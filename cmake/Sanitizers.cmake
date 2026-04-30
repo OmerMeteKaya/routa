@@ -1,0 +1,7 @@
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(SAN_FLAGS -fsanitize=address,undefined)
+    foreach(tgt routa_core hello_world test_buf test_request)
+        target_compile_options(${tgt} PRIVATE ${SAN_FLAGS})
+        target_link_options(${tgt} PRIVATE ${SAN_FLAGS})
+    endforeach()
+endif()
