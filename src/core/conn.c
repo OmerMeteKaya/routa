@@ -3,6 +3,7 @@
 #include "util/logger.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 conn_t *conn_new(int fd, const char *ip, int port) {
     conn_t *c = calloc(1, sizeof(conn_t));
@@ -14,6 +15,8 @@ conn_t *conn_new(int fd, const char *ip, int port) {
     c->fd = fd;
     c->state = CONN_READING;
     c->keep_alive = 1;
+    c->consumed = 0;
+    c->keepalive_deadline = time(NULL) + 30; // Set initial timeout
     
     if (ip) {
         strncpy(c->remote_ip, ip, sizeof(c->remote_ip) - 1);

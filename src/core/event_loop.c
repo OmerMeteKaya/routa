@@ -171,15 +171,19 @@ static void handle_events(event_loop_t *loop) {
                     buf_reset(&conn->write_buf);
                     http_response_simple(&conn->write_buf, 400, "Bad Request", 
                                         "text/plain", "Bad Request\n");
-                    conn->keep_alive = req.keep_alive;
-                    conn->state = CONN_WRITING;
                     conn->keep_alive = 0; // Close connection after error
                     goto handle_state;
                 }
                 
+                // Save consumed bytes for keep-alive
+                conn->consumed = consumed;
+                
                 // Valid request, process it
                 http_response_t resp;
                 http_response_init(&resp);
+                
+                // Set keep-alive based on request
+                conn->keep_alive = req.keep_alive;
                 
                 int allowed_methods = 0;
                 int dispatch_result = router_dispatch(g_router, &req, &resp, &allowed_methods);
@@ -195,6 +199,8 @@ static void handle_events(event_loop_t *loop) {
                     http_response_destroy(&resp);
                     http_response_init(&resp);
                     http_response_set_status(&resp, 405, "Method Not Allowed");
+                    http_response_set_header(&resp, "Connection", 
+                                           conn->keep_alive ? "keep-alive" : "close");
                     
                     // Build Allow header
                     char allow_header[256] = {0};
@@ -242,13 +248,12 @@ static void handle_events(event_loop_t *loop) {
                     buf_reset(&conn->write_buf);
                     http_response_serialize(&resp, &conn->write_buf);
                 } else {
-                    // Success, serialize response
+                    // Success, set connection header and serialize response
+                    http_response_set_header(&resp, "Connection", 
+                                           conn->keep_alive ? "keep-alive" : "close");
                     buf_reset(&conn->write_buf);
                     http_response_serialize(&resp, &conn->write_buf);
                 }
-                
-                // Set keep-alive based on request
-                conn->keep_alive = req.keep_alive;
                 
                 http_response_destroy(&resp);
                 http_request_free(&req);
@@ -263,10 +268,10 @@ static void handle_events(event_loop_t *loop) {
                     // All data written
                     if (conn->keep_alive) {
                         // Keep connection alive - consume processed request from buffer
-                        // Find the connection in the event loop context to get consumed bytes
-                        // For now, we'll reset the buffer as we've processed one request
-                        buf_reset(&conn->read_buf);
+                        buf_consume(&conn->read_buf, conn->consumed);
+                        conn->consumed = 0;
                         conn->state = CONN_READING;
+                        conn->keepalive_deadline = time(NULL) + 30; // Reset timeout
                         epoll_mod(&loop->ep, conn->fd, EPOLLIN | EPOLLET, conn);
                     } else {
                         // Close connection
