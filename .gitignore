@@ -1,3 +1,4 @@
 .aider*
 .idea
 build
+.gitignore

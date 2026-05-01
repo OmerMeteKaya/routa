@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
 
 static struct event_loop *g_loop = NULL;
 
@@ -32,6 +33,54 @@ server_t *server_new(int port, int n_threads) {
     g_loop = s->loop;
     
     return s;
+}
+
+static int static_route_handler(const http_request_t *req,
+                                http_response_t *resp, void *ctx) {
+    static_config_t *cfg = (static_config_t *)ctx;
+    return static_serve(req, resp, cfg);
+}
+
+int server_static(server_t *s, const char *url_prefix,
+                  const char *doc_root, int enable_index) {
+    if (!s || !s->loop || !url_prefix || !doc_root) {
+        return -1;
+    }
+    
+    static_config_t *cfg = calloc(1, sizeof(static_config_t));
+    if (!cfg) return -1;
+    
+    if (s->static_config_count < 16) {
+        s->static_configs[s->static_config_count++] = cfg;
+    }
+    
+    strncpy(cfg->doc_root, doc_root, sizeof(cfg->doc_root) - 1);
+    cfg->doc_root[sizeof(cfg->doc_root) - 1] = '\0';
+    
+    strncpy(cfg->url_prefix, url_prefix, sizeof(cfg->url_prefix) - 1);
+    cfg->url_prefix[sizeof(cfg->url_prefix) - 1] = '\0';
+    
+    cfg->enable_index = enable_index;
+
+    char pattern[258];
+    
+    
+
+    if (strcmp(url_prefix, "/") == 0) {
+        strcpy(pattern, "/*");
+    } else {
+        snprintf(pattern, sizeof(pattern), "%s/*", url_prefix);
+    }
+
+    event_loop_add_route((event_loop_t *)s->loop, pattern,
+                         HTTP_GET_M | HTTP_HEAD_M,
+                         static_route_handler, cfg);
+
+    /* Also register exact prefix match for the prefix itself */
+    event_loop_add_route((event_loop_t *)s->loop, url_prefix,
+                         HTTP_GET_M | HTTP_HEAD_M,
+                         static_route_handler, cfg);
+    return 0;
 }
 
 void server_route(server_t *s, const char *path, int methods,
@@ -72,6 +121,9 @@ void server_free(server_t *s) {
     if (s) {
         if (s->loop) {
             event_loop_free((event_loop_t *)s->loop);
+        }
+        for (int i = 0; i < s->static_config_count; i++) {
+            free(s->static_configs[i]);
         }
         free(s);
     }

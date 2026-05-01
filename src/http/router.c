@@ -79,6 +79,18 @@ int router_dispatch(router_t *r, const http_request_t *req,
             break;
         }
         
+        /* Check for wildcard: if route path ends with '*', match prefix */
+        if (route_path_len > 0 && route->path[route_path_len - 1] == '*') {
+            size_t prefix_len = route_path_len - 1;
+            if (strncmp(route->path, req->path, prefix_len) == 0) {
+                prefix_match = i;
+            }
+            if (prefix_len == 1 && route->path[0] == '/') {
+                prefix_match = i;
+            }
+            continue;
+        }
+        
         // Check for prefix match (path ending with /*)
         if (route_path_len > 2 && 
             route->path[route_path_len - 2] == '/' && 

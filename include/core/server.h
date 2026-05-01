@@ -2,11 +2,14 @@
 #define ROUTA_CORE_SERVER_H
 
 #include "http/router.h"
+#include "http/static.h"
 
 struct event_loop;
 
 typedef struct {
     struct event_loop *loop;
+    void  *static_configs[16];
+    int    static_config_count;
 } server_t;
 
 server_t *server_new(int port, int n_threads);
@@ -14,6 +17,8 @@ void      server_run(server_t *s);
 void      server_free(server_t *s);
 void      server_route(server_t *s, const char *path, int methods,
                        route_handler_t handler, void *ctx);
+int       server_static(server_t *s, const char *url_prefix,
+                        const char *doc_root, int enable_index);
 
 // convenience macros:
 #define HTTP_GET_M     (1 << HTTP_GET)

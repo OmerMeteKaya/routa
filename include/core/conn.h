@@ -22,6 +22,7 @@ typedef struct conn {
     int          remote_port;
     int          keep_alive;
     uint64_t     last_active_ms;
+    time_t       keepalive_deadline;
 } conn_t;
 
 conn_t *conn_new(int fd, const char *ip, int port);

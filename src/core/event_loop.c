@@ -19,7 +19,6 @@
 
 #define MAX_EVENTS 1024
 
-// Forward declaration
 static router_t *g_router = NULL;
 
 struct event_loop {
@@ -28,8 +27,6 @@ struct event_loop {
     threadpool_t *tp;
     int should_stop;
 };
-
-//static void handle_client_io(conn_t *conn);
 
 event_loop_t *event_loop_new(int port, int n_threads) {
     event_loop_t *loop = calloc(1, sizeof(event_loop_t));
@@ -87,16 +84,6 @@ void event_loop_add_route(event_loop_t *loop, const char *path,
     router_add(g_router, path, methods, handler, ctx);
 }
 
-static void handle_client_io(conn_t *conn) {
-    if (!conn) return;
-
-    // For now, we'll handle the parsing and response in the event loop thread
-    conn->state = CONN_PROCESSING;
-}
-static void process_connection(void *arg) {
-    conn_t *conn = (conn_t *)arg;
-    handle_client_io(conn);
-}
 
 
 
