@@ -17,6 +17,7 @@ conn_t *conn_new(int fd, const char *ip, int port) {
     c->keep_alive = 1;
     c->consumed = 0;
     c->keepalive_deadline = time(NULL) + 30; // Set initial timeout
+    c->sendfile_fd = -1;
     
     if (ip) {
         strncpy(c->remote_ip, ip, sizeof(c->remote_ip) - 1);

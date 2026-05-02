@@ -3,6 +3,7 @@
 #include "http/response.h"
 #include "util/logger.h"
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -146,28 +147,11 @@ int static_serve(const http_request_t *req, http_response_t *resp,
     }
     
     // Open file
-    FILE *file = fopen(resolved, "rb");
-    if (!file) {
+    int fd = open(resolved, O_RDONLY);
+    if (fd < 0) {
         http_response_set_status(resp, 404, "Not Found");
         http_response_set_body(resp, "Not Found\n", 10);
         return 0;
-    }
-    
-    // Read file content
-    char *content = malloc(st.st_size);
-    if (!content) {
-        fclose(file);
-        http_response_set_status(resp, 500, "Internal Server Error");
-        return -1;
-    }
-    
-    size_t bytes_read = fread(content, 1, st.st_size, file);
-    fclose(file);
-    
-    if (bytes_read != (size_t)st.st_size) {
-        free(content);
-        http_response_set_status(resp, 500, "Internal Server Error");
-        return -1;
     }
     
     // Set response
@@ -180,11 +164,10 @@ int static_serve(const http_request_t *req, http_response_t *resp,
         char len_str[32];
         snprintf(len_str, sizeof(len_str), "%zu", st.st_size);
         http_response_set_header(resp, "Content-Length", len_str);
-        free(content);
+        close(fd);
     } else {
-        http_response_set_body(resp, content, st.st_size);
-        // http_response_set_body copies the data, so we can free our buffer
-        free(content);
+        http_response_set_body_fd(resp, fd, 0, (size_t)st.st_size);
+        /* fd will be closed by http_response_destroy() */
     }
     
     return 0;

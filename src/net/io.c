@@ -1,78 +1,70 @@
 #define _GNU_SOURCE
 #include "net/io.h"
 #include "util/logger.h"
+#include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <netinet/in.h>
 
 #define IO_BUFFER_SIZE 8192
 
 ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
-    if (!b) {
-        return -1;
-    }
-    
+    if (!b) return -1;
+
     uint8_t temp_buf[IO_BUFFER_SIZE];
     ssize_t n;
-    
+
     if (tls) {
         n = tls_read(tls, temp_buf, sizeof(temp_buf));
-        if (n == -1) {
-            // Want read/write or error
-            return 0;
-        }
+        if (n == -1) return 0;
     } else {
         n = read(fd, temp_buf, sizeof(temp_buf));
-        
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return 0; // No data available right now
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             LOG_ERROR("Read failed: %s", strerror(errno));
             return -1;
         }
     }
-    
-    if (n == 0) {
-        return 0; // EOF
-    }
-    
+
+    if (n == 0) return 0;
+
     if (buf_append(b, temp_buf, (size_t)n) < 0) {
         LOG_ERROR("Failed to append to buffer");
         return -1;
     }
-    
+
     return n;
 }
 
 ssize_t io_write_from_buf(int fd, buf_t *b, tls_conn_t *tls) {
-    if (!b || b->len == 0) {
-        return 0;
-    }
-    
+    if (!b || b->len == 0) return 0;
+
     ssize_t n;
-    
+
     if (tls) {
         n = tls_write(tls, b->data, b->len);
-        if (n == -1) {
-            // Want read/write or error
-            return 0;
-        }
+        if (n == -1) return 0;
     } else {
         n = write(fd, b->data, b->len);
-        
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return 0; // Can't write right now
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             LOG_ERROR("Write failed: %s", strerror(errno));
             return -1;
         }
     }
-    
-    if (n > 0) {
-        buf_consume(b, (size_t)n);
-    }
-    
+
+    if (n > 0) buf_consume(b, (size_t)n);
     return n;
+}
+
+int io_cork(int fd) {
+    int v = 1;
+    return setsockopt(fd, IPPROTO_TCP, TCP_CORK, &v, sizeof(v));
+}
+
+int io_uncork(int fd) {
+    int v = 0;
+    return setsockopt(fd, IPPROTO_TCP, TCP_CORK, &v, sizeof(v));
 }

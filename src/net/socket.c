@@ -28,6 +28,12 @@ int net_server_socket(int port, int backlog) {
         close(sockfd);
         return -1;
     }
+    
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        LOG_ERROR("Failed to set SO_REUSEPORT: %s", strerror(errno));
+        close(sockfd);
+        return -1;
+    }
 
     // Set non-blocking
     if (net_set_nonblocking(sockfd) < 0) {

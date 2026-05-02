@@ -2,10 +2,9 @@
 #include "http/request.h"
 #include "http/response.h"
 #include "http/static.h"
-#include <unistd.h>
 
 static int handle_hello(const http_request_t *req,
-                        http_response_t *resp, void *ctx) {
+                         http_response_t *resp, void *ctx) {
     (void)req; (void)ctx;
     http_response_set_status(resp, 200, "OK");
     http_response_set_body(resp, "hello from routa\n", 17);
@@ -15,12 +14,6 @@ static int handle_hello(const http_request_t *req,
 
 int main(void) {
     server_t *s = server_new(8080, 4);
-
-    /* Enable HTTPS if cert files exist */
-    if (access("cert.pem", F_OK) == 0 && access("key.pem", F_OK) == 0) {
-        server_enable_tls(s, "cert.pem", "key.pem");
-    }
-
     server_route(s, "/api/hello", HTTP_GET_M | HTTP_HEAD_M, handle_hello, NULL);
     server_static(s, "/", "/home/mete/routa/public", 1);
     server_run(s);

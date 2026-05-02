@@ -11,7 +11,8 @@ typedef enum {
     CONN_WRITING,
     CONN_KEEPALIVE,
     CONN_CLOSING,
-    CONN_TLS_HANDSHAKE
+    CONN_TLS_HANDSHAKE,
+    CONN_SENDFILE
 } conn_state_t;
 
 typedef struct conn {
@@ -26,6 +27,9 @@ typedef struct conn {
     uint64_t     last_active_ms;
     time_t       keepalive_deadline;
     tls_conn_t  *tls;
+    int          sendfile_fd;
+    off_t        sendfile_off;
+    size_t       sendfile_rem;
 } conn_t;
 
 conn_t *conn_new(int fd, const char *ip, int port);
