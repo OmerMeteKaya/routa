@@ -26,7 +26,10 @@ struct event_loop {
     epoll_t ep;
     threadpool_t *tp;
     int should_stop;
+    tls_context_t *tls_ctx;
 };
+
+
 
 event_loop_t *event_loop_new(int port, int n_threads) {
     event_loop_t *loop = calloc(1, sizeof(event_loop_t));
@@ -84,6 +87,15 @@ void event_loop_add_route(event_loop_t *loop, const char *path,
     router_add(g_router, path, methods, handler, ctx);
 }
 
+void event_loop_set_tls(event_loop_t *loop,
+                        const char *cert_file, const char *key_file) {
+    if (!loop || !cert_file || !key_file) {
+        return;
+    }
+    
+    loop->tls_ctx = tls_context_new(cert_file, key_file);
+}
+
 
 
 
@@ -128,191 +140,277 @@ static void handle_events(event_loop_t *loop) {
                 net_close(client_fd);
                 continue;
             }
-            
-            // Add to epoll
-            if (epoll_add(&loop->ep, client_fd, EPOLLIN | EPOLLET, conn) < 0) {
-                LOG_ERROR("Failed to add client to epoll");
-                conn_free(conn);
-                net_close(client_fd);
-                continue;
+                
+            // Set up TLS if enabled
+            if (loop->tls_ctx) {
+                conn->tls = tls_conn_new(loop->tls_ctx, client_fd);
+                if (!conn->tls) {
+                    LOG_ERROR("Failed to create TLS connection");
+                    conn_free(conn);
+                    net_close(client_fd);
+                    continue;
+                }
+                conn->state = CONN_TLS_HANDSHAKE;
+                // Add to epoll for TLS handshake
+                if (epoll_add(&loop->ep, client_fd, EPOLLIN | EPOLLET, conn) < 0) {
+                    LOG_ERROR("Failed to add TLS client to epoll");
+                    conn_free(conn);
+                    net_close(client_fd);
+                    continue;
+                }
+            } else {
+                // Add to epoll for plain HTTP
+                if (epoll_add(&loop->ep, client_fd, EPOLLIN | EPOLLET, conn) < 0) {
+                    LOG_ERROR("Failed to add client to epoll");
+                    conn_free(conn);
+                    net_close(client_fd);
+                    continue;
+                }
             }
         } else {
             // Client socket
             conn_t *conn = (conn_t *)events[i].data.ptr;
             
             if (events[i].events & (EPOLLHUP | EPOLLERR)) {
-                conn->state = CONN_CLOSING;
-            } else if (events[i].events & EPOLLIN) {
-                // Read data into buffer
-                ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf);
-                if (n < 0) {
-                    conn->state = CONN_CLOSING;
-                    goto handle_state;
-                }
-                if (n == 0) {
-                    /* client closed connection */
-                    conn->state = CONN_CLOSING;
-                    goto handle_state;
-                }
-                if (conn->read_buf.len == 0) {
-                    continue;
-                }
-                
-                // Parse HTTP request
-                http_request_t req;
-                size_t consumed = 0;
-                int parse_result = http_request_parse(&req, &conn->read_buf, &consumed);
-                
-                if (parse_result == 1) {
-                    // Incomplete request, wait for more data
-                    continue;
-                } else if (parse_result == -1) {
-                    // Malformed request, send 400
-                    buf_reset(&conn->write_buf);
-                    http_response_simple(&conn->write_buf, 400, "Bad Request", 
-                                        "text/plain", "Bad Request\n");
-                    conn->keep_alive = 0; // Close connection after error
-                    goto handle_state;
-                }
-                
-                // Save consumed bytes for keep-alive
-                conn->consumed = consumed;
-                
-                // Valid request, process it
-                http_response_t resp;
-                http_response_init(&resp);
-                
-                // Set keep-alive based on request
-                conn->keep_alive = req.keep_alive;
-                
-                int allowed_methods = 0;
-                int dispatch_result = router_dispatch(g_router, &req, &resp, &allowed_methods);
-                
-                if (dispatch_result == -1) {
-                    // 404 Not Found
-                    http_response_destroy(&resp);
-                    http_response_init(&resp);
-                    http_response_simple(&conn->write_buf, 404, "Not Found", 
-                                        "text/plain", "Not Found\n");
-                } else if (dispatch_result == -2) {
-                    // 405 Method Not Allowed
-                    http_response_destroy(&resp);
-                    http_response_init(&resp);
-                    http_response_set_status(&resp, 405, "Method Not Allowed");
-                    http_response_set_header(&resp, "Connection", 
-                                           conn->keep_alive ? "keep-alive" : "close");
-                    
-                    // Build Allow header
-                    char allow_header[256] = {0};
-                    int first = 1;
-                    for (i = 0; i < HTTP_METHOD_UNKNOWN; i++) {
-                        if (allowed_methods & (1 << i)) {
-                            if (!first) {
-                                strncat(allow_header, ", ", sizeof(allow_header) - strlen(allow_header) - 1);
-                            }
-                            switch (i) {
-                                case HTTP_GET: 
-                                    strncat(allow_header, "GET", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_POST: 
-                                    strncat(allow_header, "POST", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_PUT: 
-                                    strncat(allow_header, "PUT", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_DELETE: 
-                                    strncat(allow_header, "DELETE", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_HEAD: 
-                                    strncat(allow_header, "HEAD", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_PATCH: 
-                                    strncat(allow_header, "PATCH", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_OPTIONS: 
-                                    strncat(allow_header, "OPTIONS", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_TRACE: 
-                                    strncat(allow_header, "TRACE", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                                case HTTP_CONNECT: 
-                                    strncat(allow_header, "CONNECT", sizeof(allow_header) - strlen(allow_header) - 1); 
-                                    break;
-                            }
-                            first = 0;
-                        }
+                if (conn->state == CONN_TLS_HANDSHAKE) {
+                    // Clean up TLS connection
+                    epoll_del(&loop->ep, conn->fd);
+                    if (conn->tls) {
+                        tls_shutdown(conn->tls);
                     }
-                    
-                    http_response_set_header(&resp, "Allow", allow_header);
-                    http_response_set_body(&resp, "Method Not Allowed\n", 20);
-                    buf_reset(&conn->write_buf);
-                    http_response_serialize(&resp, &conn->write_buf);
+                    net_close(conn->fd);
+                    conn_free(conn);
+                    continue;
                 } else {
-                    // Success, set connection header and serialize response
-                    http_response_set_header(&resp, "Connection", 
-                                           conn->keep_alive ? "keep-alive" : "close");
-                    buf_reset(&conn->write_buf);
-                    http_response_serialize(&resp, &conn->write_buf);
-                }
-                
-                http_response_destroy(&resp);
-                http_request_free(&req);
-                
-                conn->state = CONN_WRITING;
-            } else if (events[i].events & EPOLLOUT) {
-                // Write data to client
-                ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf);
-                if (n < 0) {
                     conn->state = CONN_CLOSING;
-                } else if (conn->write_buf.len == 0) {
-                    // All data written
-                    if (conn->keep_alive) {
-                        // Keep connection alive - consume processed request from buffer
-                        buf_consume(&conn->read_buf, conn->consumed);
-                        conn->consumed = 0;
-                        conn->state = CONN_READING;
-                        conn->keepalive_deadline = time(NULL) + 30; // Reset timeout
-                        epoll_mod(&loop->ep, conn->fd, EPOLLIN | EPOLLET, conn);
-                    } else {
-                        // Close connection
+                }
+            } else if (events[i].events & EPOLLIN) {
+                if (conn->state == CONN_TLS_HANDSHAKE) {
+                    // Handle TLS handshake
+                    int hs = tls_handshake(conn->tls);
+                    switch (hs) {
+                        case 0:  // Handshake complete
+                            conn->state = CONN_READING;
+                            epoll_mod(&loop->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            break;
+                        case 1:  // Want read
+                            epoll_mod(&loop->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            break;
+                        case -1: // Want write
+                            epoll_mod(&loop->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                            break;
+                        case -2: // Fatal error
+                            // Clean up TLS connection
+                            epoll_del(&loop->ep, conn->fd);
+                            if (conn->tls) {
+                                tls_shutdown(conn->tls);
+                            }
+                            net_close(conn->fd);
+                            conn_free(conn);
+                            continue;
+                    }
+                } else {
+                    // Read data into buffer
+                    ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf, conn->tls);
+                    if (n < 0) {
                         conn->state = CONN_CLOSING;
                         goto handle_state;
                     }
+                    if (n == 0) {
+                        /* client closed connection */
+                        conn->state = CONN_CLOSING;
+                        goto handle_state;
+                    }
+                    if (conn->read_buf.len == 0) {
+                        continue;
+                    }
+                
+                    // Parse HTTP request
+                    http_request_t req;
+                    size_t consumed = 0;
+                    int parse_result = http_request_parse(&req, &conn->read_buf, &consumed);
+
+                    if (parse_result == 1) {
+                        // Incomplete request, wait for more data
+                        continue;
+                    } else if (parse_result == -1) {
+                        // Malformed request, send 400
+                        buf_reset(&conn->write_buf);
+                        http_response_simple(&conn->write_buf, 400, "Bad Request",
+                                            "text/plain", "Bad Request\n");
+                        conn->keep_alive = 0; // Close connection after error
+                        goto handle_state;
+                    }
+
+                    // Save consumed bytes for keep-alive
+                    conn->consumed = consumed;
+
+                    // Valid request, process it
+                    http_response_t resp;
+                    http_response_init(&resp);
+
+                    // Set keep-alive based on request
+                    conn->keep_alive = req.keep_alive;
+
+                    int allowed_methods = 0;
+                    int dispatch_result = router_dispatch(g_router, &req, &resp, &allowed_methods);
+
+                    if (dispatch_result == -1) {
+                        // 404 Not Found
+                        http_response_destroy(&resp);
+                        http_response_init(&resp);
+                        http_response_simple(&conn->write_buf, 404, "Not Found",
+                                            "text/plain", "Not Found\n");
+                    } else if (dispatch_result == -2) {
+                        // 405 Method Not Allowed
+                        http_response_destroy(&resp);
+                        http_response_init(&resp);
+                        http_response_set_status(&resp, 405, "Method Not Allowed");
+                        http_response_set_header(&resp, "Connection",
+                                               conn->keep_alive ? "keep-alive" : "close");
+
+                        // Build Allow header
+                        char allow_header[256] = {0};
+                        int first = 1;
+                        for (i = 0; i < HTTP_METHOD_UNKNOWN; i++) {
+                            if (allowed_methods & (1 << i)) {
+                                if (!first) {
+                                    strncat(allow_header, ", ", sizeof(allow_header) - strlen(allow_header) - 1);
+                                }
+                                switch (i) {
+                                    case HTTP_GET:
+                                        strncat(allow_header, "GET", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_POST:
+                                        strncat(allow_header, "POST", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_PUT:
+                                        strncat(allow_header, "PUT", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_DELETE:
+                                        strncat(allow_header, "DELETE", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_HEAD:
+                                        strncat(allow_header, "HEAD", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_PATCH:
+                                        strncat(allow_header, "PATCH", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_OPTIONS:
+                                        strncat(allow_header, "OPTIONS", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_TRACE:
+                                        strncat(allow_header, "TRACE", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                    case HTTP_CONNECT:
+                                        strncat(allow_header, "CONNECT", sizeof(allow_header) - strlen(allow_header) - 1);
+                                        break;
+                                }
+                                first = 0;
+                            }
+                        }
+
+                        http_response_set_header(&resp, "Allow", allow_header);
+                        http_response_set_body(&resp, "Method Not Allowed\n", 20);
+                        buf_reset(&conn->write_buf);
+                        http_response_serialize(&resp, &conn->write_buf);
+                    } else {
+                        // Success, set connection header and serialize response
+                        http_response_set_header(&resp, "Connection",
+                                               conn->keep_alive ? "keep-alive" : "close");
+                        buf_reset(&conn->write_buf);
+                        http_response_serialize(&resp, &conn->write_buf);
+                    }
+
+                    http_response_destroy(&resp);
+                    http_request_free(&req);
+
+                    conn->state = CONN_WRITING;
+                    goto handle_state;
+                }
+            } else if (events[i].events & EPOLLOUT) {
+                if (conn->state == CONN_TLS_HANDSHAKE) {
+                    // Handle TLS handshake
+                    int hs = tls_handshake(conn->tls);
+                    switch (hs) {
+                        case 0:  // Handshake complete
+                            conn->state = CONN_READING;
+                            epoll_mod(&loop->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            break;
+                        case 1:  // Want read
+                            epoll_mod(&loop->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            break;
+                        case -1: // Want write
+                            epoll_mod(&loop->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                            break;
+                        case -2: // Fatal error
+                            // Clean up TLS connection
+                            epoll_del(&loop->ep, conn->fd);
+                            if (conn->tls) {
+                                tls_shutdown(conn->tls);
+                            }
+                            net_close(conn->fd);
+                            conn_free(conn);
+                            continue;
+                    }
+                } else {
+                    // Write data to client
+                    ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
+                    if (n < 0) {
+                        conn->state = CONN_CLOSING;
+                    } else if (conn->write_buf.len == 0) {
+                        // All data written
+                        if (conn->keep_alive) {
+                            // Keep connection alive - consume processed request from buffer
+                            buf_consume(&conn->read_buf, conn->consumed);
+                            conn->consumed = 0;
+                            conn->state = CONN_READING;
+                            conn->keepalive_deadline = time(NULL) + 30; // Reset timeout
+                            epoll_mod(&loop->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                        } else {
+                            // Close connection
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                    }
                 }
             }
-            
-handle_state:
-            // Handle connection state
-            switch (conn->state) {
+
+            handle_state:
+                    // Handle connection state
+                    switch (conn->state) {
                 case CONN_WRITING:
-                    epoll_mod(&loop->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
-                    break;
-                    
+                            epoll_mod(&loop->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                            break;
+
                 case CONN_CLOSING:
-                    epoll_del(&loop->ep, conn->fd);
-                    shutdown(conn->fd, SHUT_WR);
-                    net_close(conn->fd);
-                    conn_free(conn);
-                    break;
-                    
+                            epoll_del(&loop->ep, conn->fd);
+                            if (conn->tls) {
+                                tls_shutdown(conn->tls);
+                            }
+                            shutdown(conn->fd, SHUT_WR);
+                            net_close(conn->fd);
+                            conn_free(conn);
+                            break;
+
                 default:
-                    break;
-            }
+                            break;
+                    }
         }
     }
 }
-
 void event_loop_run(event_loop_t *loop) {
     if (!loop) return;
-    
+
     LOG_INFO("Event loop started");
-    
+
     while (!loop->should_stop) {
         handle_events(loop);
     }
-    
+
     LOG_INFO("Event loop stopped");
 }
+
 
 void event_loop_free(event_loop_t *loop) {
     if (!loop) return;
@@ -326,6 +424,11 @@ void event_loop_free(event_loop_t *loop) {
     if (g_router) {
         router_free(g_router);
         g_router = NULL;
+    }
+    
+    // Free TLS context
+    if (loop->tls_ctx) {
+        tls_context_free(loop->tls_ctx);
     }
     
     // Close epoll

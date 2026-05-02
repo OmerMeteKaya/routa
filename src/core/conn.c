@@ -33,6 +33,9 @@ conn_t *conn_new(int fd, const char *ip, int port) {
 
 void conn_free(conn_t *c) {
     if (c) {
+        if (c->tls) {
+            tls_conn_free(c->tls);
+        }
         buf_free(&c->read_buf);
         buf_free(&c->write_buf);
         free(c);

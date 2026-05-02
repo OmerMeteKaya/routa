@@ -83,6 +83,17 @@ int server_static(server_t *s, const char *url_prefix,
     return 0;
 }
 
+int server_enable_tls(server_t *s,
+                      const char *cert_file, const char *key_file) {
+    if (!s || !cert_file || !key_file) {
+        return -1;
+    }
+    
+    tls_init();
+    event_loop_set_tls((event_loop_t *)s->loop, cert_file, key_file);
+    return 0;
+}
+
 void server_route(server_t *s, const char *path, int methods,
                   route_handler_t handler, void *ctx) {
     if (!s || !s->loop) {

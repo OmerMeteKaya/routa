@@ -2,6 +2,7 @@
 #define ROUTA_CORE_CONN_H
 
 #include "util/buf.h"
+#include "net/tls.h"
 
 typedef enum {
     CONN_READING,
@@ -9,7 +10,8 @@ typedef enum {
     CONN_PROCESSING,
     CONN_WRITING,
     CONN_KEEPALIVE,
-    CONN_CLOSING
+    CONN_CLOSING,
+    CONN_TLS_HANDSHAKE
 } conn_state_t;
 
 typedef struct conn {
@@ -23,6 +25,7 @@ typedef struct conn {
     int          keep_alive;
     uint64_t     last_active_ms;
     time_t       keepalive_deadline;
+    tls_conn_t  *tls;
 } conn_t;
 
 conn_t *conn_new(int fd, const char *ip, int port);

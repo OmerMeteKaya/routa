@@ -19,6 +19,8 @@ void      server_route(server_t *s, const char *path, int methods,
                        route_handler_t handler, void *ctx);
 int       server_static(server_t *s, const char *url_prefix,
                         const char *doc_root, int enable_index);
+int       server_enable_tls(server_t *s,
+                            const char *cert_file, const char *key_file);
 
 // convenience macros:
 #define HTTP_GET_M     (1 << HTTP_GET)

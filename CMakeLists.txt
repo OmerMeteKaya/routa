@@ -13,7 +13,9 @@ add_library(routa_core STATIC ${ROUTA_SOURCES}
 target_include_directories(routa_core PUBLIC include)
 
 find_package(Threads REQUIRED)
-target_link_libraries(routa_core PUBLIC Threads::Threads)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(routa_core PUBLIC Threads::Threads
+                      OpenSSL::SSL OpenSSL::Crypto)
 
 add_executable(hello_world examples/hello_world.c
         src/http/static.c)
