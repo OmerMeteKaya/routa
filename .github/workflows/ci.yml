@@ -1,6 +1,4 @@
 on:
-jobs:name: CI
-
 jobs:
   linux:
     runs-on: ubuntu-latest
