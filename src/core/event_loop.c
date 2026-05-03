@@ -293,14 +293,29 @@ static void handle_events_worker(worker_t *w) {
                         http_response_set_header(&resp, "Connection",
                                                conn->keep_alive ? "keep-alive" : "close");
                         
-                        // Use buffered approach for all responses
                         buf_reset(&conn->write_buf);
                         http_response_serialize(&resp, &conn->write_buf);
+
+                        /* Check if response has a file body for sendfile */
+                        if (resp.body_fd >= 0) {
+                            if (conn->tls == NULL) {
+                                /* Transfer fd ownership to conn */
+                                conn->sendfile_fd  = resp.body_fd;
+                                conn->sendfile_off = resp.body_fd_off;
+                                conn->sendfile_rem = resp.body_fd_len;
+                                resp.body_fd = -1;  /* prevent destroy from closing it */
+                                io_cork(conn->fd);  /* headers + file in one burst */
+                            } else {
+                                /* For TLS, we need to send the file through the TLS layer */
+                                /* This blocks but TLS file serving is inherently slower */
+                                send_file_tls(w, conn, resp.body_fd, resp.body_fd_off, resp.body_fd_len);
+                                resp.body_fd = -1;  /* prevent destroy from closing it */
+                            }
+                        }
                     }
 
                     http_response_destroy(&resp);
                     http_request_free(&req);
-
                     conn->state = CONN_WRITING;
                     goto handle_state;
                 }
@@ -372,7 +387,11 @@ static void handle_events_worker(worker_t *w) {
                         conn->state = CONN_CLOSING;
                     } else if (conn->write_buf.len == 0) {
                         // All data written
-                        if (conn->keep_alive) {
+                        if (conn->sendfile_fd >= 0) {
+                            /* Headers sent, now send file body */
+                            conn->state = CONN_SENDFILE;
+                            /* stay armed for EPOLLOUT — already set */
+                        } else if (conn->keep_alive) {
                             // Keep connection alive - consume processed request from buffer
                             buf_consume(&conn->read_buf, conn->consumed);
                             conn->consumed = 0;
@@ -392,12 +411,14 @@ static void handle_events_worker(worker_t *w) {
                     // Handle connection state
                     switch (conn->state) {
                 case CONN_WRITING: {
-                    // Check if we can use sendfile optimization
-                    // This would require access to the response object which isn't available here
-                    // We'll handle this in the response processing code instead
                     epoll_mod(&w->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
                     break;
                 }
+
+                case CONN_SENDFILE:
+                    /* Already armed for EPOLLOUT from previous iteration */
+                    epoll_mod(&w->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                    break;
 
                 case CONN_CLOSING:
                     epoll_del(&w->ep, conn->fd);
@@ -422,6 +443,24 @@ static void handle_events_worker(worker_t *w) {
                     }
         }
     }
+}
+
+static int send_file_tls(worker_t *w, conn_t *conn,
+                         int fd, off_t off, size_t len) {
+    (void)w;
+    char tmp[65536];
+    lseek(fd, off, SEEK_SET);
+    size_t rem = len;
+    while (rem > 0) {
+        size_t to_read = rem < sizeof(tmp) ? rem : sizeof(tmp);
+        ssize_t n = read(fd, tmp, to_read);
+        if (n <= 0) break;
+        ssize_t written = tls_write(conn->tls, tmp, (size_t)n);
+        if (written < 0) return -1;
+        rem -= (size_t)n;
+    }
+    close(fd);
+    return 0;
 }
 
 static void *worker_run(void *arg) {

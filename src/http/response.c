@@ -125,19 +125,8 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
     /* Body */
     if (r->body && r->body_len > 0) {
         if (buf_append(out, r->body, r->body_len) < 0) return -1;
-    } else if (r->body_fd >= 0) {
-        /* Read file into buffer (sendfile optimization comes later) */
-        char tmp[65536];
-        ssize_t n;
-        off_t off = r->body_fd_off;
-        size_t rem = r->body_fd_len;
-        lseek(r->body_fd, off, SEEK_SET);
-        while (rem > 0 && (n = read(r->body_fd, tmp,
-               rem < sizeof(tmp) ? rem : sizeof(tmp))) > 0) {
-            if (buf_append(out, tmp, (size_t)n) < 0) return -1;
-            rem -= (size_t)n;
-        }
     }
+    /* If body_fd >= 0: headers only, caller uses sendfile() for body */
 
     return 0;
 }
