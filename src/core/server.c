@@ -128,6 +128,34 @@ void server_run(server_t *s) {
     event_loop_run((event_loop_t *)s->loop);
 }
 
+server_t *server_from_config(const routa_config_t *cfg) {
+    if (routa_config_validate(cfg) < 0) return NULL;
+
+    log_set_level((log_level_t)cfg->log_level);
+
+    server_t *s = server_new(cfg->port, cfg->n_workers);
+    if (!s) return NULL;
+
+    if (cfg->tls_enabled) {
+        server_enable_tls(s, cfg->tls_cert, cfg->tls_key);
+    }
+
+    for (int i = 0; i < cfg->static_count; i++) {
+        server_static(s, cfg->static_dirs[i].url_prefix,
+                      cfg->static_dirs[i].doc_root,
+                      cfg->static_dirs[i].enable_index);
+    }
+
+    return s;
+}
+
+server_t *server_from_config_file(const char *path) {
+    routa_config_t cfg;
+    routa_config_init(&cfg);
+    if (routa_config_load(&cfg, path) < 0) return NULL;
+    return server_from_config(&cfg);
+}
+
 void server_free(server_t *s) {
     if (s) {
         if (s->loop) {

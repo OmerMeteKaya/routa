@@ -3,6 +3,7 @@
 
 #include "http/router.h"
 #include "http/static.h"
+#include "core/config.h"
 
 struct event_loop;
 
@@ -21,6 +22,12 @@ int       server_static(server_t *s, const char *url_prefix,
                         const char *doc_root, int enable_index);
 int       server_enable_tls(server_t *s,
                             const char *cert_file, const char *key_file);
+
+/* Create server from config struct */
+server_t *server_from_config(const routa_config_t *cfg);
+
+/* Load config file and create server */
+server_t *server_from_config_file(const char *path);
 
 // convenience macros:
 #define HTTP_GET_M     (1 << HTTP_GET)

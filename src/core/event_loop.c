@@ -15,6 +15,9 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <sys/epoll.h>
+
+#include "net/epoll.h"
 
 #define MAX_EVENTS 1024
 
@@ -58,7 +61,7 @@ static void handle_events_worker(worker_t *w) {
     }
     int i;
     for (i = 0; i < nfds; i++) {
-        if (events[i].data.ptr == NULL) {
+        if (events[i].ptr == NULL) {
             // Server socket - accept new connection
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
@@ -149,7 +152,7 @@ static void handle_events_worker(worker_t *w) {
             if (events[i].events & (POLLER_HUP | POLLER_ERR)) {
                 if (conn->state == CONN_TLS_HANDSHAKE) {
                     // Clean up TLS connection
-                    epoll_del(&w->ep, conn->fd);
+                    poller_del(w->poller, conn->fd);
                     // Remove from active connections list
                     for (int j = 0; j < w->active_conn_count; j++) {
                         if (w->active_conns[j] == conn) {
@@ -167,24 +170,24 @@ static void handle_events_worker(worker_t *w) {
                 } else {
                     conn->state = CONN_CLOSING;
                 }
-            } else if (events[i].events & EPOLLIN) {
+            } else if (events[i].events & POLLER_READ) {
                 if (conn->state == CONN_TLS_HANDSHAKE) {
                     // Handle TLS handshake
                     int hs = tls_handshake(conn->tls);
                     switch (hs) {
                         case 0:  // Handshake complete
                             conn->state = CONN_READING;
-                            epoll_mod(&w->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
                             break;
                         case 1:  // Want read
-                            epoll_mod(&w->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
                             break;
                         case -1: // Want write
-                            epoll_mod(&w->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                            poller_mod(w->poller, conn->fd, POLLER_WRITE | POLLER_ET, conn);
                             break;
                         case -2: // Fatal error
                             // Clean up TLS connection
-                            epoll_del(&w->ep, conn->fd);
+                            poller_del(w->poller, conn->fd);
                             // Remove from active connections list
                             for (int j = 0; j < w->active_conn_count; j++) {
                                 if (w->active_conns[j] == conn) {
@@ -336,24 +339,24 @@ static void handle_events_worker(worker_t *w) {
                     conn->state = CONN_WRITING;
                     goto handle_state;
                 }
-            } else if (events[i].events & EPOLLOUT) {
+            } else if (events[i].events & POLLER_WRITE) {
                 if (conn->state == CONN_TLS_HANDSHAKE) {
                     // Handle TLS handshake
                     int hs = tls_handshake(conn->tls);
                     switch (hs) {
                         case 0:  // Handshake complete
                             conn->state = CONN_READING;
-                            epoll_mod(&w->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
                             break;
                         case 1:  // Want read
-                            epoll_mod(&w->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
                             break;
                         case -1: // Want write
-                            epoll_mod(&w->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                            poller_mod(w->poller, conn->fd, POLLER_WRITE | POLLER_ET, conn);
                             break;
                         case -2: // Fatal error
                             // Clean up TLS connection
-                            epoll_del(&w->ep, conn->fd);
+                            poller_del(w->poller, conn->fd);
                             // Remove from active connections list
                             for (int j = 0; j < w->active_conn_count; j++) {
                                 if (w->active_conns[j] == conn) {
@@ -387,7 +390,7 @@ static void handle_events_worker(worker_t *w) {
                                 conn->consumed = 0;
                                 conn->state = CONN_READING;
                                 conn->keepalive_deadline = time(NULL) + 30; // Reset timeout
-                                epoll_mod(&w->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                                poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
                             } else {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
@@ -407,14 +410,14 @@ static void handle_events_worker(worker_t *w) {
                         if (conn->sendfile_fd >= 0) {
                             /* Headers sent, now send file body */
                             conn->state = CONN_SENDFILE;
-                            /* stay armed for EPOLLOUT — already set */
+                            /* stay armed for POLLER_WRITE — already set */
                         } else if (conn->keep_alive) {
                             // Keep connection alive - consume processed request from buffer
                             buf_consume(&conn->read_buf, conn->consumed);
                             conn->consumed = 0;
                             conn->state = CONN_READING;
                             conn->keepalive_deadline = time(NULL) + 30; // Reset timeout
-                            epoll_mod(&w->ep, conn->fd, EPOLLIN | EPOLLET, conn);
+                            poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
                         } else {
                             // Close connection
                             conn->state = CONN_CLOSING;
@@ -428,17 +431,17 @@ static void handle_events_worker(worker_t *w) {
                     // Handle connection state
                     switch (conn->state) {
                 case CONN_WRITING: {
-                    epoll_mod(&w->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                    poller_mod(w->poller, conn->fd, POLLER_WRITE | POLLER_ET, conn);
                     break;
                 }
 
                 case CONN_SENDFILE:
-                    /* Already armed for EPOLLOUT from previous iteration */
-                    epoll_mod(&w->ep, conn->fd, EPOLLOUT | EPOLLET, conn);
+                    /* Already armed for POLLER_WRITE from previous iteration */
+                    poller_mod(w->poller, conn->fd, POLLER_WRITE | POLLER_ET, conn);
                     break;
 
                 case CONN_CLOSING:
-                    epoll_del(&w->ep, conn->fd);
+                    poller_del(w->poller, conn->fd);
                     // Remove from active connections list
                     for (int j = 0; j < w->active_conn_count; j++) {
                         if (w->active_conns[j] == conn) {
@@ -474,15 +477,18 @@ static void *worker_run(void *arg) {
         return NULL;
     }
     
-    if (epoll_init(&w->ep) < 0) {
+    w->poller = poller_new();
+    if (!w->poller) {
         LOG_ERROR("Worker failed to initialize epoll");
         net_close(w->server_fd);
+        poller_free(w->poller);
         return NULL;
     }
     
-    if (epoll_add(&w->ep, w->server_fd, EPOLLIN, NULL) < 0) {
+    if (poller_add(w->poller, w->server_fd, POLLER_READ, NULL) < 0) {
         LOG_ERROR("Worker failed to add server socket to epoll");
         net_close(w->server_fd);
+        poller_free(w->poller);
         return NULL;
     }
     
@@ -493,7 +499,7 @@ static void *worker_run(void *arg) {
     /* cleanup active conns */
     for (int i = 0; i < w->active_conn_count; i++) {
         conn_t *c = w->active_conns[i];
-        epoll_del(&w->ep, c->fd);
+        poller_del(w->poller, c->fd);
         if (c->sendfile_fd >= 0) {
             close(c->sendfile_fd);
             c->sendfile_fd = -1;
@@ -506,6 +512,7 @@ static void *worker_run(void *arg) {
     }
     w->active_conn_count = 0;
     net_close(w->server_fd);
+    poller_free(w->poller);
     
     return NULL;
 }
