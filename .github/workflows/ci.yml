@@ -1,0 +1,71 @@
+on:
+jobs:name: CI
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
+      - name: Build Debug
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Debug
+          make -j$(nproc)
+      - name: Test
+        run: |
+          cd build
+          ./test_buf
+          ./test_request
+      - name: Smoke test
+        run: |
+          cd build
+          mkdir -p public
+          echo '<h1>hello</h1>' > public/index.html
+          ./hello_world &
+          sleep 1
+          curl -f http://localhost:8080/api/hello
+          kill %1 || true
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: brew install openssl@3 cmake
+      - name: Build
+        run: |
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+          make -j$(nproc)
+      - name: Test
+        run: |
+          cd build
+          ./test_buf
+          ./test_request
+      - name: Smoke test
+        run: |
+          cd build
+          mkdir -p public
+          echo '<h1>hello</h1>' > public/index.html
+          ./hello_world &
+          sleep 1
+          curl -f http://localhost:8080/api/hello
+          kill %1 || true
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y openssl cmake
+          run: |
+            mkdir build && cd build
+            cmake .. -DCMAKE_BUILD_TYPE=Release
+            make -j$(nproc)
+            ./test_buf

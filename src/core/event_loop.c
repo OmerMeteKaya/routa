@@ -1,13 +1,12 @@
 #define _GNU_SOURCE
 #include "core/event_loop.h"
 #include "core/conn.h"
-#include "net/epoll.h"
+#include "net/poller.h"
 #include "net/socket.h"
 #include "net/io.h"
 #include "http/request.h"
 #include "http/response.h"
 #include "util/logger.h"
-#include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -29,13 +28,31 @@ struct event_loop {
     int            should_stop;
 };
 
+static int send_file_tls(worker_t *w, conn_t *conn,
+                         int fd, off_t off, size_t len) {
+    (void)w;
+    char tmp[65536];
+    lseek(fd, off, SEEK_SET);
+    size_t rem = len;
+    while (rem > 0) {
+        size_t to_read = rem < sizeof(tmp) ? rem : sizeof(tmp);
+        ssize_t n = read(fd, tmp, to_read);
+        if (n <= 0) break;
+        ssize_t written = tls_write(conn->tls, tmp, (size_t)n);
+        if (written < 0) return -1;
+        rem -= (size_t)n;
+    }
+    close(fd);
+    return 0;
+}
+
 static void handle_events_worker(worker_t *w) {
-    struct epoll_event events[MAX_EVENTS];
+    poller_event_t events[MAX_EVENTS];
     
-    int nfds = epoll_wait_events(&w->ep, events, MAX_EVENTS, 100);
+    int nfds = poller_wait(w->poller, events, MAX_EVENTS, 100);
     if (nfds < 0) {
         if (!w->should_stop) {
-            LOG_ERROR("Epoll wait failed");
+            LOG_ERROR("Poller wait failed");
         }
         return;
     }
@@ -97,9 +114,9 @@ static void handle_events_worker(worker_t *w) {
                     continue;
                 }
                 conn->state = CONN_TLS_HANDSHAKE;
-                // Add to epoll for TLS handshake
-                if (epoll_add(&w->ep, client_fd, EPOLLIN | EPOLLET, conn) < 0) {
-                    LOG_ERROR("Failed to add TLS client to epoll");
+                // Add to poller for TLS handshake
+                if (poller_add(w->poller, client_fd, POLLER_READ | POLLER_ET, conn) < 0) {
+                    LOG_ERROR("Failed to add TLS client to poller");
                     for (int j = 0; j < w->active_conn_count; j++) {
                         if (w->active_conns[j] == conn) {
                             w->active_conns[j] = w->active_conns[--w->active_conn_count];
@@ -111,9 +128,9 @@ static void handle_events_worker(worker_t *w) {
                     continue;
                 }
             } else {
-                // Add to epoll for plain HTTP
-                if (epoll_add(&w->ep, client_fd, EPOLLIN | EPOLLET, conn) < 0) {
-                    LOG_ERROR("Failed to add client to epoll");
+                // Add to poller for plain HTTP
+                if (poller_add(w->poller, client_fd, POLLER_READ | POLLER_ET, conn) < 0) {
+                    LOG_ERROR("Failed to add client to poller");
                     for (int j = 0; j < w->active_conn_count; j++) {
                         if (w->active_conns[j] == conn) {
                             w->active_conns[j] = w->active_conns[--w->active_conn_count];
@@ -127,9 +144,9 @@ static void handle_events_worker(worker_t *w) {
             }
         } else {
             // Client socket
-            conn_t *conn = (conn_t *)events[i].data.ptr;
+            conn_t *conn = (conn_t *)events[i].ptr;
             
-            if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+            if (events[i].events & (POLLER_HUP | POLLER_ERR)) {
                 if (conn->state == CONN_TLS_HANDSHAKE) {
                     // Clean up TLS connection
                     epoll_del(&w->ep, conn->fd);
@@ -445,23 +462,7 @@ static void handle_events_worker(worker_t *w) {
     }
 }
 
-static int send_file_tls(worker_t *w, conn_t *conn,
-                         int fd, off_t off, size_t len) {
-    (void)w;
-    char tmp[65536];
-    lseek(fd, off, SEEK_SET);
-    size_t rem = len;
-    while (rem > 0) {
-        size_t to_read = rem < sizeof(tmp) ? rem : sizeof(tmp);
-        ssize_t n = read(fd, tmp, to_read);
-        if (n <= 0) break;
-        ssize_t written = tls_write(conn->tls, tmp, (size_t)n);
-        if (written < 0) return -1;
-        rem -= (size_t)n;
-    }
-    close(fd);
-    return 0;
-}
+
 
 static void *worker_run(void *arg) {
     worker_t *w = (worker_t *)arg;
