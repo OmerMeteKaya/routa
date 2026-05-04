@@ -6,6 +6,7 @@
 #include "http/router.h"
 #include "net/poller.h"
 #include "net/tls.h"
+#include "http/middleware.h"
 
 typedef struct event_loop event_loop_t;
 typedef struct worker     worker_t;
@@ -19,6 +20,7 @@ struct worker {
     int            port;
     tls_context_t *tls_ctx;
     router_t      *router;
+    middleware_chain_t *chain;
     pthread_t      thread;
 };
 
@@ -31,5 +33,6 @@ void          event_loop_add_route(event_loop_t *loop, const char *path,
                                    void *ctx);
 void          event_loop_set_tls(event_loop_t *loop,
                                  const char *cert_file, const char *key_file);
+void          event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain);
 
 #endif /* ROUTA_CORE_EVENT_LOOP_H */

@@ -2,6 +2,10 @@
 #include "http/request.h"
 #include "http/response.h"
 #include "http/static.h"
+#include "http/middleware.h"
+#include "http/mw_logger.h"
+#include "http/mw_cors.h"
+#include "http/mw_ratelimit.h"
 
 static int handle_hello(const http_request_t *req,
                          http_response_t *resp, void *ctx) {
@@ -14,8 +18,18 @@ static int handle_hello(const http_request_t *req,
 
 int main(void) {
     server_t *s = server_new(8080, 4);
-    server_route(s, "/api/hello", HTTP_GET_M | HTTP_HEAD_M, handle_hello, NULL);
+
+    server_use(s, mw_logger, NULL);
+    server_use(s, mw_cors, mw_cors_config_new("*",
+        "GET, POST, PUT, DELETE, OPTIONS",
+        "Content-Type, Authorization"));
+    server_use(s, mw_rate_limit,
+        mw_rate_limit_config_new(1000, 2000));
+
+    server_route(s, "/api/hello", HTTP_GET_M | HTTP_HEAD_M | HTTP_OPTIONS_M,
+                 handle_hello, NULL);
     server_static(s, "/", "./public", 1);
+
     server_run(s);
     server_free(s);
     return 0;

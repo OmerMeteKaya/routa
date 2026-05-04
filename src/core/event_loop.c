@@ -22,6 +22,7 @@
 #define MAX_EVENTS 1024
 
 static router_t *g_router = NULL;
+static middleware_chain_t *g_chain = NULL;
 
 struct event_loop {
     int            port;
@@ -247,15 +248,35 @@ static void handle_events_worker(worker_t *w) {
                     conn->keep_alive = req.keep_alive;
 
                     int allowed_methods = 0;
-                    int dispatch_result = router_dispatch(w->router, &req, &resp, &allowed_methods);
+                    route_t *matched_route = router_match(w->router, &req, &allowed_methods);
 
-                    if (dispatch_result == -1) {
+                    if (matched_route == NULL && allowed_methods == 0) {
                         // 404 Not Found
                         http_response_destroy(&resp);
                         http_response_init(&resp);
                         http_response_simple(&conn->write_buf, 404, "Not Found",
                                             "text/plain", "Not Found\n");
-                    } else if (dispatch_result == -2) {
+                    } else if (matched_route == NULL && allowed_methods != 0) {
+                        /* 405 — but run chain first so CORS middleware can
+                           handle OPTIONS preflight before we reject */
+                        if (w->chain && req.method == HTTP_OPTIONS) {
+                            /* Provide a no-op final handler */
+                            w->chain->current = 0;
+                            middleware_chain_set_handler(w->chain, NULL, NULL);
+                            middleware_chain_execute(w->chain, &req, &resp);
+                            /* If middleware already set a status, serialize and go */
+                            if (resp.status != 0) {
+                                http_response_set_header(&resp, "Connection",
+                                    conn->keep_alive ? "keep-alive" : "close");
+                                buf_reset(&conn->write_buf);
+                                http_response_serialize(&resp, &conn->write_buf);
+                                http_response_destroy(&resp);
+                                http_request_free(&req);
+                                conn->state = CONN_WRITING;
+                                goto handle_state;
+                            }
+                        }
+                        /* Fall through to normal 405 handling */
                         // 405 Method Not Allowed
                         http_response_destroy(&resp);
                         http_response_init(&resp);
@@ -309,7 +330,15 @@ static void handle_events_worker(worker_t *w) {
                         buf_reset(&conn->write_buf);
                         http_response_serialize(&resp, &conn->write_buf);
                     } else {
-                        // Success, set connection header and serialize response
+                        // Success — run through middleware chain or call handler directly
+                        if (w->chain) {
+                            w->chain->current = 0;
+                            middleware_chain_set_handler(w->chain, matched_route->handler, matched_route->ctx);
+                            middleware_chain_execute(w->chain, &req, &resp);
+                        } else {
+                            matched_route->handler(&req, &resp, matched_route->ctx);
+                        }
+                        // Set connection header and serialize response
                         http_response_set_header(&resp, "Connection",
                                                conn->keep_alive ? "keep-alive" : "close");
                         
@@ -527,6 +556,7 @@ void event_loop_run(event_loop_t *loop) {
         w->port      = loop->port;
         w->tls_ctx   = loop->tls_ctx;
         w->router    = g_router;
+        w->chain     = g_chain;
         w->should_stop = 0;
         pthread_create(&w->thread, NULL, worker_run, w);
     }
@@ -585,6 +615,11 @@ void event_loop_set_tls(event_loop_t *loop,
 
 
 
+
+void event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain) {
+    (void)loop;
+    g_chain = chain;
+}
 
 
 void event_loop_free(event_loop_t *loop) {

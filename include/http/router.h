@@ -29,4 +29,7 @@ int router_add(router_t *r, const char *path, int methods,
 int router_dispatch(router_t *r, const http_request_t *req,
                     http_response_t *resp, int *allowed_methods);
 
+// Match a route without executing it. Returns the route or NULL.
+route_t *router_match(router_t *r, const http_request_t *req, int *allowed_methods);
+
 #endif // ROUTA_HTTP_ROUTER_H

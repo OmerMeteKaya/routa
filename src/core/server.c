@@ -2,6 +2,7 @@
 #include "core/server.h"
 #include "core/event_loop.h"
 #include "util/logger.h"
+#include "http/middleware.h"
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -125,6 +126,9 @@ void server_run(server_t *s) {
     }
     
     // Run event loop
+    if (s->chain) {
+        event_loop_set_chain((event_loop_t *)s->loop, s->chain);
+    }
     event_loop_run((event_loop_t *)s->loop);
 }
 
@@ -167,5 +171,22 @@ void server_free(server_t *s) {
         free(s);
     }
     
+    if (s->chain) {
+        middleware_chain_free(s->chain);
+    }
+    free(s);
+    
     g_loop = NULL;
+}
+
+void server_use(server_t *s, middleware_fn_t fn, void *ctx) {
+    if (!s) return;
+    if (!s->chain) {
+        s->chain = middleware_chain_new();
+        if (!s->chain) {
+            LOG_ERROR("Failed to create middleware chain");
+            return;
+        }
+    }
+    middleware_chain_use(s->chain, fn, ctx);
 }

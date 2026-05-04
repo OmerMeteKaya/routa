@@ -143,3 +143,57 @@ int router_dispatch(router_t *r, const http_request_t *req,
     // Call handler
     return route->handler(req, resp, route->ctx);
 }
+
+route_t *router_match(router_t *r, const http_request_t *req, int *allowed_methods) {
+    if (!r || !req) return NULL;
+
+    int best_match  = -1;
+    int prefix_match = -1;
+    int exact_match  = -1;
+
+    for (int i = 0; i < r->route_count; i++) {
+        route_t *route = &r->routes[i];
+        size_t route_path_len = strlen(route->path);
+
+        if (strcmp(route->path, req->path) == 0) {
+            exact_match = i;
+            break;
+        }
+
+        if (route_path_len > 0 && route->path[route_path_len - 1] == '*') {
+            size_t prefix_len = route_path_len - 1;
+            if (strncmp(route->path, req->path, prefix_len) == 0)
+                prefix_match = i;
+            if (prefix_len == 1 && route->path[0] == '/')
+                prefix_match = i;
+            continue;
+        }
+
+        if (route_path_len > 2 &&
+            route->path[route_path_len - 2] == '/' &&
+            route->path[route_path_len - 1] == '*') {
+            size_t prefix_len = route_path_len - 2;
+            if (strncmp(route->path, req->path, prefix_len) == 0 &&
+                (req->path[prefix_len] == '\0' || req->path[prefix_len] == '/'))
+                prefix_match = i;
+        }
+    }
+
+    best_match = (exact_match >= 0) ? exact_match : prefix_match;
+    if (best_match < 0) return NULL;
+
+    route_t *route = &r->routes[best_match];
+
+    if (allowed_methods) {
+        *allowed_methods = 0;
+        for (int i = 0; i < route->method_count; i++)
+            *allowed_methods |= (1 << route->methods[i]);
+    }
+
+    /* Check method is allowed — return NULL with allowed_methods filled = 405 signal */
+    for (int i = 0; i < route->method_count; i++)
+        if (route->methods[i] == req->method)
+            return route;
+
+    return NULL; /* method not allowed */
+}
