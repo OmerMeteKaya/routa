@@ -86,6 +86,15 @@ static char *find_next_line(char *start, char *end, char **line_end) {
     return NULL;
 }
 
+const char *http_request_get_query(const http_request_t *req, const char *key) {
+    if (!req || !key) return NULL;
+    for (int i = 0; i < req->query_param_count; i++)
+        if (req->query_params[i].key &&
+            strcmp(req->query_params[i].key, key) == 0)
+            return req->query_params[i].value;
+    return NULL;
+}
+
 int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) {
     if (!req || !buf || !consumed) return -1;
 
@@ -138,6 +147,35 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
         *q = '\0';
         req->query = strdup(q + 1);
         if (!req->query) { free(raw_path); ret = -1; goto done; }
+    }
+
+    /* Parse query params from req->query */
+    if (req->query) {
+        char *qs = strdup(req->query);
+        if (qs) {
+            char *pair = qs;
+            char *amp;
+            do {
+                amp = strchr(pair, '&');
+                if (amp) *amp = '\0';
+                char *eq = strchr(pair, '=');
+                if (eq && req->query_param_count < 32) {
+                    *eq = '\0';
+                    char *k = url_decode(pair, strlen(pair));
+                    char *v = url_decode(eq + 1, strlen(eq + 1));
+                    if (k && v) {
+                        req->query_params[req->query_param_count].key   = k;
+                        req->query_params[req->query_param_count].value = v;
+                        req->query_param_count++;
+                    } else {
+                        free(k);
+                        free(v);
+                    }
+                }
+                pair = amp ? amp + 1 : NULL;
+            } while (pair);
+            free(qs);
+        }
     }
 
     char *decoded = url_decode(raw_path, strlen(raw_path));
@@ -226,6 +264,10 @@ void http_request_free(http_request_t *req) {
     if (!req) return;
     free(req->path);
     free(req->query);
+    for (int i = 0; i < req->query_param_count; i++) {
+        free(req->query_params[i].key);
+        free(req->query_params[i].value);
+    }
     free(req->body);
     for (int i = 0; i < req->header_count; i++) {
         free(req->headers[i].key);

@@ -19,6 +19,11 @@ typedef struct {
     http_method_t  method;
     char          *path;        // heap allocated, url-decoded, normalized
     char          *query;       // heap allocated, raw query string or NULL
+    struct {
+        char *key;
+        char *value;
+    }              query_params[32];
+    int            query_param_count;
     int            version_major;
     int            version_minor;
     http_header_t  headers[64];
@@ -33,5 +38,6 @@ typedef struct {
 int  http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed);
 void http_request_free(http_request_t *req);
 const char *http_request_get_header(const http_request_t *req, const char *key);
+const char *http_request_get_query(const http_request_t *req, const char *key);
 
 #endif // ROUTA_HTTP_REQUEST_H
