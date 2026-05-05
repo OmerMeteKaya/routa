@@ -3,6 +3,7 @@
 #include "core/event_loop.h"
 #include "util/logger.h"
 #include "http/middleware.h"
+#include "http/file_cache.h"
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -55,7 +56,13 @@ int server_static(server_t *s, const char *url_prefix,
         s->static_configs[s->static_config_count++] = cfg;
     }
     
-    strncpy(cfg->doc_root, doc_root, sizeof(cfg->doc_root) - 1);
+    char resolved_root[1024];
+    if (!realpath(doc_root, resolved_root)) {
+        /* fallback to raw path if realpath fails */
+        strncpy(cfg->doc_root, doc_root, sizeof(cfg->doc_root) - 1);
+    } else {
+        strncpy(cfg->doc_root, resolved_root, sizeof(cfg->doc_root) - 1);
+    }
     cfg->doc_root[sizeof(cfg->doc_root) - 1] = '\0';
     
     strncpy(cfg->url_prefix, url_prefix, sizeof(cfg->url_prefix) - 1);
@@ -129,6 +136,16 @@ void server_run(server_t *s) {
     if (s->chain) {
         event_loop_set_chain((event_loop_t *)s->loop, s->chain);
     }
+
+    /* Initialize file cache */
+    file_cache_config_t fc_cfg = {
+        .enabled     = 1,
+        .max_entries = 512,
+        .ttl_seconds = 5,
+        .strategy    = FILE_CACHE_STAT_TTL
+    };
+    file_cache_init(&fc_cfg);
+
     event_loop_run((event_loop_t *)s->loop);
 }
 
@@ -161,22 +178,15 @@ server_t *server_from_config_file(const char *path) {
 }
 
 void server_free(server_t *s) {
-    if (s) {
-        if (s->loop) {
-            event_loop_free((event_loop_t *)s->loop);
-        }
-        for (int i = 0; i < s->static_config_count; i++) {
-            free(s->static_configs[i]);
-        }
-        free(s);
-    }
-    
-    if (s->chain) {
+    if (!s) return;
+    if (s->loop)
+        event_loop_free((event_loop_t *)s->loop);
+    if (s->chain)
         middleware_chain_free(s->chain);
-    }
+    for (int i = 0; i < s->static_config_count; i++)
+        free(s->static_configs[i]);
+    file_cache_free();
     free(s);
-    
-    g_loop = NULL;
 }
 
 void server_use(server_t *s, middleware_fn_t fn, void *ctx) {

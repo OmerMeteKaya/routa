@@ -624,23 +624,26 @@ void event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain) {
 
 void event_loop_free(event_loop_t *loop) {
     if (!loop) return;
-    
-    // Free router
+
     if (g_router) {
         router_free(g_router);
         g_router = NULL;
     }
-    
-    // Free TLS context
+
+    if (g_chain) {
+        g_chain = NULL;  /* owned by server_t, not us */
+    }
+
     if (loop->tls_ctx) {
         tls_context_free(loop->tls_ctx);
+        loop->tls_ctx = NULL;
     }
-    
-    // Free workers
+
     if (loop->workers) {
         free(loop->workers);
+        loop->workers = NULL;
     }
-    
+
     free(loop);
 }
 

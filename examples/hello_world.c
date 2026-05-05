@@ -19,12 +19,14 @@ static int handle_hello(const http_request_t *req,
 int main(void) {
     server_t *s = server_new(8080, 4);
 
-    server_use(s, mw_logger, NULL);
-    server_use(s, mw_cors, mw_cors_config_new("*",
+    cors_config_t       *cors_cfg = mw_cors_config_new("*",
         "GET, POST, PUT, DELETE, OPTIONS",
-        "Content-Type, Authorization"));
-    server_use(s, mw_rate_limit,
-        mw_rate_limit_config_new(1000, 2000));
+        "Content-Type, Authorization");
+    rate_limit_config_t *rl_cfg   = mw_rate_limit_config_new(1000, 2000);
+
+    server_use(s, mw_logger,     NULL);
+    server_use(s, mw_cors,       cors_cfg);
+    server_use(s, mw_rate_limit, rl_cfg);
 
     server_route(s, "/api/hello", HTTP_GET_M | HTTP_HEAD_M | HTTP_OPTIONS_M,
                  handle_hello, NULL);
@@ -32,5 +34,8 @@ int main(void) {
 
     server_run(s);
     server_free(s);
+
+    mw_cors_config_free(cors_cfg);
+    mw_rate_limit_config_free(rl_cfg);
     return 0;
 }
