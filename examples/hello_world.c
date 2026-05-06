@@ -26,7 +26,7 @@ int main(void) {
 
     server_use(s, mw_logger,     NULL);
     server_use(s, mw_cors,       cors_cfg);
-    server_use(s, mw_rate_limit, rl_cfg);
+    //server_use(s, mw_rate_limit, rl_cfg);
 
     server_route(s, "/api/hello", HTTP_GET_M | HTTP_HEAD_M | HTTP_OPTIONS_M,
                  handle_hello, NULL);

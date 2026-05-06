@@ -13,6 +13,19 @@ void http_response_init(http_response_t *r) {
     r->body_fd = -1;
 }
 
+int http_chunk_append(buf_t *out, const void *data, size_t len) {
+    if (!out) return -1;
+
+    if (len == 0) {
+        return buf_append(out, "0\r\n\r\n", 5);
+    }
+    char prefix[24];
+    int plen = snprintf(prefix, sizeof(prefix), "%zx\r\n", len);
+    if (buf_append(out, prefix, (size_t)plen) < 0) return -1;
+    if (buf_append(out, data, len) < 0) return -1;
+    return buf_append(out, "\r\n", 2);
+}
+
 void http_response_set_status(http_response_t *r, int status, const char *reason) {
     if (!r) return;
     r->status = status;
@@ -51,9 +64,12 @@ void http_response_set_body(http_response_t *r, const char *data, size_t len) {
     memcpy(r->body, data, len);
     r->body_len = len;
 
-    char cl[32];
-    snprintf(cl, sizeof(cl), "%zu", len);
-    http_response_set_header(r, "Content-Length", cl);
+    // Only set Content-Length if not using chunked encoding
+    if (!r->chunked) {
+        char cl[32];
+        snprintf(cl, sizeof(cl), "%zu", len);
+        http_response_set_header(r, "Content-Length", cl);
+    }
 }
 
 void http_response_set_body_fd(http_response_t *r, int fd, off_t offset, size_t len) {
@@ -85,10 +101,12 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
 
     /* Check which required headers already set */
     int has_date = 0, has_server = 0, has_connection = 0;
+    int has_transfer_encoding = 0;
     for (int i = 0; i < r->header_count; i++) {
-        if (strcasecmp(r->headers[i][0], "Date") == 0)       has_date = 1;
-        if (strcasecmp(r->headers[i][0], "Server") == 0)     has_server = 1;
-        if (strcasecmp(r->headers[i][0], "Connection") == 0) has_connection = 1;
+        if (strcasecmp(r->headers[i][0], "Date") == 0)              has_date = 1;
+        if (strcasecmp(r->headers[i][0], "Server") == 0)            has_server = 1;
+        if (strcasecmp(r->headers[i][0], "Connection") == 0)        has_connection = 1;
+        if (strcasecmp(r->headers[i][0], "Transfer-Encoding") == 0) has_transfer_encoding = 1;
     }
 
     /* Status line */
@@ -111,8 +129,20 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
         if (buf_append(out, "Connection: close\r\n", 19) < 0) return -1;
     }
 
+    /* Handle chunked encoding */
+    if (r->chunked) {
+        if (!has_transfer_encoding) {
+            if (buf_append(out, "Transfer-Encoding: chunked\r\n", 28) < 0) return -1;
+        }
+    }
+
     /* All headers set by caller */
     for (int i = 0; i < r->header_count; i++) {
+        // Skip Content-Length header when using chunked encoding
+        if (r->chunked && strcasecmp(r->headers[i][0], "Content-Length") == 0) {
+            continue;
+        }
+        
         char hl[512];
         int hl_len = snprintf(hl, sizeof(hl), "%s: %s\r\n",
                               r->headers[i][0], r->headers[i][1]);
@@ -123,8 +153,18 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
     if (buf_append(out, "\r\n", 2) < 0) return -1;
 
     /* Body */
-    if (r->body && r->body_len > 0) {
-        if (buf_append(out, r->body, r->body_len) < 0) return -1;
+    if (r->chunked) {
+        // For chunked encoding with body data
+        if (r->body && r->body_len > 0) {
+            if (http_chunk_append(out, r->body, r->body_len) < 0) return -1;
+        }
+        // Always add terminating chunk for chunked encoding
+        if (http_chunk_append(out, NULL, 0) < 0) return -1;
+    } else {
+        // Non-chunked encoding
+        if (r->body && r->body_len > 0) {
+            if (buf_append(out, r->body, r->body_len) < 0) return -1;
+        }
     }
     /* If body_fd >= 0: headers only, caller uses sendfile() for body */
 

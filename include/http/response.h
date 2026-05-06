@@ -15,6 +15,7 @@ typedef struct {
     int    body_fd;      /* -1 = no fd body, >= 0 = use sendfile() */
     off_t  body_fd_off;  /* offset to start from */
     size_t body_fd_len; /* number of bytes to send */
+    int    chunked;      /* 1 = use Transfer-Encoding: chunked, no Content-Length */
 } http_response_t;
 
 void http_response_init(http_response_t *r);
@@ -41,5 +42,8 @@ void http_response_destroy(http_response_t *r);
 // Convenience: write a complete response in one call
 int http_response_simple(buf_t *out, int status, const char *reason,
                          const char *content_type, const char *body);
+
+/* Encode one chunk into out. len=0 writes terminator "0\r\n\r\n". */
+int http_chunk_append(buf_t *out, const void *data, size_t len);
 
 #endif // ROUTA_HTTP_RESPONSE_H

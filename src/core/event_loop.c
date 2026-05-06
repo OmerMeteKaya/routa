@@ -31,6 +31,9 @@ struct event_loop {
     tls_context_t *tls_ctx;
     int            should_stop;
 };
+tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop) {
+    return loop ? loop->tls_ctx : NULL;
+}
 
 static int send_file_tls(worker_t *w, conn_t *conn,
                          int fd, off_t off, size_t len) {

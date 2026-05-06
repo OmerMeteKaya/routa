@@ -34,5 +34,6 @@ void          event_loop_add_route(event_loop_t *loop, const char *path,
 void          event_loop_set_tls(event_loop_t *loop,
                                  const char *cert_file, const char *key_file);
 void          event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain);
+tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop);
 
 #endif /* ROUTA_CORE_EVENT_LOOP_H */

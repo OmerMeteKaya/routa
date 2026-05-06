@@ -31,12 +31,17 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->port                = 8080;
     cfg->n_workers           = GET_CPU_COUNT();
     cfg->backlog             = 128;
+    cfg->tls_session_timeout = 3600;
     cfg->log_level           = 1; /* INFO */
     cfg->keepalive_timeout_ms = 30000;
     cfg->request_timeout_ms  = 10000;
     cfg->max_connections     = 10000;
     cfg->max_request_size    = 1048576; /* 1MB */
     cfg->cache_memory_mb     = 64;
+    cfg->file_cache_enabled     = 1;
+    cfg->file_cache_max_entries = 512;
+    cfg->file_cache_ttl         = 5;
+    cfg->file_cache_strategy    = 1; /* stat_ttl */
 }
 
 /* ---- Simple line-based parser ---- */
@@ -151,6 +156,21 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                              lineno, val);
                 }
             }
+        } else if (strcmp(key, "file_cache_enabled") == 0) {
+            cfg->file_cache_enabled = atoi(val);
+        } else if (strcmp(key, "file_cache_entries") == 0) {
+            cfg->file_cache_max_entries = atoi(val);
+        } else if (strcmp(key, "file_cache_ttl") == 0) {
+            cfg->file_cache_ttl = atoi(val);
+        } else if (strcmp(key, "file_cache_strategy") == 0) {
+            if (strcasecmp(val, "ttl") == 0)          cfg->file_cache_strategy = 0;
+            else if (strcasecmp(val, "stat_ttl") == 0) cfg->file_cache_strategy = 1;
+            else if (strcasecmp(val, "inotify") == 0)  cfg->file_cache_strategy = 2;
+            else cfg->file_cache_strategy = atoi(val);
+        } else if (strcmp(key, "tls_session_timeout") == 0) {
+            cfg->tls_session_timeout = atoi(val);
+        } else if (strcmp(key, "tls_ocsp_response") == 0) {
+            strncpy(cfg->tls_ocsp_response, val, sizeof(cfg->tls_ocsp_response) - 1);
         } else {
             LOG_WARN("config:%d: unknown key '%s'", lineno, key);
         }

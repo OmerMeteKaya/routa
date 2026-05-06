@@ -25,6 +25,7 @@ int       server_static(server_t *s, const char *url_prefix,
                         const char *doc_root, int enable_index);
 int       server_enable_tls(server_t *s,
                             const char *cert_file, const char *key_file);
+int       server_enable_ocsp_stapling(server_t *s, const char *ocsp_file);
 
 /* Create server from config struct */
 server_t *server_from_config(const routa_config_t *cfg);

@@ -17,6 +17,8 @@ typedef struct {
     int   tls_enabled;
     char  tls_cert[512];
     char  tls_key[512];
+    int   tls_session_timeout;      /* seconds, default: 3600 */
+    char  tls_ocsp_response[512];   /* path to DER file, empty = disabled */
 
     /* Static file serving */
     struct {
@@ -38,10 +40,16 @@ typedef struct {
     int max_connections;        /* default: 10000 */
     int max_request_size;       /* default: 1MB */
 
-    /* Cache */
-    int   cache_enabled;
+    /* HTTP response cache */
+    int    cache_enabled;
     size_t cache_memory_mb;     /* default: 64 */
-    char  cache_dir[512];       /* empty = memory only */
+    char   cache_dir[512];      /* empty = memory only */
+
+    /* File stat/path cache */
+    int  file_cache_enabled;    /* default: 1 */
+    int  file_cache_max_entries;/* default: 512 */
+    int  file_cache_ttl;        /* seconds, default: 5 */
+    int  file_cache_strategy;   /* 0=ttl, 1=stat_ttl, 2=inotify */
 } routa_config_t;
 
 /* Initialize config with sensible defaults */

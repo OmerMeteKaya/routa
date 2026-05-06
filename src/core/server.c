@@ -99,6 +99,8 @@ int server_enable_tls(server_t *s,
     
     tls_init();
     event_loop_set_tls((event_loop_t *)s->loop, cert_file, key_file);
+    /* Session resumption is enabled by default in tls_context_new().
+       OCSP stapling activated via server_enable_ocsp_stapling(). */
     return 0;
 }
 
@@ -109,6 +111,16 @@ void server_route(server_t *s, const char *path, int methods,
     }
     
     event_loop_add_route((event_loop_t *)s->loop, path, methods, handler, ctx);
+}
+
+int server_enable_ocsp_stapling(server_t *s, const char *ocsp_file) {
+    if (!s || !s->loop || !ocsp_file) return -1;
+    event_loop_t *loop = (event_loop_t *)s->loop;
+    if (!event_loop_get_tls_ctx(loop)) {
+        LOG_ERROR("TLS must be enabled before OCSP stapling");
+        return -1;
+    }
+    return tls_context_enable_ocsp_stapling(event_loop_get_tls_ctx(loop), ocsp_file);
 }
 
 void server_run(server_t *s) {
@@ -139,7 +151,7 @@ void server_run(server_t *s) {
 
     /* Initialize file cache */
     file_cache_config_t fc_cfg = {
-        .enabled     = 1,
+        .enabled     = 0,
         .max_entries = 512,
         .ttl_seconds = 5,
         .strategy    = FILE_CACHE_STAT_TTL

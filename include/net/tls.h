@@ -14,6 +14,7 @@ typedef struct {
     SSL     *ssl;
     int      fd;
     int      handshake_done;
+    int      resumed;          /* 1 if session was resumed */
 } tls_conn_t;
 
 /* Initialize OpenSSL library (call once at startup) */
@@ -42,5 +43,14 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len);
 
 /* Graceful shutdown */
 void tls_shutdown(tls_conn_t *tc);
+
+/* Session resumption — call after tls_context_new() */
+int tls_context_enable_session_cache(tls_context_t *ctx, int timeout_seconds);
+
+/* OCSP stapling — load pre-fetched DER response from file */
+int tls_context_enable_ocsp_stapling(tls_context_t *ctx, const char *ocsp_file);
+
+/* Returns 1 if last connection used session resumption */
+int tls_session_resumed(const tls_conn_t *tc);
 
 #endif
