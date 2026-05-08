@@ -17,7 +17,9 @@ find_package(Threads REQUIRED)
 
 file(GLOB_RECURSE ROUTA_SOURCES src/**/*.c)
 
-add_library(routa_core STATIC ${ROUTA_SOURCES})
+add_library(routa_core STATIC ${ROUTA_SOURCES}
+        include/net/uring.h
+        src/net/uring.c)
 
 target_include_directories(routa_core PUBLIC include)
 
