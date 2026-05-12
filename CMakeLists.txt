@@ -16,10 +16,12 @@ endif()
 
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
-
+find_package(ZLIB REQUIRED)
+target_link_libraries(routa_core PRIVATE ZLIB::ZLIB)
 file(GLOB_RECURSE ROUTA_SOURCES src/**/*.c)
 
-add_library(routa_core STATIC ${ROUTA_SOURCES})
+add_library(routa_core STATIC ${ROUTA_SOURCES}
+        include/http/mw_compress.h)
 
 target_include_directories(routa_core PUBLIC include)
 
