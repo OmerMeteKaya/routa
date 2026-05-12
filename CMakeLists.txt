@@ -6,6 +6,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(cmake/CompileFlags.cmake)
 
+option(ROUTA_IO_URING "Use io_uring I/O backend (Linux only)" OFF)
+
 if(APPLE)
     list(APPEND CMAKE_PREFIX_PATH
         "/opt/homebrew/opt/openssl@3"
@@ -17,14 +19,21 @@ find_package(Threads REQUIRED)
 
 file(GLOB_RECURSE ROUTA_SOURCES src/**/*.c)
 
-add_library(routa_core STATIC ${ROUTA_SOURCES}
-        include/net/uring.h
-        src/net/uring.c)
+add_library(routa_core STATIC ${ROUTA_SOURCES})
 
 target_include_directories(routa_core PUBLIC include)
 
 target_link_libraries(routa_core PUBLIC
         Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(routa_core PRIVATE pthread ssl crypto)
+if(ROUTA_IO_URING)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "io_uring is Linux-only")
+    endif()
+    target_compile_definitions(routa_core PRIVATE ROUTA_IO_URING=1)
+    target_link_libraries(routa_core PRIVATE uring)
+    target_sources(routa_core PRIVATE src/net/uring.c)
+endif()
 add_executable(chunked_example examples/chunked_example.c)
 target_link_libraries(chunked_example PRIVATE routa_core)
 

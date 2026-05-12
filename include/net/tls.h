@@ -3,54 +3,87 @@
 
 #include <openssl/ssl.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
+#include <pthread.h>
 #include "util/buf.h"
 
+/* ── Session Ticket Encryption Key (STEK) ─────────────────────────────────
+ * One STEK lives in tls_context_t and is shared across all workers via the
+ * same SSL_CTX pointer.  Rotate with tls_context_rotate_stek() periodically
+ * (e.g. every 6-24 h).  Forward-secrecy: old sessions cannot be decrypted
+ * after rotation.
+ * -------------------------------------------------------------------------*/
+#define TLS_STEK_NAME_LEN  16
+#define TLS_STEK_AES_LEN   16   /* AES-128-CBC */
+#define TLS_STEK_HMAC_LEN  16   /* HMAC-SHA256 truncated */
+
 typedef struct {
-    SSL_CTX *ctx;
+    uint8_t name   [TLS_STEK_NAME_LEN];
+    uint8_t aes_key[TLS_STEK_AES_LEN];
+    uint8_t hmac_key[TLS_STEK_HMAC_LEN];
+} tls_stek_t;
+
+/* ── Context ───────────────────────────────────────────────────────────────*/
+typedef struct {
+    SSL_CTX        *ctx;
+
+    /* STEK – guarded by stek_lock */
+    tls_stek_t      stek;
+    pthread_rwlock_t stek_lock;
+
+    /* OCSP stapling response – guarded by ocsp_lock */
+    unsigned char  *ocsp_response;
+    long            ocsp_response_len;
+    pthread_rwlock_t ocsp_lock;
 } tls_context_t;
 
 typedef struct {
-    SSL     *ssl;
-    int      fd;
-    int      handshake_done;
-    int      resumed;          /* 1 if session was resumed */
+    SSL *ssl;
+    int  fd;
+    int  handshake_done;
+    int  resumed;          /* 1 if session was resumed */
 } tls_conn_t;
 
-/* Initialize OpenSSL library (call once at startup) */
+/* ── Library init (call once at startup) ───────────────────────────────────*/
 void tls_init(void);
 
-/* Create a server TLS context from cert and key PEM files.
-   Returns NULL on error. */
+/* ── Context lifetime ──────────────────────────────────────────────────────*/
 tls_context_t *tls_context_new(const char *cert_file, const char *key_file);
 void           tls_context_free(tls_context_t *ctx);
 
-/* Wrap an accepted fd with TLS. Returns NULL on error. */
+/* ── Session cache (TLS 1.2 session IDs, optional) ─────────────────────── */
+int tls_context_enable_session_cache(tls_context_t *ctx, int timeout_seconds);
+
+/* ── STEK rotation ─────────────────────────────────────────────────────────
+ * Generates a fresh random STEK and installs it.  Existing TLS 1.3 tickets
+ * signed by the old key will fall back to a full handshake.
+ * Call from a single timer thread; safe to call while workers are running. */
+int tls_context_rotate_stek(tls_context_t *ctx);
+
+/* ── OCSP stapling ─────────────────────────────────────────────────────────
+ * Load a pre-fetched DER-encoded OCSP response from file.
+ * Thread-safe: safe to call while workers are running (hot reload). */
+int tls_context_enable_ocsp_stapling(tls_context_t *ctx, const char *ocsp_file);
+
+/* ── Connection lifetime ───────────────────────────────────────────────────*/
 tls_conn_t *tls_conn_new(tls_context_t *ctx, int fd);
 void        tls_conn_free(tls_conn_t *tc);
 
-/* Perform TLS handshake. Returns:
-    0  — handshake complete
-    1  — want read (call again when fd readable)
-   -1  — want write (call again when fd writable)
-   -2  — fatal error */
+/* Handshake — returns:
+    0  complete
+    1  want read
+   -1  want write
+   -2  fatal */
 int tls_handshake(tls_conn_t *tc);
 
-/* Read/write — same semantics as read()/write() but over TLS.
-   Return bytes transferred, 0 on close, -1 on error/want-more. */
-ssize_t tls_read(tls_conn_t *tc, void *buf, size_t len);
+/* Read / write — same semantics as read()/write(). */
+ssize_t tls_read (tls_conn_t *tc, void *buf,       size_t len);
 ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len);
 
-/* Graceful shutdown */
 void tls_shutdown(tls_conn_t *tc);
 
-/* Session resumption — call after tls_context_new() */
-int tls_context_enable_session_cache(tls_context_t *ctx, int timeout_seconds);
-
-/* OCSP stapling — load pre-fetched DER response from file */
-int tls_context_enable_ocsp_stapling(tls_context_t *ctx, const char *ocsp_file);
-
-/* Returns 1 if last connection used session resumption */
+/* Returns 1 if the last handshake resumed a previous session. */
 int tls_session_resumed(const tls_conn_t *tc);
 
-#endif
+#endif /* ROUTA_NET_TLS_H */
