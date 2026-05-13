@@ -1,48 +1,53 @@
 #define _GNU_SOURCE
-#include "net/io.h"
-#include "util/logger.h"
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#include <netinet/in.h>
+#include <stdio.h>
+#include <time.h>
+#include "net/io.h"
+#include "http/response.h"
+#include "util/logger.h"
 
-#define IO_BUFFER_SIZE 8192
+#define IO_READ_BUF_SZ 8192
 
+/* ── io_read_into_buf ───────────────────────────────────────────────────────*/
 ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
     if (!b) return -1;
 
-    uint8_t temp_buf[IO_BUFFER_SIZE];
+    uint8_t tmp[IO_READ_BUF_SZ];
     ssize_t n;
 
     if (tls) {
-        n = tls_read(tls, temp_buf, sizeof(temp_buf));
-        if (n == -1) return 0;
+        n = tls_read(tls, tmp, sizeof(tmp));
+        if (n == -1) return 0;   /* want-read / want-write */
     } else {
-        n = read(fd, temp_buf, sizeof(temp_buf));
+        n = read(fd, tmp, sizeof(tmp));
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            LOG_ERROR("Read failed: %s", strerror(errno));
+            LOG_ERROR("io_read: %s", strerror(errno));
             return -1;
         }
     }
 
     if (n == 0) return 0;
 
-    if (buf_append(b, temp_buf, (size_t)n) < 0) {
-        LOG_ERROR("Failed to append to buffer");
+    if (buf_append(b, tmp, (size_t)n) < 0) {
+        LOG_ERROR("io_read: buf_append failed");
         return -1;
     }
-
     return n;
 }
 
+/* ── io_write_from_buf ──────────────────────────────────────────────────────*/
 ssize_t io_write_from_buf(int fd, buf_t *b, tls_conn_t *tls) {
     if (!b || b->len == 0) return 0;
 
     ssize_t n;
-
     if (tls) {
         n = tls_write(tls, b->data, b->len);
         if (n == -1) return 0;
@@ -50,7 +55,7 @@ ssize_t io_write_from_buf(int fd, buf_t *b, tls_conn_t *tls) {
         n = write(fd, b->data, b->len);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            LOG_ERROR("Write failed: %s", strerror(errno));
+            LOG_ERROR("io_write: %s", strerror(errno));
             return -1;
         }
     }
@@ -59,6 +64,162 @@ ssize_t io_write_from_buf(int fd, buf_t *b, tls_conn_t *tls) {
     return n;
 }
 
+/* ── Header serialization (headers only, no body) ───────────────────────────
+ * Writes status line + headers + "\r\n" into hdr_buf.
+ * Does NOT include body — caller appends body via iovec or sendfile.       */
+static int serialize_headers_only(const http_response_t *r, buf_t *hdr_buf) {
+    /* Date */
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    gmtime_r(&now, &tm_buf);
+    char date_str[64];
+    strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
+
+    /* Presence flags */
+    int has_date = 0, has_server = 0, has_connection = 0;
+    int has_transfer_encoding = 0;
+    for (int i = 0; i < r->header_count; i++) {
+        const char *k = r->headers[i][0];
+        if (strcasecmp(k, "Date") == 0)              has_date = 1;
+        else if (strcasecmp(k, "Server") == 0)       has_server = 1;
+        else if (strcasecmp(k, "Connection") == 0)   has_connection = 1;
+        else if (strcasecmp(k, "Transfer-Encoding") == 0) has_transfer_encoding = 1;
+    }
+
+    /* Status line */
+    char sl[256];
+    int sl_len = snprintf(sl, sizeof(sl), "HTTP/1.1 %d %s\r\n",
+                          r->status, r->reason ? r->reason : "OK");
+    if (buf_append(hdr_buf, sl, (size_t)sl_len) < 0) return -1;
+
+    /* Required headers */
+    if (!has_date) {
+        char dh[80];
+        int dl = snprintf(dh, sizeof(dh), "Date: %s\r\n", date_str);
+        if (buf_append(hdr_buf, dh, (size_t)dl) < 0) return -1;
+    }
+    if (!has_server)
+        if (buf_append(hdr_buf, "Server: routa/0.1\r\n", 19) < 0) return -1;
+    if (!has_connection)
+        if (buf_append(hdr_buf, "Connection: close\r\n", 19) < 0) return -1;
+    if (r->chunked && !has_transfer_encoding)
+        if (buf_append(hdr_buf, "Transfer-Encoding: chunked\r\n", 28) < 0) return -1;
+
+    /* Caller-set headers */
+    for (int i = 0; i < r->header_count; i++) {
+        /* Skip Content-Length for chunked */
+        if (r->chunked &&
+            strcasecmp(r->headers[i][0], "Content-Length") == 0) continue;
+
+        char hl[512];
+        int hl_len = snprintf(hl, sizeof(hl), "%s: %s\r\n",
+                              r->headers[i][0], r->headers[i][1]);
+        if (buf_append(hdr_buf, hl, (size_t)hl_len) < 0) return -1;
+    }
+
+    /* End of headers */
+    return buf_append(hdr_buf, "\r\n", 2);
+}
+
+/* ── io_writev_response ─────────────────────────────────────────────────────*/
+ssize_t io_writev_response(int fd, tls_conn_t *tls,
+                           const http_response_t *resp,
+                           buf_t *hdr_buf,
+                           size_t *written)
+{
+    /* hdr_buf must already be populated by conn_prepare_writev */
+    if (hdr_buf->len == 0) return -1;
+
+    size_t hdr_len  = hdr_buf->len;
+    size_t body_len = (resp->body && resp->body_len > 0) ? resp->body_len : 0;
+    size_t total    = hdr_len + body_len;
+
+    if (*written >= total) return 0;
+
+    size_t remaining = total - *written;
+
+    /* ── TLS path: two sequential writes ── */
+    if (tls) {
+        ssize_t n = 0;
+
+        /* Headers portion */
+        if (*written < hdr_len) {
+            size_t hdr_off  = *written;
+            size_t hdr_rem  = hdr_len - hdr_off;
+            n = tls_write(tls,
+                          (const char *)hdr_buf->data + hdr_off,
+                          hdr_rem);
+            if (n < 0) return 0;   /* want-read/write */
+            *written += (size_t)n;
+            if ((size_t)n < hdr_rem) return n;   /* partial */
+        }
+
+        /* Body portion */
+        if (body_len > 0 && *written >= hdr_len) {
+            size_t body_off = *written - hdr_len;
+            size_t body_rem = body_len - body_off;
+            n = tls_write(tls,
+                          (const char *)resp->body + body_off,
+                          body_rem);
+            if (n < 0) return 0;
+            *written += (size_t)n;
+            return n;
+        }
+        return 0;
+    }
+
+    /* ── Plain path: writev ── */
+    if (body_len > 0) {
+        /* Two iovec: headers + body */
+        size_t hdr_off  = (*written < hdr_len) ? *written : hdr_len;
+        size_t body_off = (*written > hdr_len) ? (*written - hdr_len) : 0;
+
+        struct iovec iov[2];
+        int    iovcnt = 0;
+
+        if (hdr_off < hdr_len) {
+            iov[iovcnt].iov_base = (char *)hdr_buf->data + hdr_off;
+            iov[iovcnt].iov_len  = hdr_len - hdr_off;
+            iovcnt++;
+        }
+        if (body_off < body_len) {
+            iov[iovcnt].iov_base = (char *)resp->body + body_off;
+            iov[iovcnt].iov_len  = body_len - body_off;
+            iovcnt++;
+        }
+
+        if (iovcnt == 0) return 0;
+
+        ssize_t n = writev(fd, iov, iovcnt);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            LOG_ERROR("io_writev: %s", strerror(errno));
+            return -1;
+        }
+        *written += (size_t)n;
+        return n;
+    }
+
+    /* Headers only (body_fd case or empty body) */
+    if (*written < hdr_len) {
+        size_t off = *written;
+        ssize_t n = write(fd,
+                          (const char *)hdr_buf->data + off,
+                          hdr_len - off);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            LOG_ERROR("io_write_hdr: %s", strerror(errno));
+            return -1;
+        }
+        *written += (size_t)n;
+        return n;
+    }
+
+    (void)remaining;
+    return 0;
+}
+
+/* ── TCP_CORK ───────────────────────────────────────────────────────────────*/
 int io_cork(int fd) {
     int v = 1;
     return setsockopt(fd, IPPROTO_TCP, TCP_CORK, &v, sizeof(v));
