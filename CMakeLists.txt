@@ -6,61 +6,72 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(cmake/CompileFlags.cmake)
 
+# ── Options ──────────────────────────────────────────────────────────────────
 option(ROUTA_IO_URING "Use io_uring I/O backend (Linux only)" OFF)
 
+# ── Dependency search paths (macOS Homebrew) ─────────────────────────────────
 if(APPLE)
     list(APPEND CMAKE_PREFIX_PATH
-        "/opt/homebrew/opt/openssl@3"
-        "/usr/local/opt/openssl@3")
+            "/opt/homebrew/opt/openssl@3"
+            "/usr/local/opt/openssl@3")
 endif()
 
+# ── Required dependencies ────────────────────────────────────────────────────
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
-find_package(ZLIB REQUIRED)
-target_link_libraries(routa_core PRIVATE ZLIB::ZLIB)
-file(GLOB_RECURSE ROUTA_SOURCES src/**/*.c)
+find_package(ZLIB    REQUIRED)
 
-add_library(routa_core STATIC ${ROUTA_SOURCES}
-        include/http/mw_compress.h)
+# ── Sources ──────────────────────────────────────────────────────────────────
+# Collect everything under src/ automatically
+file(GLOB_RECURSE ROUTA_SOURCES
+        src/core/*.c
+        src/http/*.c
+        src/net/*.c
+        src/util/*.c
+        src/lb/*.c
+)
+
+# ── Core library ─────────────────────────────────────────────────────────────
+add_library(routa_core STATIC ${ROUTA_SOURCES})
 
 target_include_directories(routa_core PUBLIC include)
 
 target_link_libraries(routa_core PUBLIC
-        Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
-target_link_libraries(routa_core PRIVATE pthread ssl crypto)
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        Threads::Threads
+        ZLIB::ZLIB
+)
+
+# ── io_uring (Linux only, opt-in) ────────────────────────────────────────────
 if(ROUTA_IO_URING)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR "io_uring is Linux-only")
     endif()
     target_compile_definitions(routa_core PRIVATE ROUTA_IO_URING=1)
     target_link_libraries(routa_core PRIVATE uring)
-    target_sources(routa_core PRIVATE src/net/uring.c)
 endif()
-add_executable(chunked_example examples/chunked_example.c)
-target_link_libraries(chunked_example PRIVATE routa_core)
 
-add_executable(hello_world examples/hello_world.c)
-add_executable(config_example examples/config_example.c)
-
-foreach(tgt hello_world config_example)
-    target_link_libraries(${tgt} PRIVATE routa_core)
+# ── Examples ─────────────────────────────────────────────────────────────────
+foreach(example hello_world config_example chunked_example)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
+        add_executable(${example} examples/${example}.c)
+        target_link_libraries(${example} PRIVATE routa_core)
+    endif()
 endforeach()
-add_executable(test_chunked tests/test_chunked.c)
-target_link_libraries(test_chunked PRIVATE routa_core)
 
-add_executable(test_buf tests/test_buf.c)
-add_executable(test_request tests/test_request.c)
-add_executable(test_middleware tests/test_middleware.c)
-
-foreach(tgt test_buf test_request test_middleware)
-    target_link_libraries(${tgt} PRIVATE routa_core)
+# ── Tests ────────────────────────────────────────────────────────────────────
+foreach(test test_buf test_request test_middleware test_chunked)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
+        add_executable(${test} tests/${test}.c)
+        target_link_libraries(${test} PRIVATE routa_core)
+    endif()
 endforeach()
 
 include(cmake/Sanitizers.cmake)
 
 enable_testing()
-
 add_test(NAME test_buf        COMMAND test_buf)
 add_test(NAME test_request    COMMAND test_request)
 add_test(NAME test_middleware COMMAND test_middleware)
-add_test(NAME chunked         COMMAND test_chunked)
+add_test(NAME test_chunked    COMMAND test_chunked)
