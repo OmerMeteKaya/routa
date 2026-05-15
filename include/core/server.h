@@ -5,14 +5,16 @@
 #include "http/static.h"
 #include "core/config.h"
 #include "http/middleware.h"
+#include "lb/lb.h"
 
 struct event_loop;
 
 typedef struct {
-    struct event_loop *loop;
-    void  *static_configs[16];
-    int    static_config_count;
+    struct event_loop  *loop;
+    void               *static_configs[16];
+    int                 static_config_count;
     middleware_chain_t *chain;
+    lb_t               *lb;           /* NULL when load balancer disabled   */
 } server_t;
 
 server_t *server_new(int port, int n_threads);
@@ -27,13 +29,15 @@ int       server_enable_tls(server_t *s,
                             const char *cert_file, const char *key_file);
 int       server_enable_ocsp_stapling(server_t *s, const char *ocsp_file);
 
-/* Create server from config struct */
-server_t *server_from_config(const routa_config_t *cfg);
+/* Load balancer — call before server_run() */
+int  server_enable_lb(server_t *s, const lb_config_t *cfg);
+int  server_lb_add_upstream(server_t *s,
+                             const char *host, uint16_t port, int weight);
 
-/* Load config file and create server */
+/* Create server from config struct / file */
+server_t *server_from_config(const routa_config_t *cfg);
 server_t *server_from_config_file(const char *path);
 
-// convenience macros:
 #define HTTP_GET_M     (1 << HTTP_GET)
 #define HTTP_POST_M    (1 << HTTP_POST)
 #define HTTP_PUT_M     (1 << HTTP_PUT)
@@ -42,4 +46,4 @@ server_t *server_from_config_file(const char *path);
 #define HTTP_HEAD_M    (1 << HTTP_HEAD)
 #define HTTP_OPTIONS_M (1 << HTTP_OPTIONS)
 
-#endif // ROUTA_CORE_SERVER_H
+#endif /* ROUTA_CORE_SERVER_H */

@@ -1,0 +1,11 @@
+/home/mete/routa/build-uring/CMakeFiles/routa_core.dir
+/home/mete/routa/build-uring/CMakeFiles/hello_world.dir
+/home/mete/routa/build-uring/CMakeFiles/config_example.dir
+/home/mete/routa/build-uring/CMakeFiles/chunked_example.dir
+/home/mete/routa/build-uring/CMakeFiles/test_buf.dir
+/home/mete/routa/build-uring/CMakeFiles/test_request.dir
+/home/mete/routa/build-uring/CMakeFiles/test_middleware.dir
+/home/mete/routa/build-uring/CMakeFiles/test_chunked.dir
+/home/mete/routa/build-uring/CMakeFiles/test.dir
+/home/mete/routa/build-uring/CMakeFiles/edit_cache.dir
+/home/mete/routa/build-uring/CMakeFiles/rebuild_cache.dir

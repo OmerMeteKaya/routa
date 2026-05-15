@@ -29,6 +29,6 @@ void mw_compress(middleware_chain_t *chain,
                  const http_request_t *req,
                  http_response_t *resp,
                  next_fn_t next,
-                 void *ctx);
+                 void *ctx,int);
 
 #endif /* ROUTA_HTTP_MW_COMPRESS_H */

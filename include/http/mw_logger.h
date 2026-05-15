@@ -6,6 +6,6 @@
 #include "http/response.h"
 
 void mw_logger(middleware_chain_t *chain, const http_request_t *req,
-               http_response_t *resp, next_fn_t next, void *ctx);
+               http_response_t *resp, next_fn_t next, void *ctx,int);
 
 #endif /* ROUTA_HTTP_MW_LOGGER_H */

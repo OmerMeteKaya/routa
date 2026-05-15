@@ -149,7 +149,7 @@ void file_cache_put(const char *path, const file_cache_entry_t *entry) {
         slot_unmap(&tl_slots[idx]);
     }
 
-    memcpy(tl_slots[idx].path, path, sizeof(tl_slots[idx].path));
+    strncpy(tl_slots[idx].path, path, sizeof(tl_slots[idx].path) - 1);
     tl_slots[idx].path[sizeof(tl_slots[idx].path) - 1] = '\0';
     tl_slots[idx].entry           = *entry;
     tl_slots[idx].entry.hash      = hash;

@@ -1,22 +1,23 @@
-//
-// Created by mete on 6.05.2026.
-//
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
 #include "http/response.h"
 #include "util/buf.h"
 
+static int buf_contains(const buf_t *b, const char *needle) {
+    return memmem(b->data, b->len, needle, strlen(needle)) != NULL;
+}
+static int buf_not_contains(const buf_t *b, const char *needle) {
+    return memmem(b->data, b->len, needle, strlen(needle)) == NULL;
+}
+
 static void test_chunk_append_normal(void) {
     buf_t b;
     buf_init(&b);
-
     int r = http_chunk_append(&b, "Hello", 5);
     assert(r == 0);
-    /* Expected: "5\r\nHello\r\n" */
     assert(b.len == 10);
     assert(memcmp(b.data, "5\r\nHello\r\n", 10) == 0);
-
     buf_free(&b);
     printf("  [OK] chunk_append normal\n");
 }
@@ -24,12 +25,10 @@ static void test_chunk_append_normal(void) {
 static void test_chunk_append_terminator(void) {
     buf_t b;
     buf_init(&b);
-
     int r = http_chunk_append(&b, NULL, 0);
     assert(r == 0);
     assert(b.len == 5);
     assert(memcmp(b.data, "0\r\n\r\n", 5) == 0);
-
     buf_free(&b);
     printf("  [OK] chunk_append terminator\n");
 }
@@ -43,15 +42,10 @@ static void test_chunked_response_no_content_length(void) {
 
     buf_t out;
     buf_init(&out);
-    int r = http_response_serialize(&resp, &out);
-    assert(r == 0);
+    assert(http_response_serialize(&resp, &out) == 0);
 
-    /* Must NOT contain Content-Length */
-    char *s = (char *)out.data;
-    assert(strstr(s, "Content-Length") == NULL);
-
-    /* Must contain Transfer-Encoding: chunked */
-    assert(strstr(s, "Transfer-Encoding: chunked") != NULL);
+    assert(buf_not_contains(&out, "Content-Length"));
+    assert(buf_contains(&out, "Transfer-Encoding: chunked"));
 
     buf_free(&out);
     http_response_destroy(&resp);
@@ -69,13 +63,8 @@ static void test_chunked_response_body_format(void) {
     buf_init(&out);
     http_response_serialize(&resp, &out);
 
-    char *s = (char *)out.data;
-
-    /* Body section must contain chunk header "5\r\n" */
-    assert(strstr(s, "5\r\nHello\r\n") != NULL);
-
-    /* Must end with terminator */
-    assert(strstr(s, "0\r\n\r\n") != NULL);
+    assert(buf_contains(&out, "5\r\nHello\r\n"));
+    assert(buf_contains(&out, "0\r\n\r\n"));
 
     buf_free(&out);
     http_response_destroy(&resp);
@@ -92,9 +81,8 @@ static void test_non_chunked_unchanged(void) {
     buf_init(&out);
     http_response_serialize(&resp, &out);
 
-    char *s = (char *)out.data;
-    assert(strstr(s, "Content-Length: 5") != NULL);
-    assert(strstr(s, "Transfer-Encoding") == NULL);
+    assert(buf_contains(&out, "Content-Length: 5"));
+    assert(buf_not_contains(&out, "Transfer-Encoding"));
 
     buf_free(&out);
     http_response_destroy(&resp);
@@ -106,16 +94,13 @@ static void test_chunked_empty_body(void) {
     http_response_init(&resp);
     http_response_set_status(&resp, 200, "OK");
     resp.chunked = 1;
-    /* no body set */
 
     buf_t out;
     buf_init(&out);
     http_response_serialize(&resp, &out);
 
-    char *s = (char *)out.data;
-    assert(strstr(s, "Transfer-Encoding: chunked") != NULL);
-    assert(strstr(s, "Content-Length") == NULL);
-    /* No chunk data, no terminator — body is NULL, correct behavior */
+    assert(buf_contains(&out, "Transfer-Encoding: chunked"));
+    assert(buf_not_contains(&out, "Content-Length"));
 
     buf_free(&out);
     http_response_destroy(&resp);

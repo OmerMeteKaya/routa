@@ -100,13 +100,13 @@ void mw_compress(middleware_chain_t *chain,
                  const http_request_t *req,
                  http_response_t *resp,
                  next_fn_t next,
-                 void *ctx)
+                 void *ctx,int current)
 {
     const compress_config_t *cfg = ctx ? (const compress_config_t *)ctx
                                        : &g_default_cfg;
 
     /* Run the rest of the chain first — we compress the final response */
-    next(chain, req, resp);
+    next(chain, req, resp, current);
 
     /* ── Guard conditions ── */
 

@@ -577,6 +577,139 @@ void lb_free(lb_t *lb) {
     free(lb);
 }
 
+/* ── Async forwarding ───────────────────────────────────────────────────────*/
+
+int lb_begin_forward(lb_t *lb,
+                     const http_request_t *req,
+                     const char           *client_ip,
+                     buf_t                *req_buf,
+                     upstream_node_t     **out_node,
+                     upstream_conn_t     **out_uconn)
+{
+    upstream_node_t *node = lb_pick_node(lb, client_ip);
+    if (!node) { LOG_WARN("lb_begin_forward: no upstream"); return -1; }
+
+    /* Try idle pooled connection first */
+    upstream_conn_t *uconn = NULL;
+    pthread_mutex_lock(&node->pool_lock);
+    if (node->idle_conns) {
+        uconn            = node->idle_conns;
+        node->idle_conns = uconn->next;
+        node->idle_count--;
+        node->active_count++;
+        uconn->next  = NULL;
+        uconn->state = UPSTREAM_CONN_IN_USE;
+    }
+    pthread_mutex_unlock(&node->pool_lock);
+
+    int fd;
+    if (uconn) {
+        fd = uconn->fd;
+        __atomic_fetch_add(&node->inflight, 1u, __ATOMIC_RELAXED);
+    } else {
+        pthread_mutex_lock(&node->pool_lock);
+        if (node->active_count >= node->pool_max) {
+            pthread_mutex_unlock(&node->pool_lock);
+            LOG_WARN("lb_begin_forward: pool exhausted %s:%d", node->host, node->port);
+            return -1;
+        }
+        node->active_count++;
+        pthread_mutex_unlock(&node->pool_lock);
+
+        fd = upstream_conn_connect_async(node);
+        if (fd < 0) {
+            pthread_mutex_lock(&node->pool_lock);
+            node->active_count--;
+            pthread_mutex_unlock(&node->pool_lock);
+            upstream_node_record_failure(node, lb->pool);
+            return -1;
+        }
+
+        uconn = calloc(1, sizeof(upstream_conn_t));
+        if (!uconn) { close(fd); return -1; }
+        uconn->fd         = fd;
+        uconn->state      = UPSTREAM_CONN_IN_USE;
+        uconn->node       = node;
+        uconn->created_at = time(NULL);
+        uconn->last_used  = uconn->created_at;
+        __atomic_fetch_add(&node->inflight, 1u, __ATOMIC_RELAXED);
+    }
+
+    /* Serialize request */
+    char tmp[65536];
+    int  len = build_forward_request(req, tmp, sizeof(tmp));
+    if (len <= 0) { upstream_conn_release(uconn, 0); return -1; }
+    buf_reset(req_buf);
+    if (buf_append(req_buf, tmp, (size_t)len) < 0) {
+        upstream_conn_release(uconn, 0); return -1;
+    }
+
+    *out_node  = node;
+    *out_uconn = uconn;
+    return fd;
+}
+
+int lb_finish_forward(lb_t            *lb,
+                      buf_t           *resp_buf,
+                      http_response_t *resp,
+                      upstream_node_t *node,
+                      upstream_conn_t *uconn,
+                      int              healthy)
+{
+    int ret = 0;
+    if (resp_buf->len == 0) { ret = -1; goto done; }
+
+    {
+        char *raw = malloc(resp_buf->len + 1);
+        if (!raw) { ret = -1; goto done; }
+        memcpy(raw, resp_buf->data, resp_buf->len);
+        raw[resp_buf->len] = '\0';
+
+        if (strncmp(raw, "HTTP/1.", 7) != 0) { free(raw); ret = -1; goto done; }
+
+        int status = 0; char reason[64] = {0};
+        sscanf(raw + 9, "%d %63[^\r]", &status, reason);
+        http_response_set_status(resp, status, reason);
+
+        char *body_start = strstr(raw, "\r\n\r\n");
+        if (body_start) {
+            char *line = strchr(raw, '\n');
+            if (line) line++;
+            body_start += 4;
+
+            while (line && line < body_start) {
+                char *end = strstr(line, "\r\n");
+                if (!end || end == line) break;
+                *end = '\0';
+                char *colon = strchr(line, ':');
+                if (colon) {
+                    *colon = '\0';
+                    char *val = colon + 1;
+                    while (*val == ' ') val++;
+                    http_response_set_header(resp, line, val);
+                    if (strcasecmp(line, "content-length") == 0) {
+                        size_t clen = (size_t)atoll(val);
+                        size_t blen = resp_buf->len - (size_t)(body_start - raw);
+                        size_t use  = clen < blen ? clen : blen;
+                        if (use > 0)
+                            http_response_set_body(resp, body_start, use);
+                    }
+                }
+                *end = '\r';
+                line = end + 2;
+            }
+        }
+        free(raw);
+    }
+
+done:
+    upstream_conn_release(uconn, healthy && ret == 0);
+    if (ret == 0) upstream_node_record_success(node, lb->pool);
+    else          upstream_node_record_failure(node, lb->pool);
+    (void)lb;
+    return ret;
+}
+
 lb_stats_t lb_get_stats(const lb_t *lb) {
     const volatile uint64_t *req = &lb->stat_requests;
     const volatile uint64_t *fail = &lb->stat_failed;

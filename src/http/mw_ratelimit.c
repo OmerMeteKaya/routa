@@ -59,11 +59,18 @@ void mw_rate_limit_config_free(rate_limit_config_t *cfg) {
 }
 
 void mw_rate_limit(middleware_chain_t *chain, const http_request_t *req,
-                   http_response_t *resp, next_fn_t next, void *ctx) {
+                   http_response_t *resp, next_fn_t next, void *ctx,int current) {
     rate_limit_config_t *cfg = (rate_limit_config_t *)ctx;
     
-    // For simplicity, we'll use a dummy IP if not available
-    const char *client_ip = "127.0.0.1"; // In real implementation, this would come from conn
+    // Get client IP from request headers or use a default
+    // In a full implementation, this would come from the connection object
+    const char *client_ip = http_request_get_header(req, "X-Forwarded-For");
+    if (!client_ip) {
+        client_ip = http_request_get_header(req, "X-Real-IP");
+    }
+    if (!client_ip) {
+        client_ip = "127.0.0.1"; // Default fallback
+    }
     
     unsigned int bucket_idx = hash_ip(client_ip);
     bucket_entry_t *entry = NULL;
@@ -91,7 +98,7 @@ void mw_rate_limit(middleware_chain_t *chain, const http_request_t *req,
             if (cur->tokens >= 1.0) {
                 cur->tokens -= 1.0;
                 pthread_mutex_unlock(&g_limiter.mutexes[bucket_idx]);
-                next(chain, req, resp);
+                next(chain, req, resp, current);
                 return;
             } else {
                 pthread_mutex_unlock(&g_limiter.mutexes[bucket_idx]);
@@ -114,10 +121,10 @@ void mw_rate_limit(middleware_chain_t *chain, const http_request_t *req,
         entry->next = g_limiter.buckets[bucket_idx];
         g_limiter.buckets[bucket_idx] = entry;
         pthread_mutex_unlock(&g_limiter.mutexes[bucket_idx]);
-        next(chain, req, resp);
+        next(chain, req, resp, current);
         return;
     }
     
     pthread_mutex_unlock(&g_limiter.mutexes[bucket_idx]);
-    next(chain, req, resp);
+    next(chain, req, resp, current);
 }

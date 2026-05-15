@@ -37,38 +37,28 @@ void middleware_chain_set_handler(middleware_chain_t *chain, route_handler_t han
     chain->final_ctx = ctx;
 }
 
-void middleware_chain_execute(middleware_chain_t *chain, const http_request_t *req, http_response_t *resp) {
+void middleware_chain_execute(middleware_chain_t *chain,
+                              const http_request_t *req,
+                              http_response_t *resp) {
     if (!chain || !req || !resp) return;
-    
-    // Reset current index
-    chain->current = 0;
-    
-    // Start execution
-    if (chain->count > 0) {
-        middleware_next(chain, req, resp);
-    } else if (chain->final_handler) {
-        // No middlewares, call final handler directly
+    if (chain->count > 0)
+        middleware_next(chain, req, resp, 0);
+    else if (chain->final_handler)
         chain->final_handler(req, resp, chain->final_ctx);
-    }
 }
 
-void middleware_next(middleware_chain_t *chain, const http_request_t *req, http_response_t *resp) {
+void middleware_next(middleware_chain_t *chain,
+                    const http_request_t *req,
+                    http_response_t *resp,
+                    int current) {
     if (!chain || !req || !resp) return;
-    
-    // If we've processed all middlewares, call the final handler
-    if (chain->current >= chain->count) {
-        if (chain->final_handler) {
+    if (current >= chain->count) {
+        if (chain->final_handler)
             chain->final_handler(req, resp, chain->final_ctx);
-        }
         return;
     }
-    
-    // Get current middleware
-    middleware_t *mw = &chain->middlewares[chain->current];
-    chain->current++;
-    
-    // Call middleware function with next callback
-    mw->fn(chain, req, resp, middleware_next, mw->ctx);
+    middleware_t *mw = &chain->middlewares[current];
+    mw->fn(chain, req, resp, middleware_next, mw->ctx, current + 1);
 }
 
 void middleware_chain_free(middleware_chain_t *chain) {

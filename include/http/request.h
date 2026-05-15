@@ -30,7 +30,8 @@ typedef struct {
     int            header_count;
     char          *body;        // heap allocated or NULL
     size_t         body_len;
-    int            keep_alive;  // 1 if connection should persist
+    int            keep_alive; // 1 if connection should persist
+    char remote_ip[46];
 } http_request_t;
 
 // Parse from buf_t. Returns 0 on success, -1 on error, 1 if incomplete

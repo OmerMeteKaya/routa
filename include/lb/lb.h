@@ -75,7 +75,36 @@ int lb_forward(lb_t *lb,
 /* ── Node selection (exposed for testing / custom wrappers) ────────────────*/
 upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip);
 
-/* ── Stats ─────────────────────────────────────────────────────────────────*/
+/* ── Async forwarding API ───────────────────────────────────────────────────
+ *
+ * Instead of blocking, these functions integrate with the worker's epoll loop.
+ *
+ * lb_begin_forward():
+ *   - Picks an upstream node
+ *   - Acquires a pooled connection (or opens a new non-blocking one)
+ *   - Serializes the HTTP request into req_buf
+ *   - Returns the upstream fd to add to poller (POLLER_WRITE for connect/send)
+ *   - out_node / out_uconn: set for later pool return
+ *   Returns fd >= 0 on success, -1 on failure (all nodes down).
+ *
+ * lb_finish_forward():
+ *   - Parses the raw upstream response bytes into resp
+ *   - Returns connection to pool (healthy flag)
+ *   Returns 0 ok, -1 parse error.
+ * -------------------------------------------------------------------------*/
+int lb_begin_forward(lb_t *lb,
+                     const http_request_t *req,
+                     const char           *client_ip,
+                     buf_t                *req_buf,        /* out: serialized req */
+                     upstream_node_t     **out_node,       /* out: for record_* */
+                     upstream_conn_t     **out_uconn);     /* out: for release   */
+
+int lb_finish_forward(lb_t            *lb,
+                      buf_t           *resp_buf,           /* raw upstream bytes */
+                      http_response_t *resp,               /* out: parsed resp   */
+                      upstream_node_t *node,
+                      upstream_conn_t *uconn,
+                      int              healthy);
 typedef struct {
     uint64_t requests_total;
     uint64_t requests_failed;

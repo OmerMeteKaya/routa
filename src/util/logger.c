@@ -32,7 +32,7 @@ void log_msg(log_level_t level, const char *file, int line, const char *fmt, ...
     timestamp[strlen(timestamp) - 1] = '\0'; // Remove newline
     
     // Print log header
-    fprintf(stderr, "[%s] [%s] %s:%d ", timestamp, level_strings[level], file, line);
+   // fprintf(stderr, "[%s] [%s] %s:%d ", timestamp, level_strings[level], file, line);
     
     // Print message
     va_list args;
@@ -40,7 +40,7 @@ void log_msg(log_level_t level, const char *file, int line, const char *fmt, ...
     vfprintf(stderr, fmt, args);
     va_end(args);
     
-    fprintf(stderr, "\n");
+    //fprintf(stderr, "\n");
     fflush(stderr);
     
     pthread_mutex_unlock(&g_log_mutex);

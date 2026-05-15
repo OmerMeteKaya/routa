@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/mete/routa/build_ubsan/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

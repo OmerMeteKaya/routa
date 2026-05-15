@@ -18,6 +18,39 @@ typedef enum {
     CFG_LB_CONSISTENT_HASH = 6,
 } cfg_lb_algo_t;
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * WebSocket config
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
+typedef struct {
+    int    enabled;
+
+
+    int    max_connections;          /* default: 10000                      */
+    int    handshake_timeout_ms;     /* default: 5000                       */
+    int    idle_timeout_ms;          /* default: 0                          */
+
+    /* Frame  */
+    size_t max_frame_size;           /* default: 16MB                       */
+    size_t max_message_size;         /* fragmented, default: 64MB    */
+
+    /* Ping/Pong */
+    int    ping_interval_ms;
+    int    ping_timeout_ms;
+    int    max_ping_misses;
+
+    /* Buffer */
+    size_t read_buf_size;            /* default: 65536                      */
+    size_t write_buf_size;           /* default: 65536                      */
+    int    write_queue_max;          /* backpressure limit, default: 128   */
+
+    /* Compression (RFC 7692 permessage-deflate) */
+    int    permessage_deflate;
+    int    compression_level;
+    size_t compression_threshold;
+    int    require_masking;
+} ws_config_t;
+
 /* ── Health check type (mirrors health_check_type_t) ───────────────────────*/
 typedef enum {
     CFG_HC_NONE   = 0,

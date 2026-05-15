@@ -4,6 +4,10 @@
 #include "util/buf.h"
 #include "net/tls.h"
 #include "http/response.h"
+#include "http/ws.h"
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
 
 typedef enum {
     CONN_READING,
@@ -13,45 +17,117 @@ typedef enum {
     CONN_KEEPALIVE,
     CONN_CLOSING,
     CONN_TLS_HANDSHAKE,
-    CONN_SENDFILE
+    CONN_SENDFILE,
+    /* Async upstream (reverse proxy / LB) */
+    CONN_UPSTREAM_CONNECTING,
+    CONN_UPSTREAM_WRITING,
+    CONN_UPSTREAM_READING,
+    CONN_UPSTREAM_DONE,
+    /* WebSocket */
+    CONN_WEBSOCKET,             /* connection has been upgraded to WS      */
 } conn_state_t;
 
+/* ── conn_t — cache-line aware layout ──────────────────────────────────────
+ *
+ * CL0 (0–63):   HOT  — fd, state, keep_alive, tls, read_buf, sendfile_fd
+ * CL1 (64–127): WARM — write_buf, hdr_buf, writev state
+ * CL2 (128–191): WARM — body/sendfile/consumed + uring bufs
+ * CL3 (192+):   COLD — upstream, websocket, id, timestamps, remote_ip
+ * -------------------------------------------------------------------------*/
 typedef struct conn {
-    int          fd;
-    size_t       consumed;
-    conn_state_t state;
-    buf_t        read_buf;
-    buf_t        write_buf;     /* legacy: used by old io_write_from_buf path  */
-    char         remote_ip[46];
+
+    /* ── CL0: HOT ────────────────────────────────────────────────────────*/
+    int          fd;                    /*  4 */
+    conn_state_t state;                 /*  4 */
+    int          keep_alive;            /*  4 */
+    int          sendfile_fd;           /*  4 */
+    tls_conn_t  *tls;                   /*  8 */
+    buf_t        read_buf;              /* 24 */
+    char         _pad0[16];             /* 16 — pad to 64 */
+
+    /* ── CL1: WARM write path ───────────────────────────────────────────*/
+    buf_t        write_buf;             /* 24 */
+    buf_t        hdr_buf;               /* 24 */
+    size_t       writev_written;        /*  8 */
+    const char  *resp_body_ptr;         /*  8 */
+    /* 64 bytes — line full */
+
+    /* ── CL2: WARM sendfile + uring ────────────────────────────────────*/
+    size_t       resp_body_len;         /*  8 */
+    off_t        sendfile_off;          /*  8 */
+    size_t       sendfile_rem;          /*  8 */
+    size_t       consumed;              /*  8 */
+    uint8_t     *recv_buf;              /*  8 */
+    uint8_t     *send_buf;              /*  8 */
+    size_t       send_buf_len;          /*  8 */
+    int          recv_pending;          /*  4 */
+    int          pending_io;            /*  4 */
+
+    /* ── CL3: COLD — upstream fields ───────────────────────────────────*/
+    int          upstream_fd;
+    void        *upstream_node;         /* upstream_node_t*                */
+    void        *upstream_conn;         /* upstream_conn_t*                */
+    buf_t        upstream_req_buf;
+    buf_t        upstream_resp_buf;
+    size_t       upstream_req_sent;
+    int          upstream_retry;
+
+    /* ── WebSocket fields ───────────────────────────────────────────────
+     *
+     * ws_frame_state_t is embedded (no heap alloc) to avoid an extra
+     * pointer chase on every ws_recv call.  frag_buf inside ws_fs is
+     * the only heap allocation and is initialised lazily on upgrade.
+     * -------------------------------------------------------------------*/
+    ws_conn_state_t  ws_state;          /* WS_STATE_INIT until upgraded    */
+    ws_frame_state_t ws_fs;             /* frame parser state machine       */
+    uint64_t         ws_last_ping_ms;   /* monotonic ms of last ping sent   */
+    int              ws_ping_misses;    /* consecutive unanswered pings     */
+    int              ws_write_queued;   /* frames waiting in write_buf      */
+    ws_handler_t     *ws_handler;
+
+    /* ── Cold metadata ──────────────────────────────────────────────────*/
+    int          closing;
+    int          active;
     int          remote_port;
-    int          keep_alive;
+    int          _pad3;
+    uint64_t     id;
     uint64_t     last_active_ms;
     time_t       keepalive_deadline;
-    tls_conn_t  *tls;
-    int          sendfile_fd;
-    off_t        sendfile_off;
-    size_t       sendfile_rem;
-    int          closing;
-    int          pending_io;
-    uint8_t     *recv_buf;
-    int          recv_pending;
-    uint8_t     *send_buf;
-    size_t       send_buf_len;
-    uint64_t     id;
-    int          active;
+    char         remote_ip[46];
+    char         _pad4[2];
 
-    /* ── writev path ──────────────────────────────────────────────────────
-     * hdr_buf holds the serialized HTTP headers (built once per response).
-     * writev_written tracks total bytes sent so far (headers + body).
-     * resp_body_{ptr,len} are a non-owning view into the response body so
-     * that io_writev_response can reference it across partial writes.
-     * ------------------------------------------------------------------- */
-    buf_t        hdr_buf;          /* serialized headers, reset after send  */
-    size_t       writev_written;   /* bytes sent this response              */
-    const char  *resp_body_ptr;    /* non-owning pointer into resp->body    */
-    size_t       resp_body_len;
 } conn_t;
 
+/* ── Slab pool ──────────────────────────────────────────────────────────────
+ *
+ * Per-worker, single-threaded — no locks needed.
+ * Pre-allocates `capacity` conn_t + recv/send buffers upfront.
+ * O(1) acquire/release via freelist.
+ * -------------------------------------------------------------------------*/
+#define CONN_RECV_BUF_SZ  65536
+#define CONN_SEND_BUF_SZ  131072
+#define CONN_SLAB_ALIGN   64
+
+typedef struct conn_slab conn_slab_t;
+
+conn_slab_t *conn_slab_new(int capacity);
+void         conn_slab_free(conn_slab_t *slab);
+
+/* Returns a zeroed conn_t with recv_buf/send_buf already set.
+ * Returns NULL if slab is exhausted (fall back to conn_new).              */
+conn_t *conn_slab_acquire(conn_slab_t *slab);
+
+/* Return conn to slab freelist.
+ * Caller must have already closed fd, freed tls, reset bufs.             */
+void conn_slab_release(conn_slab_t *slab, conn_t *conn);
+
+int conn_slab_available(const conn_slab_t *slab);
+
+/* Per-connection init/reset (used by both heap and slab paths) */
+void conn_init(conn_t *c, int fd, const char *ip, int port);
+void conn_reset(conn_t *c);   /* reset for keep-alive reuse               */
+
+/* Legacy heap API */
 conn_t *conn_new(int fd, const char *ip, int port);
 void    conn_free(conn_t *c);
 

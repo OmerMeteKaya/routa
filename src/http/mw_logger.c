@@ -4,13 +4,13 @@
 #include <time.h>
 
 void mw_logger(middleware_chain_t *chain, const http_request_t *req,
-               http_response_t *resp, next_fn_t next, void *ctx) {
+               http_response_t *resp, next_fn_t next, void *ctx, int current) {
     (void)ctx;
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    next(chain, req, resp);
+    next(chain, req, resp, current);
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = (t1.tv_sec - t0.tv_sec) * 1000L +
@@ -28,6 +28,6 @@ void mw_logger(middleware_chain_t *chain, const http_request_t *req,
         default: break;
     }
 
-    LOG_INFO("%s %s %d (%ldms)", method_str, req->path,
-             resp->status, ms);
+    /* debug LOG_INFO("%s %s %d (%ldms)", method_str, req->path,
+             resp->status, ms);*/
 }

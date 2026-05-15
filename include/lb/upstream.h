@@ -156,8 +156,20 @@ void             upstream_pool_free(upstream_pool_t *pool);
 int              upstream_pool_add_node(upstream_pool_t *pool,
                                         upstream_node_t *node);
 
-/* Mark a node UP/DOWN (thread-safe).                                       */
-void upstream_node_set_state(upstream_node_t *node, node_state_t state);
+/* ── Async connect API ─────────────────────────────────────────────────────
+ *
+ * upstream_conn_connect_async() opens a non-blocking TCP socket and calls
+ * connect().  Returns:
+ *   fd >= 0  connect in progress (EINPROGRESS) or done — caller adds fd
+ *            to its poller with POLLER_WRITE to wait for completion.
+ *   -1       fatal error (node marked failed).
+ *
+ * After POLLOUT fires, call upstream_conn_check_connected(fd):
+ *   0   connected OK
+ *  -1   connect failed
+ * -------------------------------------------------------------------------*/
+int upstream_conn_connect_async(upstream_node_t *node);
+int upstream_conn_check_connected(int fd);
 
 /* Record a request outcome — drives passive health logic.                  */
 void upstream_node_record_success(upstream_node_t *node,

@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 
-int main() {
+int main(void) {
     buf_t b;
     
     // Test initialization

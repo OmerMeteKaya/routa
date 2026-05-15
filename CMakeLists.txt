@@ -22,17 +22,23 @@ find_package(Threads REQUIRED)
 find_package(ZLIB    REQUIRED)
 
 # ── Sources ──────────────────────────────────────────────────────────────────
-# Collect everything under src/ automatically
 file(GLOB_RECURSE ROUTA_SOURCES
         src/core/*.c
         src/http/*.c
-        src/net/*.c
+        src/net/socket.c
+        src/net/poller.c
+        src/net/io.c
+        src/net/tls.c
         src/util/*.c
         src/lb/*.c
 )
 
 # ── Core library ─────────────────────────────────────────────────────────────
-add_library(routa_core STATIC ${ROUTA_SOURCES})
+add_library(routa_core STATIC ${ROUTA_SOURCES}
+        src/http/ws.c
+        src/http/ws_registry.c
+        include/http/ws.h
+        include/http/ws_registry.h)
 
 target_include_directories(routa_core PUBLIC include)
 
@@ -48,23 +54,26 @@ if(ROUTA_IO_URING)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR "io_uring is Linux-only")
     endif()
+    target_sources(routa_core PRIVATE src/net/uring.c)
     target_compile_definitions(routa_core PRIVATE ROUTA_IO_URING=1)
     target_link_libraries(routa_core PRIVATE uring)
 endif()
 
 # ── Examples ─────────────────────────────────────────────────────────────────
-foreach(example hello_world config_example chunked_example)
+foreach(example hello_world config_example chunked_example ws_echo_server)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
         add_executable(${example} examples/${example}.c)
         target_link_libraries(${example} PRIVATE routa_core)
+        target_include_directories(${example} PRIVATE include)
     endif()
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked)
+foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
         add_executable(${test} tests/${test}.c)
         target_link_libraries(${test} PRIVATE routa_core)
+        target_include_directories(${test} PRIVATE include)
     endif()
 endforeach()
 
@@ -75,3 +84,5 @@ add_test(NAME test_buf        COMMAND test_buf)
 add_test(NAME test_request    COMMAND test_request)
 add_test(NAME test_middleware COMMAND test_middleware)
 add_test(NAME test_chunked    COMMAND test_chunked)
+add_test(NAME test_file_cache    COMMAND test_file_cache)
+add_test(NAME test_ws    COMMAND test_ws)

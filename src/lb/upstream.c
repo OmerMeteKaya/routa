@@ -162,6 +162,42 @@ void upstream_node_drain_idle(upstream_node_t *node) {
     }
 }
 
+/* ── Async connect ──────────────────────────────────────────────────────────*/
+
+int upstream_conn_connect_async(upstream_node_t *node) {
+    if (!node->addr_resolved) {
+        memset(&node->addr, 0, sizeof(node->addr));
+        node->addr.sin_family = AF_INET;
+        node->addr.sin_port   = htons(node->port);
+        if (inet_pton(AF_INET, node->host, &node->addr.sin_addr) != 1) {
+            LOG_ERROR("upstream: cannot parse IP '%s'", node->host);
+            return -1;
+        }
+        node->addr_resolved = 1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    int ret = connect(fd, (struct sockaddr *)&node->addr, sizeof(node->addr));
+    if (ret < 0 && errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int upstream_conn_check_connected(int fd) {
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0)
+        return -1;
+    return 0;
+}
+
 /* ── Passive health tracking ────────────────────────────────────────────────*/
 
 void upstream_node_set_state(upstream_node_t *node, node_state_t state) {

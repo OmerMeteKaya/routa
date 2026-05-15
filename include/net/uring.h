@@ -15,7 +15,12 @@ typedef enum {
 typedef struct {
     uring_op_t  op;
     void       *conn;   /* conn_t * — NULL for ACCEPT */
-    int         fd;     /* pipe read-end for SPLICE, -1 otherwise */
+    int         fd;  /* pipe read-end for SPLICE, -1 otherwise */
+     uint64_t conn_id;
+    int splice_phase;  /* 0 = file→pipe, 1 = pipe→socket */
+    uint8_t *in_use; //fake
+    socklen_t               accept_addrlen; // fake
+    struct sockaddr_storage accept_addr; // fake
 } uring_udata_t;
 
 typedef struct {
@@ -27,6 +32,7 @@ typedef struct {
     int             server_fd;
     /* for multishot accept */
     struct sockaddr_storage accept_addr;
+    uint8_t *in_use;
     socklen_t               accept_addrlen;
 } uring_t;
 
@@ -52,12 +58,11 @@ int uring_submit_splice(uring_t *u, void *conn,
 
 /* Wait for completions. Returns number of CQEs processed.
    Calls cb(udata, res) for each. */
-typedef void (*uring_cqe_cb_t)(uring_udata_t *ud, int res, void *arg);
+typedef void (*uring_cqe_cb_t)(uring_udata_t *ud, int res, uint32_t flags, void *arg);
 int uring_wait(uring_t *u, uring_cqe_cb_t cb, void *arg);
 
 /* Acquire/release udata from pool — O(1) */
 uring_udata_t *uring_udata_get(uring_t *u);
 void           uring_udata_put(uring_t *u, uring_udata_t *ud);
-
 #endif /* __linux__ */
 #endif /* ROUTA_NET_URING_H */

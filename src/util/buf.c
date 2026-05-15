@@ -43,7 +43,10 @@ int buf_append(buf_t *b, const void *src, size_t n) {
     b->len += n;
     return 0;
 }
-
+int buf_append_str(buf_t *b, const char *s) {
+    if (!s) return 0;
+    return buf_append(b, s, strlen(s));
+}
 void buf_consume(buf_t *b, size_t n) {
     if (!b || n == 0) {
         return;

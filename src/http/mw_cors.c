@@ -19,7 +19,7 @@ void mw_cors_config_free(cors_config_t *cfg) {
 }
 
 void mw_cors(middleware_chain_t *chain, const http_request_t *req,
-             http_response_t *resp, next_fn_t next, void *ctx) {
+             http_response_t *resp, next_fn_t next, void *ctx, int current) {
     cors_config_t *cfg = (cors_config_t *)ctx;
 
     const char *origin  = (cfg && cfg->origin[0])  ? cfg->origin  : "*";
@@ -36,5 +36,5 @@ void mw_cors(middleware_chain_t *chain, const http_request_t *req,
         return;
     }
 
-    next(chain, req, resp);
+    next(chain, req, resp, current);
 }

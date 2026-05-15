@@ -9,18 +9,18 @@ static int call_order[8];
 static int call_count = 0;
 
 static void mw_a(middleware_chain_t *chain, const http_request_t *req,
-                 http_response_t *resp, next_fn_t next, void *ctx) {
+                 http_response_t *resp, next_fn_t next, void *ctx, int current) {
     (void)ctx;
     call_order[call_count++] = 1;
-    next(chain, req, resp);
+    next(chain, req, resp, current);
     call_order[call_count++] = 4;
 }
 
 static void mw_b(middleware_chain_t *chain, const http_request_t *req,
-                 http_response_t *resp, next_fn_t next, void *ctx) {
+                 http_response_t *resp, next_fn_t next, void *ctx, int current) {
     (void)ctx;
     call_order[call_count++] = 2;
-    next(chain, req, resp);
+    next(chain, req, resp, current);
     call_order[call_count++] = 3;
 }
 
@@ -81,7 +81,6 @@ static void test_short_circuit(void) {
     http_response_init(&resp);
 
     /* Only run mw_a manually to simulate short-circuit */
-    chain->current = 0;
     middleware_chain_set_handler(chain, NULL, NULL);
 
     /* Override mw_a with one that short-circuits */
