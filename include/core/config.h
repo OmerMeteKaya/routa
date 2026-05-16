@@ -2,6 +2,7 @@
 #define ROUTA_CORE_CONFIG_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #define ROUTA_MAX_UPSTREAMS   64
 #define ROUTA_MAX_STATIC      16
@@ -58,6 +59,28 @@ typedef enum {
     CFG_HC_HTTP   = 2,
     CFG_HC_CUSTOM = 3,
 } cfg_hc_type_t;
+
+/* ── HTTP/2 ──────────────────────────────────────────────────────────────── */
+typedef struct {
+    int      enabled;                    /* default: 1                        */
+
+    /* HPACK */
+    uint32_t header_table_size;          /* dynamic table per-conn, default: 4096  */
+    int      huffman_encoding;           /* outbound Huffman, default: 1      */
+    int      dynamic_table_update;       /* server writes to dyn table, default: 1 */
+
+    /* Flow control */
+    uint32_t initial_window_size;        /* stream window, default: 65535     */
+    uint32_t max_frame_size;             /* default: 16384 (RFC min)          */
+    uint32_t max_header_list_size;       /* default: 0 (unlimited)            */
+
+    /* Concurrency */
+    uint32_t max_concurrent_streams;     /* per-conn, default: 128            */
+
+    /* Timeouts */
+    int      stream_timeout_ms;          /* idle stream, default: 30000       */
+    int      keepalive_timeout_ms;       /* h2 conn idle, default: 120000     */
+} routa_h2_config_t;
 
 typedef struct {
     /* Network */
@@ -136,7 +159,8 @@ typedef struct {
     int lb_retry_on_5xx;                /* default: 0                       */
 
     /* Consistent hash */
-    int lb_consistent_hash_vnodes;      /* default: 150                     */
+    int lb_consistent_hash_vnodes;      /* default: 150       */
+    routa_h2_config_t h2;
 } routa_config_t;
 
 /* Initialize config with sensible defaults */

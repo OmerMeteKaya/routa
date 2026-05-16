@@ -1,1 +1,0 @@
-/usr/bin/cc -fsanitize=address,undefined -g -O0 -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wconversion -Wno-unused-parameter -fstack-protector-strong -Wl,--dependency-file=CMakeFiles/test_middleware.dir/link.d CMakeFiles/test_middleware.dir/tests/test_middleware.c.o -o test_middleware  librouta_core.a /usr/lib/libssl.so /usr/lib/libcrypto.so -luring

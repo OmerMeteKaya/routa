@@ -38,7 +38,10 @@ add_library(routa_core STATIC ${ROUTA_SOURCES}
         src/http/ws.c
         src/http/ws_registry.c
         include/http/ws.h
-        include/http/ws_registry.h)
+        include/http/ws_registry.h
+        src/http/h2.c
+        src/http/h2_hpack.c
+        include/http/h2.h)
 
 target_include_directories(routa_core PUBLIC include)
 
@@ -62,14 +65,15 @@ endif()
 # ── Examples ─────────────────────────────────────────────────────────────────
 foreach(example hello_world config_example chunked_example ws_echo_server)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
-        add_executable(${example} examples/${example}.c)
+        add_executable(${example} examples/${example}.c
+                include/http/h2_hpack.h)
         target_link_libraries(${example} PRIVATE routa_core)
         target_include_directories(${example} PRIVATE include)
     endif()
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws)
+foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_h2_hpack)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
         add_executable(${test} tests/${test}.c)
         target_link_libraries(${test} PRIVATE routa_core)
@@ -86,3 +90,4 @@ add_test(NAME test_middleware COMMAND test_middleware)
 add_test(NAME test_chunked    COMMAND test_chunked)
 add_test(NAME test_file_cache    COMMAND test_file_cache)
 add_test(NAME test_ws    COMMAND test_ws)
+add_test(NAME test_h2_hpack    COMMAND test_h2_hpack)

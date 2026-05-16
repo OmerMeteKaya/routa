@@ -83,6 +83,8 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len);
 
 void tls_shutdown(tls_conn_t *tc);
 
+const char *tls_negotiated_protocol(const tls_conn_t *tc);
+
 /* Returns 1 if the last handshake resumed a previous session. */
 int tls_session_resumed(const tls_conn_t *tc);
 

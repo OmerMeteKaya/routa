@@ -18,6 +18,27 @@ static void log_ssl_error(const char *prefix) {
     ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
     LOG_ERROR("%s: %s", prefix, buf);
 }
+static int alpn_select_cb(SSL *ssl,
+                           const unsigned char **out, unsigned char *outlen,
+                           const unsigned char *in,  unsigned int inlen,
+                           void *arg) {
+    (void)ssl; (void)arg;
+    // RFC 7301: server picks from client's list
+    // Prefer h2, fall back to http/1.1
+    static const unsigned char h2[]       = {2, 'h', '2'};
+    static const unsigned char http11[]   = {8, 'h','t','t','p','/','1','.','1'};
+
+    const unsigned char *p = in;
+    while (p < in + inlen) {
+        unsigned int len = *p++;
+        if (len == 2 && memcmp(p, "h2", 2) == 0) {
+            *out = h2 + 1; *outlen = 2; return SSL_TLSEXT_ERR_OK;
+        }
+        p += len;
+    }
+    // fallback
+    *out = http11 + 1; *outlen = 8; return SSL_TLSEXT_ERR_OK;
+}
 
 /* ── STEK ticket-key callback ──────────────────────────────────────────────
  *
@@ -184,6 +205,8 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
 
     /* ── Install STEK callback ── */
     SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, stek_ticket_cb);
+    /* ── ALPN: prefer h2, fall back to http/1.1 ── */
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
 
     return tls_ctx;
 }

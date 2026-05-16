@@ -1,1 +1,0 @@
-/usr/bin/cc  -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 -Wconversion -Wno-unused-parameter -fstack-protector-strong -O2 -g -DNDEBUG -Wl,--dependency-file=CMakeFiles/config_example.dir/link.d CMakeFiles/config_example.dir/examples/config_example.c.o -o config_example  librouta_core.a /usr/lib/libssl.so /usr/lib/libcrypto.so /usr/lib/libz.so

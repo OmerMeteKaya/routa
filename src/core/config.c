@@ -42,6 +42,16 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->file_cache_max_entries = 512;
     cfg->file_cache_ttl         = 5;
     cfg->file_cache_strategy    = 1; /* stat_ttl */
+    cfg->h2.enabled                = 1;
+    cfg->h2.header_table_size      = 4096;
+    cfg->h2.huffman_encoding       = 1;
+    cfg->h2.dynamic_table_update   = 1;
+    cfg->h2.initial_window_size    = 65535;
+    cfg->h2.max_frame_size         = 16384;
+    cfg->h2.max_header_list_size   = 0;
+    cfg->h2.max_concurrent_streams = 128;
+    cfg->h2.stream_timeout_ms      = 30000;
+    cfg->h2.keepalive_timeout_ms   = 120000;
 }
 
 /* ---- Simple line-based parser ---- */
