@@ -52,6 +52,8 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->h2.max_concurrent_streams = 128;
     cfg->h2.stream_timeout_ms      = 30000;
     cfg->h2.keepalive_timeout_ms   = 120000;
+    cfg->h2.stream_lookup = H2_STREAM_LOOKUP_LINEAR;
+    cfg->h2.max_concurrent_streams_hard_cap = 256;
 }
 
 /* ---- Simple line-based parser ---- */

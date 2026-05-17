@@ -10,6 +10,7 @@
 #include "http/ws.h"
 #include "lb/lb.h"
 #include "net/uring.h"
+#include "core/config.h"
 
 #if defined(__linux__) && defined(ROUTA_IO_URING)
 #include "net/uring.h"
@@ -54,6 +55,9 @@ struct worker {
     /* Per-route WebSocket handler table (mirrors router, WS paths only) */
     ws_handler_t   **ws_handlers;        /* indexed same as router routes  */
     int              ws_handler_count;
+
+    /* h2 */
+    routa_h2_config_t h2_cfg;
 };
 
 event_loop_t *event_loop_new(int port, int n_threads);
@@ -80,5 +84,8 @@ void          event_loop_set_max_connections(event_loop_t *loop,
                                              int max_connections);
 void          event_loop_set_lb(event_loop_t *loop, lb_t *lb);
 tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop);
+
+void event_loop_set_h2_config(event_loop_t *loop,
+                               const routa_h2_config_t *cfg);
 
 #endif /* ROUTA_CORE_EVENT_LOOP_H */

@@ -61,6 +61,11 @@ typedef enum {
 } cfg_hc_type_t;
 
 /* ── HTTP/2 ──────────────────────────────────────────────────────────────── */
+typedef enum {
+    H2_STREAM_LOOKUP_LINEAR  = 0,   /* fixed pool, linear scan, default   */
+    H2_STREAM_LOOKUP_HASHMAP = 1,   /* open addressing hashmap            */
+} h2_stream_lookup_t;
+
 typedef struct {
     int      enabled;                    /* default: 1                        */
 
@@ -80,6 +85,8 @@ typedef struct {
     /* Timeouts */
     int      stream_timeout_ms;          /* idle stream, default: 30000       */
     int      keepalive_timeout_ms;       /* h2 conn idle, default: 120000     */
+    h2_stream_lookup_t stream_lookup;        /* default: H2_STREAM_LOOKUP_LINEAR  */
+    uint32_t           max_concurrent_streams_hard_cap; /* pool hard cap, default: 256 */
 } routa_h2_config_t;
 
 typedef struct {
@@ -160,6 +167,7 @@ typedef struct {
 
     /* Consistent hash */
     int lb_consistent_hash_vnodes;      /* default: 150       */
+    h2_stream_lookup_t stream_lookup;        /* default: H2_STREAM_LOOKUP_LINEAR  */
     routa_h2_config_t h2;
 } routa_config_t;
 

@@ -766,6 +766,7 @@ int hpack_encode(hpack_ctx_t *ctx,
     for (int i = 0; i < count; i++) {
         const char *name  = headers[i].name;
         const char *value = headers[i].value;
+        if (!name || !value) continue;   /* skip null headers */
 
         /* Static table full match? */
         int full_match = 0;

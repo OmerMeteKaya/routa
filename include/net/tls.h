@@ -14,23 +14,10 @@
  * (e.g. every 6-24 h).  Forward-secrecy: old sessions cannot be decrypted
  * after rotation.
  * -------------------------------------------------------------------------*/
-#define TLS_STEK_NAME_LEN  16
-#define TLS_STEK_AES_LEN   16   /* AES-128-CBC */
-#define TLS_STEK_HMAC_LEN  16   /* HMAC-SHA256 truncated */
-
-typedef struct {
-    uint8_t name   [TLS_STEK_NAME_LEN];
-    uint8_t aes_key[TLS_STEK_AES_LEN];
-    uint8_t hmac_key[TLS_STEK_HMAC_LEN];
-} tls_stek_t;
 
 /* ── Context ───────────────────────────────────────────────────────────────*/
 typedef struct {
     SSL_CTX        *ctx;
-
-    /* STEK – guarded by stek_lock */
-    tls_stek_t      stek;
-    pthread_rwlock_t stek_lock;
 
     /* OCSP stapling response – guarded by ocsp_lock */
     unsigned char  *ocsp_response;
@@ -55,12 +42,6 @@ void           tls_context_free(tls_context_t *ctx);
 /* ── Session cache (TLS 1.2 session IDs, optional) ─────────────────────── */
 int tls_context_enable_session_cache(tls_context_t *ctx, int timeout_seconds);
 
-/* ── STEK rotation ─────────────────────────────────────────────────────────
- * Generates a fresh random STEK and installs it.  Existing TLS 1.3 tickets
- * signed by the old key will fall back to a full handshake.
- * Call from a single timer thread; safe to call while workers are running. */
-int tls_context_rotate_stek(tls_context_t *ctx);
-
 /* ── OCSP stapling ─────────────────────────────────────────────────────────
  * Load a pre-fetched DER-encoded OCSP response from file.
  * Thread-safe: safe to call while workers are running (hot reload). */
@@ -83,6 +64,8 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len);
 
 void tls_shutdown(tls_conn_t *tc);
 
+/* Returns "h2" or "http/1.1" after handshake, NULL if unknown.
+ * Returned string is static — do not free.                                */
 const char *tls_negotiated_protocol(const tls_conn_t *tc);
 
 /* Returns 1 if the last handshake resumed a previous session. */

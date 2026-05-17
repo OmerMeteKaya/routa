@@ -12,6 +12,8 @@
 #include "net/io.h"
 #include "http/response.h"
 #include "util/logger.h"
+#include "net/tls.h"
+#include <openssl/ssl.h>
 
 #define IO_READ_BUF_SZ 8192
 
@@ -20,27 +22,38 @@ ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
     if (!b) return -1;
 
     uint8_t tmp[IO_READ_BUF_SZ];
-    ssize_t n;
+    ssize_t total = 0;
 
     if (tls) {
-        n = tls_read(tls, tmp, sizeof(tmp));
-        if (n == -1) return 0;   /* want-read / want-write */
+        /* Drain all pending TLS records in one call                       */
+        while (1) {
+            ssize_t n = tls_read(tls, tmp, sizeof(tmp));
+            if (n < 0) {
+                /* WANT_READ/WANT_WRITE — no more data right now           */
+                return total > 0 ? total : -1;
+            }
+            if (n == 0) {
+                /* Connection closed                                        */
+                return total > 0 ? total : 0;
+            }
+            if (buf_append(b, tmp, (size_t)n) < 0) return -1;
+            total += n;
+
+            /* Check if more TLS records are buffered in OpenSSL           */
+            if (SSL_pending(tls->ssl) == 0) break;
+        }
+        return total;
     } else {
-        n = read(fd, tmp, sizeof(tmp));
+        ssize_t n = read(fd, tmp, sizeof(tmp));
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
             LOG_ERROR("io_read: %s", strerror(errno));
             return -1;
         }
+        if (n == 0) return 0;
+        if (buf_append(b, tmp, (size_t)n) < 0) return -1;
+        return n;
     }
-
-    if (n == 0) return 0;
-
-    if (buf_append(b, tmp, (size_t)n) < 0) {
-        LOG_ERROR("io_read: buf_append failed");
-        return -1;
-    }
-    return n;
 }
 
 /* ── io_write_from_buf ──────────────────────────────────────────────────────*/

@@ -7,6 +7,8 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
+#include "http/h2.h"
+
 /* ── ID counter (worker-local in practice, atomic for safety) ───────────── */
 static uint_fast64_t g_conn_id = 0;
 
@@ -209,6 +211,10 @@ void conn_free(conn_t *c) {
     if (!c) return;
     if (c->tls) tls_conn_free(c->tls);
     if (c->upstream_fd >= 0) close(c->upstream_fd);
+    if (c->h2) {
+        h2_conn_free(c->h2);
+        c->h2 = NULL;
+    }
     buf_free(&c->read_buf);
     buf_free(&c->write_buf);
     buf_free(&c->hdr_buf);

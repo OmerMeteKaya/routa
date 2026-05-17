@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <time.h>
 
+struct h2_conn;
+
 typedef enum {
     CONN_READING,
     CONN_PARSING,
@@ -25,6 +27,7 @@ typedef enum {
     CONN_UPSTREAM_DONE,
     /* WebSocket */
     CONN_WEBSOCKET,             /* connection has been upgraded to WS      */
+    CONN_H2,   /* HTTP/2 connection — h2_conn_t manages               */
 } conn_state_t;
 
 /* ── conn_t — cache-line aware layout ──────────────────────────────────────
@@ -95,7 +98,7 @@ typedef struct conn {
     time_t       keepalive_deadline;
     char         remote_ip[46];
     char         _pad4[2];
-
+    struct h2_conn *h2;   /* NULL if HTTP/1.1                         */
 } conn_t;
 
 /* ── Slab pool ──────────────────────────────────────────────────────────────

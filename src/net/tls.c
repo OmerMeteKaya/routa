@@ -12,7 +12,22 @@
 #include <unistd.h>
 
 /* ── Helpers ───────────────────────────────────────────────────────────────*/
+const char *tls_negotiated_protocol(const tls_conn_t *tc) {
+    if (!tc || !tc->ssl || !tc->handshake_done) return NULL;
 
+    const unsigned char *proto = NULL;
+    unsigned int         len   = 0;
+
+    SSL_get0_alpn_selected(tc->ssl, &proto, &len);
+
+    if (!proto || len == 0) return NULL;
+
+    /* Return a static string — caller does not free                       */
+    if (len == 2 && memcmp(proto, "h2", 2) == 0)       return "h2";
+    if (len == 8 && memcmp(proto, "http/1.1", 8) == 0) return "http/1.1";
+
+    return NULL;
+}
 static void log_ssl_error(const char *prefix) {
     char buf[256];
     ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
@@ -23,23 +38,10 @@ static int alpn_select_cb(SSL *ssl,
                            const unsigned char *in,  unsigned int inlen,
                            void *arg) {
     (void)ssl; (void)arg;
-    // RFC 7301: server picks from client's list
-    // Prefer h2, fall back to http/1.1
-    static const unsigned char h2[]       = {2, 'h', '2'};
-    static const unsigned char http11[]   = {8, 'h','t','t','p','/','1','.','1'};
-
-    const unsigned char *p = in;
-    while (p < in + inlen) {
-        unsigned int len = *p++;
-        if (len == 2 && memcmp(p, "h2", 2) == 0) {
-            *out = h2 + 1; *outlen = 2; return SSL_TLSEXT_ERR_OK;
-        }
-        p += len;
-    }
-    // fallback
-    *out = http11 + 1; *outlen = 8; return SSL_TLSEXT_ERR_OK;
+    *out    = in + 1;
+    *outlen = in[0];
+    return SSL_TLSEXT_ERR_OK;   /* bu 0 mu 1 mi? */
 }
-
 /* ── STEK ticket-key callback ──────────────────────────────────────────────
  *
  * OpenSSL calls this for every TLS 1.3 ticket encrypt/decrypt.
@@ -48,58 +50,6 @@ static int alpn_select_cb(SSL *ssl,
  * We store a pointer to tls_context_t in the SSL_CTX app-data slot so the
  * callback can reach the current STEK without a global variable.
  */
-static int stek_ticket_cb(SSL *ssl,
-                           unsigned char *key_name,   /* 16 bytes */
-                           unsigned char *iv,
-                           EVP_CIPHER_CTX *ectx,
-                           EVP_MAC_CTX    *hctx,       /* OpenSSL 3.x */
-                           int             enc)
-{
-    (void)ssl;
-    /* Retrieve our context from SSL_CTX app-data */
-    SSL_CTX        *ssl_ctx = SSL_get_SSL_CTX(ssl);
-    tls_context_t  *tls_ctx = SSL_CTX_get_app_data(ssl_ctx);
-    if (!tls_ctx) return -1;
-
-    pthread_rwlock_rdlock(&tls_ctx->stek_lock);
-    tls_stek_t stek = tls_ctx->stek;           /* local copy under read-lock */
-    pthread_rwlock_unlock(&tls_ctx->stek_lock);
-
-    if (enc) {
-        /* ── Encrypt path ── */
-        memcpy(key_name, stek.name, TLS_STEK_NAME_LEN);
-        if (RAND_bytes(iv, EVP_MAX_IV_LENGTH) != 1) return -1;
-
-        if (!EVP_EncryptInit_ex(ectx, EVP_aes_128_cbc(), NULL,
-                                stek.aes_key, iv))
-            return -1;
-
-        /* HMAC params for OpenSSL 3.x OSSL_PARAM style */
-        OSSL_PARAM params[2];
-        params[0] = OSSL_PARAM_construct_octet_string(
-            "key", stek.hmac_key, TLS_STEK_HMAC_LEN);
-        params[1] = OSSL_PARAM_construct_end();
-        if (!EVP_MAC_CTX_set_params(hctx, params)) return -1;
-
-        return 1;
-    } else {
-        /* ── Decrypt path ── */
-        if (memcmp(key_name, stek.name, TLS_STEK_NAME_LEN) != 0)
-            return 0;   /* key mismatch → full handshake */
-
-        if (!EVP_DecryptInit_ex(ectx, EVP_aes_128_cbc(), NULL,
-                                stek.aes_key, iv))
-            return -1;
-
-        OSSL_PARAM params[2];
-        params[0] = OSSL_PARAM_construct_octet_string(
-            "key", stek.hmac_key, TLS_STEK_HMAC_LEN);
-        params[1] = OSSL_PARAM_construct_end();
-        if (!EVP_MAC_CTX_set_params(hctx, params)) return -1;
-
-        return 1;
-    }
-}
 
 /* ── OCSP stapling callback ────────────────────────────────────────────────*/
 
@@ -188,23 +138,12 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
         return NULL;
     }
 
-    pthread_rwlock_init(&tls_ctx->stek_lock, NULL);
     pthread_rwlock_init(&tls_ctx->ocsp_lock, NULL);
     tls_ctx->ctx = ctx;
 
     /* ── Store back-pointer so ticket callback can reach us ── */
     SSL_CTX_set_app_data(ctx, tls_ctx);
 
-    /* ── Generate initial STEK ── */
-    if (tls_context_rotate_stek(tls_ctx) != 0) {
-        LOG_ERROR("tls_context_new: initial STEK generation failed");
-        SSL_CTX_free(ctx);
-        free(tls_ctx);
-        return NULL;
-    }
-
-    /* ── Install STEK callback ── */
-    SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, stek_ticket_cb);
     /* ── ALPN: prefer h2, fall back to http/1.1 ── */
     SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
 
@@ -226,7 +165,6 @@ void tls_context_free(tls_context_t *ctx) {
     }
     pthread_rwlock_unlock(&ctx->ocsp_lock);
 
-    pthread_rwlock_destroy(&ctx->stek_lock);
     pthread_rwlock_destroy(&ctx->ocsp_lock);
     free(ctx);
 }
@@ -240,28 +178,6 @@ int tls_context_enable_session_cache(tls_context_t *ctx, int timeout_seconds) {
     SSL_CTX_set_session_cache_mode(ctx->ctx,
         SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
     SSL_CTX_set_timeout(ctx->ctx, timeout_seconds > 0 ? timeout_seconds : 3600);
-    return 0;
-}
-
-/* ── tls_context_rotate_stek ───────────────────────────────────────────────
- * Generate a fresh STEK.  Safe to call from any thread while workers run.  */
-
-int tls_context_rotate_stek(tls_context_t *ctx) {
-    if (!ctx) return -1;
-
-    tls_stek_t fresh;
-    if (RAND_bytes(fresh.name,    TLS_STEK_NAME_LEN) != 1 ||
-        RAND_bytes(fresh.aes_key, TLS_STEK_AES_LEN)  != 1 ||
-        RAND_bytes(fresh.hmac_key,TLS_STEK_HMAC_LEN) != 1) {
-        LOG_ERROR("tls_context_rotate_stek: RAND_bytes failed");
-        return -1;
-    }
-
-    pthread_rwlock_wrlock(&ctx->stek_lock);
-    ctx->stek = fresh;
-    pthread_rwlock_unlock(&ctx->stek_lock);
-
-    LOG_INFO("TLS STEK rotated");
     return 0;
 }
 
@@ -350,6 +266,8 @@ void tls_conn_free(tls_conn_t *tc) {
 int tls_handshake(tls_conn_t *tc) {
     if (!tc) return -2;
 
+    if (tc->handshake_done) return 0;
+
     int ret = SSL_do_handshake(tc->ssl);
     if (ret == 1) {
         tc->handshake_done = 1;
@@ -357,7 +275,8 @@ int tls_handshake(tls_conn_t *tc) {
         return 0;
     }
 
-    switch (SSL_get_error(tc->ssl, ret)) {
+    int err = SSL_get_error(tc->ssl, ret);
+    switch (err) {
         case SSL_ERROR_WANT_READ:  return  1;
         case SSL_ERROR_WANT_WRITE: return -1;
         default:

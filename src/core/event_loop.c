@@ -22,6 +22,8 @@
 #include "http/ws.h"
 #include "http/ws_registry.h"
 #include <sys/eventfd.h>
+#include "core/config.h"
+#include "http/h2.h"
 
 
 #if defined(__linux__) && defined(ROUTA_IO_URING)
@@ -48,6 +50,7 @@ struct event_loop {
     tls_context_t *tls_ctx;
     lb_t          *lb;
     int            should_stop;
+    routa_h2_config_t h2_cfg;
 };
 static int ws_route_placeholder(const http_request_t *req,
                                  http_response_t *resp, void *ctx) {
@@ -56,6 +59,11 @@ static int ws_route_placeholder(const http_request_t *req,
     http_response_set_header(resp, "Upgrade", "websocket");
     http_response_set_body(resp, "WebSocket upgrade required\n", 27);
     return 0;
+}
+
+void event_loop_set_h2_config(event_loop_t *loop,
+                               const routa_h2_config_t *cfg) {
+    if (loop && cfg) loop->h2_cfg = *cfg;
 }
 
 void event_loop_add_ws_route(event_loop_t *loop, const char *path,
@@ -294,15 +302,45 @@ static void handle_events_worker(worker_t *w) {
 
         /* ── POLLER_READ ── */
         if (events[i].events & POLLER_READ) {
+            if (conn->state == CONN_H2) {
+                int rc = h2_conn_flush(conn->h2);
+                if (rc < 0) {
+                    conn->state = CONN_CLOSING;
+                    goto handle_state;
+                }
+                while (1) {
+                    ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf,
+                                                 conn->tls);
+                    if (n < 0) break;    /* EAGAIN                                  */
+                    if (n == 0) {        /* EOF                                     */
+                        conn->state = CONN_CLOSING;
+                        goto handle_state;
+                    }
+                    int rrc = h2_conn_recv(conn->h2, w->router, w->chain);
+                    if (rrc < 0) {
+                        conn->state = CONN_CLOSING;
+                        goto handle_state;
+                    }
+                }
+                if (conn->h2->write_buf.len > 0) {
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                } else {
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_ET, conn);
+                }
+                continue;
+            }
             // WebSocket data
             if (conn->state == CONN_WEBSOCKET) {
                 ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf, conn->tls);
-                if (n <= 0) {
+                if (n == 0) {
                     ws_registry_remove(&w->ws_registry, conn);
                     ws_frame_state_free(&conn->ws_fs);
                     conn->state = CONN_CLOSING;
                     goto handle_state;
                 }
+                if (n < 0) continue;   /* EAGAIN */
                 if (handle_ws_read(w, conn) < 0) {
                     if (conn->write_buf.len > 0) {
                         conn->keep_alive = 0;
@@ -395,11 +433,28 @@ static void handle_events_worker(worker_t *w) {
             /* TLS handshake */
             if (conn->state == CONN_TLS_HANDSHAKE) {
                 int hs = tls_handshake(conn->tls);
-                if      (hs ==  0) { conn->state = CONN_READING;
-                                     poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn); }
-                else if (hs ==  1)   poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
-                else if (hs == -1)   poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
-                else { /* -2 fatal */
+                if (hs == 0) {
+                    const char *proto = tls_negotiated_protocol(conn->tls);
+                    if (proto && strcmp(proto, "h2") == 0) {
+                        conn->h2 = h2_conn_new(conn, &w->h2_cfg);
+                        if (!conn->h2) {
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                        conn->state = CONN_H2;
+                        h2_conn_flush(conn->h2);
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    } else {
+                        conn->state = CONN_READING;
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_ET, conn);
+                    }
+                } else if (hs == 1 || hs == -1) {
+                    /* Always watch both during handshake — TLS 1.3 needs it         */
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                } else {
                     poller_del(w->poller, conn->fd);
                     conn_remove(w, conn);
                     if (conn->tls) tls_shutdown(conn->tls);
@@ -614,6 +669,17 @@ static void handle_events_worker(worker_t *w) {
 
         /* ── POLLER_WRITE ── */
         if (events[i].events & POLLER_WRITE) {
+            if (conn->state == CONN_H2) {
+                int rc = h2_conn_flush(conn->h2);
+                if (rc < 0) {
+                    conn->state = CONN_CLOSING;
+                    goto handle_state;
+                }
+                if (conn->h2->write_buf.len == 0) {
+                    poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
+                }
+                continue;
+            }
             // WebSocket outbound flush
             if (conn->state == CONN_WEBSOCKET) {
                 ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
@@ -696,11 +762,28 @@ static void handle_events_worker(worker_t *w) {
             /* TLS handshake */
             if (conn->state == CONN_TLS_HANDSHAKE) {
                 int hs = tls_handshake(conn->tls);
-                if      (hs ==  0) { conn->state = CONN_READING;
-                                     poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn); }
-                else if (hs ==  1)   poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
-                else if (hs == -1)   poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
-                else {
+                if (hs == 0) {
+                    const char *proto = tls_negotiated_protocol(conn->tls);
+                    if (proto && strcmp(proto, "h2") == 0) {
+                        conn->h2 = h2_conn_new(conn, &w->h2_cfg);
+                        if (!conn->h2) {
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                        conn->state = CONN_H2;
+                        h2_conn_flush(conn->h2);
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    } else {
+                        conn->state = CONN_READING;
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_ET, conn);
+                    }
+                } else if (hs == 1 || hs == -1) {
+                    /* Always watch both during handshake — TLS 1.3 needs it         */
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                } else {
                     poller_del(w->poller, conn->fd);
                     conn_remove(w, conn);
                     if (conn->tls) tls_shutdown(conn->tls);
@@ -814,6 +897,10 @@ static void handle_events_worker(worker_t *w) {
 
         handle_state:
             switch (conn->state) {
+            case CONN_H2:
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_ET, conn);
+                    break;
             case CONN_WEBSOCKET:
                     poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
                     break;
@@ -1099,7 +1186,7 @@ static void *worker_run_uring(void *arg) {
 
 void event_loop_run(event_loop_t *loop) {
     if (!loop) return;
-    LOG_INFO("Event loop started");
+    LOG_INFO("\nEvent loop started\n");
     for (int i = 0; i < loop->n_workers; i++) {
         worker_t *w    = &loop->workers[i];
         w->port        = loop->port;
@@ -1109,6 +1196,7 @@ void event_loop_run(event_loop_t *loop) {
         w->chain       = g_chain;
         w->lb          = loop->lb;
         w->should_stop = 0;
+        w->h2_cfg = loop->h2_cfg;
 #if defined(__linux__) && defined(ROUTA_IO_URING)
         pthread_create(&w->thread, NULL, worker_run_uring, w);
 #else

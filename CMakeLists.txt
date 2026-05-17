@@ -63,17 +63,16 @@ if(ROUTA_IO_URING)
 endif()
 
 # ── Examples ─────────────────────────────────────────────────────────────────
-foreach(example hello_world config_example chunked_example ws_echo_server)
+foreach(example hello_world config_example chunked_example ws_echo_server h2_test_server)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
-        add_executable(${example} examples/${example}.c
-                include/http/h2_hpack.h)
+        add_executable(${example} examples/${example}.c)
         target_link_libraries(${example} PRIVATE routa_core)
         target_include_directories(${example} PRIVATE include)
     endif()
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_h2_hpack)
+foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_h2_hpack test_h2)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
         add_executable(${test} tests/${test}.c)
         target_link_libraries(${test} PRIVATE routa_core)
@@ -83,6 +82,9 @@ endforeach()
 
 include(cmake/Sanitizers.cmake)
 
+target_link_libraries(test_h2 PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
+target_link_libraries(h2_test_server PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
+
 enable_testing()
 add_test(NAME test_buf        COMMAND test_buf)
 add_test(NAME test_request    COMMAND test_request)
@@ -91,3 +93,4 @@ add_test(NAME test_chunked    COMMAND test_chunked)
 add_test(NAME test_file_cache    COMMAND test_file_cache)
 add_test(NAME test_ws    COMMAND test_ws)
 add_test(NAME test_h2_hpack    COMMAND test_h2_hpack)
+add_test(NAME test_h2    COMMAND test_h2)
