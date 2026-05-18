@@ -7,6 +7,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+
+static int handle_echo(const http_request_t *req,
+                        http_response_t *resp, void *ctx) {
+    (void)ctx;
+    http_response_set_status(resp, 200, "OK");
+    http_response_set_header(resp, "content-type", "text/plain");
+    if (req->body && req->body_len > 0)
+        http_response_set_body(resp, req->body, req->body_len);
+    else
+        http_response_set_body(resp, "(empty)\n", 8);
+    return 0;
+}
+
+static int handle_large(const http_request_t *req,
+                          http_response_t *resp, void *ctx) {
+    (void)req; (void)ctx;
+    size_t sz  = 131072;
+    char  *buf = malloc(sz);
+    if (!buf) return -1;
+    memset(buf, 'X', sz);
+    http_response_set_status(resp, 200, "OK");
+    http_response_set_header(resp, "content-type", "application/octet-stream");
+    http_response_set_body(resp, buf, sz);
+    free(buf);
+    return 0;
+}
+
 static int handle_hello(const http_request_t *req,
                          http_response_t *resp, void *ctx) {
     (void)req; (void)ctx;
@@ -36,6 +63,10 @@ int main(void) {
     event_loop_set_h2_config(loop, &cfg.h2);
 
     event_loop_add_route(loop, "/hello", 1 << HTTP_GET, handle_hello, NULL);
+    event_loop_add_route(loop, "/echo",
+                     1 << HTTP_POST, handle_echo, NULL);
+    event_loop_add_route(loop, "/large",
+                         1 << HTTP_GET, handle_large, NULL);
 
     printf("\nListening on 18443...\n");
     event_loop_run(loop);

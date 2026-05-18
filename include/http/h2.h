@@ -88,6 +88,8 @@ typedef struct h2_stream {
     uint32_t          dependency;
     uint8_t           weight;
     int               exclusive;
+    buf_t    pending_data;      /* buffered DATA frames waiting for window    */
+    size_t   pending_offset;    /* bytes already sent from pending_data       */
 } h2_stream_t;
 
 /* ── Stream storage backends ─────────────────────────────────────────────── */

@@ -322,6 +322,7 @@ static void handle_events_worker(worker_t *w) {
                         goto handle_state;
                     }
                 }
+
                 if (conn->h2->write_buf.len > 0) {
                     poller_mod(w->poller, conn->fd,
                                POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
@@ -474,7 +475,26 @@ static void handle_events_worker(worker_t *w) {
             int pr = http_request_parse(&req, &conn->read_buf, &consumed);
 
             if (pr == 1) continue;   /* incomplete */
-
+            /* h2c — cleartext HTTP/2 direct connection (RFC 7540 §3.4)   */
+            if (pr == -1 || pr == 1) {
+                /* Peek: is this the H2 client preface?                   */
+                static const uint8_t H2_PREFACE[] =
+                    "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+                if (conn->read_buf.len >= 24 &&
+                    memcmp(conn->read_buf.data, H2_PREFACE, 24) == 0) {
+                    conn->h2 = h2_conn_new(conn, &w->h2_cfg);
+                    if (!conn->h2) {
+                        conn->state = CONN_CLOSING;
+                        goto handle_state;
+                    }
+                    conn->state = CONN_H2;
+                    h2_conn_flush(conn->h2);
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    continue;
+                    }
+            }
+            
             if (pr == -1) {
                 /* 400 — legacy write_buf path */
                 buf_reset(&conn->write_buf);
@@ -675,8 +695,33 @@ static void handle_events_worker(worker_t *w) {
                     conn->state = CONN_CLOSING;
                     goto handle_state;
                 }
-                if (conn->h2->write_buf.len == 0) {
-                    poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
+                if (conn->h2->write_buf.len > 0) {
+                    /* Partial flush — keep watching for write                     */
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                } else {
+                    /* All flushed — read only + drain any pending input           */
+                    while (1) {
+                        ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf,
+                                                     conn->tls);
+                        if (n < 0) break;
+                        if (n == 0) {
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                        int rrc = h2_conn_recv(conn->h2, w->router, w->chain);
+                        if (rrc < 0) {
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                    }
+                    if (conn->h2->write_buf.len > 0) {
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    } else {
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_ET, conn);
+                    }
                 }
                 continue;
             }

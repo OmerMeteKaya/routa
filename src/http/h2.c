@@ -45,6 +45,8 @@ static h2_stream_t *pool_create(h2_stream_pool_t *p, uint32_t id,
     s->send_window = initial_window;
     buf_init(&s->body);
     buf_init(&s->header_block);
+    buf_init(&s->pending_data);
+    s->pending_offset = 0;
     return s;
 }
 
@@ -52,6 +54,7 @@ static void pool_remove(h2_stream_pool_t *p, uint32_t id) {
     for (int i = 0; i < p->count; i++) {
         if (p->slots[i].id == id) {
             buf_free(&p->slots[i].body);
+            buf_free(&p->slots[i].pending_data);
             buf_free(&p->slots[i].header_block);
             if (p->slots[i].headers) {
                 hpack_headers_free(p->slots[i].headers,
@@ -91,6 +94,7 @@ static void map_free_entries(h2_stream_map_t *m) {
     for (int i = 0; i < m->capacity; i++) {
         if (m->keys[i] && m->buckets[i]) {
             buf_free(&m->buckets[i]->body);
+            buf_free(&m->buckets[i]->pending_data);
             buf_free(&m->buckets[i]->header_block);
             if (m->buckets[i]->headers) {
                 hpack_headers_free(m->buckets[i]->headers,
@@ -132,6 +136,8 @@ static h2_stream_t *map_create(h2_stream_map_t *m, uint32_t id,
     s->send_window = initial_window;
     buf_init(&s->body);
     buf_init(&s->header_block);
+    buf_init(&s->pending_data);
+    s->pending_offset = 0;
 
     int mask = m->capacity - 1;
     int idx  = (int)(id & (uint32_t)mask);
@@ -156,6 +162,7 @@ static void map_remove(h2_stream_map_t *m, uint32_t id) {
         if (m->keys[slot] == 0) return;
         if (m->keys[slot] == id) {
             buf_free(&m->buckets[slot]->body);
+            buf_free(&m->buckets[slot]->pending_data);
             buf_free(&m->buckets[slot]->header_block);
             if (m->buckets[slot]->headers) {
                 hpack_headers_free(m->buckets[slot]->headers,
@@ -404,6 +411,7 @@ void h2_conn_free(h2_conn_t *hc) {
         for (int i = 0; i < hc->streams.pool.count; i++) {
             h2_stream_t *s = &hc->streams.pool.slots[i];
             buf_free(&s->body);
+            buf_free(&s->pending_data);
             buf_free(&s->header_block);
             if (s->headers) {
                 hpack_headers_free(s->headers, s->header_count);
@@ -528,6 +536,44 @@ static int handle_ping(h2_conn_t *hc, const uint8_t *payload,
     return write_ping_ack(&hc->write_buf, payload);
 }
 
+static void flush_pending(h2_conn_t *hc, h2_stream_t *s) {
+    if (s->pending_data.len == 0) return;
+
+    size_t rem = s->pending_data.len - s->pending_offset;
+    const uint8_t *ptr = (const uint8_t *)s->pending_data.data
+                         + s->pending_offset;
+
+    while (rem > 0) {
+        int32_t conn_win   = hc->send_window;
+        int32_t stream_win = s->send_window;
+        int32_t win        = conn_win < stream_win ? conn_win : stream_win;
+        if (win <= 0) break;
+
+        size_t can_send = (size_t)win < rem ? (size_t)win : rem;
+        size_t chunk    = can_send < hc->peer_max_frame_size
+                          ? can_send : hc->peer_max_frame_size;
+        int end = (chunk == rem);
+
+        if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
+                            H2_FRAME_DATA,
+                            end ? H2_FLAG_END_STREAM : 0,
+                            s->id) < 0) break;
+        if (buf_append(&hc->write_buf, ptr, chunk) < 0) break;
+
+        hc->send_window    -= (int32_t)chunk;
+        s->send_window     -= (int32_t)chunk;
+        s->pending_offset  += chunk;
+        ptr += chunk;
+        rem -= chunk;
+    }
+
+    if (s->pending_offset >= s->pending_data.len) {
+        /* All pending data sent                                           */
+        buf_reset(&s->pending_data);
+        s->pending_offset = 0;
+    }
+}
+
 static int handle_window_update(h2_conn_t *hc, const uint8_t *payload,
                                  uint32_t length, uint32_t stream_id) {
     if (length != 4) return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
@@ -555,6 +601,27 @@ static int handle_window_update(h2_conn_t *hc, const uint8_t *payload,
             }
         }
     }
+    if (stream_id == 0) {
+        /* Connection window update — try to flush all pending streams    */
+        if (hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR) {
+            for (int i = 0; i < hc->streams.pool.count; i++) {
+                h2_stream_t *ps = &hc->streams.pool.slots[i];
+                if (ps->pending_data.len > ps->pending_offset)
+                    flush_pending(hc, ps);
+            }
+        } else {
+            for (int i = 0; i < hc->streams.map.capacity; i++) {
+                if (!hc->streams.map.keys[i]) continue;
+                h2_stream_t *ps = hc->streams.map.buckets[i];
+                if (ps->pending_data.len > ps->pending_offset)
+                    flush_pending(hc, ps);
+            }
+        }
+    } else {
+        h2_stream_t *ps = stream_find(hc, stream_id);
+        if (ps && ps->pending_data.len > ps->pending_offset)
+            flush_pending(hc, ps);
+    }
     return 0;
 }
 
@@ -562,27 +629,29 @@ static int handle_rst_stream(h2_conn_t *hc, const uint8_t *payload,
                               uint32_t length, uint32_t stream_id) {
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     if (length != 4)    return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
-    uint32_t err = ((uint32_t)payload[0] << 24) |
-                   ((uint32_t)payload[1] << 16) |
-                   ((uint32_t)payload[2] <<  8) |
-                    (uint32_t)payload[3];
-    stream_remove(hc, stream_id);
+
+    uint32_t error_code = ((uint32_t)payload[0] << 24) |
+                          ((uint32_t)payload[1] << 16) |
+                          ((uint32_t)payload[2] <<  8) |
+                           (uint32_t)payload[3];
+    (void)error_code;   /* logged below if needed */
+
+    h2_stream_t *s = stream_find(hc, stream_id);
+    if (s) {
+        /* Discard any pending outbound data for this stream              */
+        buf_reset(&s->pending_data);
+        s->pending_offset = 0;
+        s->state = H2_STREAM_CLOSED;
+        stream_remove(hc, stream_id);
+    }
+    /* Unknown stream ID in RST_STREAM is silently ignored (RFC 7540 §6.4) */
     return 0;
 }
-
 static int handle_goaway(h2_conn_t *hc, const uint8_t *payload,
                           uint32_t length) {
     hc->goaway_received = 1;
-    if (length >= 8) {
-        uint32_t last_sid = (((uint32_t)payload[0] & 0x7f) << 24) |
-                            ((uint32_t)payload[1] << 16) |
-                            ((uint32_t)payload[2] <<  8) |
-                             (uint32_t)payload[3];
-        uint32_t err      = ((uint32_t)payload[4] << 24) |
-                            ((uint32_t)payload[5] << 16) |
-                            ((uint32_t)payload[6] <<  8) |
-                             (uint32_t)payload[7];
-    }
+    (void)payload;
+    (void)length;
     return -1;
 }
 /* ── Build http_request_t from decoded HPACK headers ────────────────────── */
@@ -619,22 +688,27 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
         }
 
         if (req->header_count < 64) {
-            req->headers[req->header_count].key   = (char *)name;
-            req->headers[req->header_count].value = (char *)value;
-            req->header_count++;
+            req->headers[req->header_count].key   = strdup(name);
+            req->headers[req->header_count].value = strdup(value);
+            if (req->headers[req->header_count].key &&
+                req->headers[req->header_count].value)
+                req->header_count++;
         }
     }
     if (!req->path) req->path = strdup("/");
 
     if (s->body.len > 0) {
-        req->body     =(char *) s->body.data;
-        req->body_len = s->body.len;
+        req->body = malloc(s->body.len);
+        if (req->body) {
+            memcpy(req->body, s->body.data, s->body.len);
+            req->body_len = s->body.len;
+        }
     }
     return 0;
 }
 
 /* ── Write HTTP response as H2 HEADERS + DATA frames ────────────────────── */
-static int send_response(h2_conn_t *hc, uint32_t stream_id,
+static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                           http_response_t *resp) {
     char status_str[4];
     snprintf(status_str, sizeof(status_str), "%d", resp->status);
@@ -692,22 +766,70 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id,
     if (resp->body && resp->body_len > 0) {
         size_t rem = resp->body_len;
         const uint8_t *ptr = (const uint8_t *)resp->body;
+
         while (rem > 0) {
-            size_t chunk = rem < hc->peer_max_frame_size
-                           ? rem : hc->peer_max_frame_size;
+            /* How much can we send right now? */
+            int32_t conn_win   = hc->send_window;
+            int32_t stream_win = s->send_window;
+            int32_t win        = conn_win < stream_win ? conn_win : stream_win;
+
+            if (win <= 0) {
+                /* Window exhausted — buffer remaining data in stream     */
+                if (buf_append(&s->pending_data, ptr, rem) < 0) return -1;
+                s->pending_offset = 0;
+                return 0;
+            }
+
+            size_t can_send = (size_t)win < rem ? (size_t)win : rem;
+            size_t chunk    = can_send < hc->peer_max_frame_size
+                              ? can_send : hc->peer_max_frame_size;
             int end = (chunk == rem);
+
             if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
                                 H2_FRAME_DATA,
                                 end ? H2_FLAG_END_STREAM : 0,
-                                stream_id) < 0){
-                return -1;
-        }
+                                stream_id) < 0) return -1;
             if (buf_append(&hc->write_buf, ptr, chunk) < 0) return -1;
+
+            hc->send_window -= (int32_t)chunk;
+            s->send_window  -= (int32_t)chunk;
             ptr += chunk;
             rem -= chunk;
         }
     }
     return 0;
+}
+
+static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
+                            uint32_t stream_id,
+                            struct router *router,
+                            struct middleware_chain *chain) {
+    http_request_t  req;
+    http_response_t resp;
+    stream_to_request(s, &req);
+    http_response_init(&resp);
+
+    int allowed = 0;
+    route_t *route = router_match(router, &req, &allowed);
+    if (!route && allowed == 0) {
+        http_response_set_status(&resp, 404, "Not Found");
+        http_response_set_body(&resp, "Not Found\n", 10);
+    } else if (!route) {
+        http_response_set_status(&resp, 405, "Method Not Allowed");
+        http_response_set_body(&resp, "Method Not Allowed\n", 20);
+    } else {
+        if (chain) {
+            middleware_chain_set_handler(chain, route->handler, route->ctx);
+            middleware_chain_execute(chain, &req, &resp);
+        } else {
+            route->handler(&req, &resp, route->ctx);
+        }
+    }
+    http_response_set_header(&resp, "server", "routa");
+    int rc = send_response(hc, stream_id, s, &resp);
+    http_response_destroy(&resp);
+    http_request_free(&req);
+    return rc;
 }
 
 /* ── HEADERS frame handler ───────────────────────────────────────────────── */
@@ -793,41 +915,15 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
 
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
-
-        /* Dispatch to router                                              */
-        http_request_t req;
-        stream_to_request(s, &req);
-
-        http_response_t resp;
-        http_response_init(&resp);
-
-        int allowed = 0;
-        route_t *route = router_match(router, &req, &allowed);
-
-        if (!route && allowed == 0) {
-            http_response_set_status(&resp, 404, "Not Found");
-            http_response_set_body(&resp, "Not Found\n", 10);
-        } else if (!route) {
-            http_response_set_status(&resp, 405, "Method Not Allowed");
-            http_response_set_body(&resp, "Method Not Allowed\n", 20);
-        } else {
-            if (chain) {
-                middleware_chain_set_handler(chain,
-                                             route->handler, route->ctx);
-                middleware_chain_execute(chain, &req, &resp);
-            } else {
-                route->handler(&req, &resp, route->ctx);
-            }
-        }
-        http_response_set_header(&resp, "server", "routa");
-        send_response(hc, stream_id, &resp);
-        http_response_destroy(&resp);
-
+        dispatch_stream(hc, s, stream_id, router, chain);
+        s->body.data = NULL;
+        s->body.len  = 0;
+        s->body.cap  = 0;
         s->state = H2_STREAM_CLOSED;
         stream_remove(hc, stream_id);
-
-        /* Send WINDOW_UPDATE to keep connection flow control healthy      */
         write_window_update(&hc->write_buf, 0, (uint32_t)length);
+    } else {
+        s->state = H2_STREAM_OPEN;
     }
     return 0;
 }
@@ -849,19 +945,14 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
         return conn_error(hc, H2_ERR_INTERNAL_ERROR);
 
     if (flags & H2_FLAG_END_HEADERS) {
-        /* Synthesize END_HEADERS — reuse handle_headers end path         */
-        uint8_t synth_flags = H2_FLAG_END_HEADERS |
-                              (s->state == H2_STREAM_HALF_CLOSED_REMOTE
-                               ? H2_FLAG_END_STREAM : 0);
-        /* Decode directly — header_block already accumulated             */
         hpack_header_t headers[64];
         int n = hpack_decode(&hc->hpack_rx,
                              (const uint8_t *)s->header_block.data,
                              s->header_block.len,
                              headers, 64);
         buf_reset(&s->header_block);
-        s->expect_continuation      = 0;
-        hc->continuation_stream_id  = 0;
+        s->expect_continuation     = 0;
+        hc->continuation_stream_id = 0;
 
         if (n < 0) return conn_error(hc, H2_ERR_COMPRESSION_ERROR);
 
@@ -874,35 +965,13 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
         memcpy(s->headers, headers, (size_t)n * sizeof(hpack_header_t));
         s->header_count = n;
 
-        if (synth_flags & H2_FLAG_END_STREAM) {
-            http_request_t  req;
-            http_response_t resp;
-            stream_to_request(s, &req);
-            http_response_init(&resp);
-
-            int allowed = 0;
-            route_t *route = router_match(router, &req, &allowed);
-            if (!route && allowed == 0) {
-                http_response_set_status(&resp, 404, "Not Found");
-                http_response_set_body(&resp, "Not Found\n", 10);
-            } else if (!route) {
-                http_response_set_status(&resp, 405, "Method Not Allowed");
-                http_response_set_body(&resp, "Method Not Allowed\n", 20);
-            } else {
-                if (chain) {
-                    middleware_chain_set_handler(chain,
-                                                 route->handler, route->ctx);
-                    middleware_chain_execute(chain, &req, &resp);
-                } else {
-                    route->handler(&req, &resp, route->ctx);
-                }
-            }
-            http_response_set_header(&resp, "server", "routa");
-            send_response(hc, stream_id, &resp);
-            http_response_destroy(&resp);
-            s->state = H2_STREAM_CLOSED;
-            stream_remove(hc, stream_id);
-        }
+        s->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        dispatch_stream(hc, s, stream_id, router, chain);
+        s->body.data = NULL;
+        s->body.len  = 0;
+        s->body.cap  = 0;
+        s->state = H2_STREAM_CLOSED;
+        stream_remove(hc, stream_id);
     }
     return 0;
 }
@@ -917,6 +986,7 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
 
     h2_stream_t *s = stream_find(hc, stream_id);
     if (!s) {
+        LOG_WARN("h2: DATA for unknown stream %u", stream_id);
         write_rst_stream(&hc->write_buf, stream_id, H2_ERR_STREAM_CLOSED);
         return 0;
     }
@@ -933,43 +1003,30 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
         dlen -= pad;
     }
 
+    if ((int32_t)dlen > hc->recv_window) {
+        return conn_error(hc, H2_ERR_FLOW_CONTROL_ERROR);
+    }
+    hc->recv_window -= (int32_t)dlen;
+
     if (buf_append(&s->body, data, dlen) < 0)
         return conn_error(hc, H2_ERR_INTERNAL_ERROR);
 
     /* Flow control: send WINDOW_UPDATE to keep stream alive               */
     if (dlen > 0) {
+        hc->recv_window += (int32_t)dlen;   /* restore before WINDOW_UPDATE */
         write_window_update(&hc->write_buf, stream_id, dlen);
         write_window_update(&hc->write_buf, 0, dlen);
     }
 
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        s->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        dispatch_stream(hc, s, stream_id, router, chain);
 
-        http_request_t  req;
-        http_response_t resp;
-        stream_to_request(s, &req);
-        http_response_init(&resp);
+        s->body.data = NULL;
+        s->body.len  = 0;
+        s->body.cap  = 0;
 
-        int allowed = 0;
-        route_t *route = router_match(router, &req, &allowed);
-        if (!route && allowed == 0) {
-            http_response_set_status(&resp, 404, "Not Found");
-            http_response_set_body(&resp, "Not Found\n", 10);
-        } else if (!route) {
-            http_response_set_status(&resp, 405, "Method Not Allowed");
-            http_response_set_body(&resp, "Method Not Allowed\n", 20);
-        } else {
-            if (chain) {
-                middleware_chain_set_handler(chain,
-                                             route->handler, route->ctx);
-                middleware_chain_execute(chain, &req, &resp);
-            } else {
-                route->handler(&req, &resp, route->ctx);
-            }
-        }
-        http_response_set_header(&resp, "server", "routa");
-        send_response(hc, stream_id, &resp);
-        http_response_destroy(&resp);
         s->state = H2_STREAM_CLOSED;
         stream_remove(hc, stream_id);
     }
