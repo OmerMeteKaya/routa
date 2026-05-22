@@ -920,7 +920,17 @@ static void handle_events_worker(worker_t *w) {
                         conn->ws_handler->on_open(conn, conn->ws_handler->ctx);
 
                     poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
-                    continue;   // back to event loop
+                    if (conn->read_buf.len > 0) {
+                        if (handle_ws_read(w, conn) < 0) {
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                        if (conn->write_buf.len > 0) {
+                            poller_mod(w->poller, conn->fd,
+                                       POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                        }
+                    }
+                    continue;
                 }
                 if (conn->sendfile_fd >= 0) {
                     conn->state = CONN_SENDFILE;

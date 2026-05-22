@@ -130,8 +130,7 @@ int ws_handshake(conn_t *conn, const http_request_t *req,
 
     conn->ws_state = WS_STATE_OPEN;
     ws_frame_state_init(&conn->ws_fs);
-
-    LOG_DEBUG("ws: handshake complete for %s", conn->remote_ip);
+    
     return 0;
 }
 
@@ -163,7 +162,8 @@ static int build_frame_header(uint8_t *hdr, ws_opcode_t opcode,
 
 int ws_send(conn_t *conn, const uint8_t *data, size_t len,
             ws_opcode_t opcode) {
-    if (!conn || (!data && len > 0)) return -1;
+    if (!conn) return -1;
+    if (!data && len > 0) return -1;
     if (conn->ws_state != WS_STATE_OPEN &&
         conn->ws_state != WS_STATE_CLOSING) return -1;
 
@@ -291,18 +291,41 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
             buf_consume(rb, hdr_consumed);
 
             fs->payload_read = 0;
+            if (fs->payload_len == 0) {
+                int is_ctrl = (fs->opcode == WS_OP_PING ||
+                               fs->opcode == WS_OP_PONG ||
+                               fs->opcode == WS_OP_CLOSE);
+                if (is_ctrl) {
+                    if (fs->opcode == WS_OP_PING) {
+                        int r = ws_pong(conn, NULL, 0);
+                    } else if (fs->opcode == WS_OP_PONG) {
+                        conn->ws_ping_misses = 0;
+                    } else if (fs->opcode == WS_OP_CLOSE) {
+                        if (handler->on_close)
+                            handler->on_close(conn, WS_CLOSE_NORMAL,
+                                              NULL, handler->ctx);
+                        ws_close(conn, WS_CLOSE_NORMAL, NULL);
+                        conn->ws_state = WS_STATE_CLOSED;
+                        return -1;
+                    }
+                    fs->phase = WS_PARSE_HEADER;
+                    break;
+                }
+            }
             fs->phase        = WS_PARSE_PAYLOAD;
+
             break;
         }
 
         /* ── Phase 2: read payload bytes ─────────────────────────────── */
         case WS_PARSE_PAYLOAD: {
+
             uint64_t remaining = fs->payload_len - fs->payload_read;
             size_t   available = rb->len;
             size_t   to_read   = (available < (size_t)remaining)
                                  ? available : (size_t)remaining;
 
-            if (to_read == 0) return 0;   /* wait for more data           */
+            if (to_read == 0 && remaining > 0) return 0;   /* wait for more data           */
 
             uint8_t *payload_ptr = (uint8_t *)rb->data;
 
@@ -326,8 +349,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
                 if (to_read < (size_t)fs->payload_len) return 0;
 
                 if (fs->opcode == WS_OP_PING) {
-                    ws_pong(conn, payload_ptr, (size_t)fs->payload_len);
-
+                    int r = ws_pong(conn, payload_ptr, (size_t)fs->payload_len);
                 } else if (fs->opcode == WS_OP_PONG) {
                     conn->ws_ping_misses = 0;   /* reset miss counter      */
 
@@ -355,6 +377,19 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
             }
 
             /* ── Data frames: accumulate into frag_buf ──────────────── */
+            /* Reject reserved/unknown opcodes (RFC 6455 §5.2)            */
+            if (fs->opcode != WS_OP_TEXT     &&
+                fs->opcode != WS_OP_BINARY   &&
+                fs->opcode != WS_OP_CONTINUATION) {
+                ws_close(conn, WS_CLOSE_PROTOCOL, "unknown opcode");
+                return -1;
+                }
+
+            /* Reject orphan CONTINUATION (no preceding TEXT/BINARY)      */
+            if (fs->opcode == WS_OP_CONTINUATION && !fs->in_fragment) {
+                ws_close(conn, WS_CLOSE_PROTOCOL, "unexpected continuation");
+                return -1;
+            }
             if (fs->opcode != WS_OP_CONTINUATION) {
                 /* New message — record opcode for fragmented sequence     */
                 if (fs->in_fragment) {

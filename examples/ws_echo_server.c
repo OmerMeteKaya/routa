@@ -15,7 +15,7 @@ static void on_sigint(int sig) {
 
 static void on_open(conn_t *conn, void *ctx) {
     (void)ctx;
-    LOG_INFO("ws: client connected fd=%d", conn->fd);
+    LOG_INFO("ws: client connected fd=%d\n", conn->fd);
 }
 
 static void on_message(conn_t *conn, const uint8_t *data,
@@ -28,13 +28,13 @@ static void on_message(conn_t *conn, const uint8_t *data,
 static void on_close(conn_t *conn, ws_close_code_t code,
                      const char *reason, void *ctx) {
     (void)ctx;
-    LOG_INFO("ws: client closed fd=%d code=%d reason=%s",
+    LOG_INFO("ws: client closed fd=%d code=%d reason=%s\n",
              conn->fd, code, reason ? reason : "");
 }
 
 static void on_error(conn_t *conn, const char *msg, void *ctx) {
     (void)ctx;
-    LOG_WARN("ws: error fd=%d: %s", conn->fd, msg);
+    LOG_WARN("ws: error fd=%d: %s\n", conn->fd, msg);
 }
 
 static event_loop_t *g_loop_ref = NULL;
