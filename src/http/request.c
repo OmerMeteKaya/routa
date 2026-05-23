@@ -113,7 +113,11 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
 
     /* ---- find end of headers ---- */
     char *hdr_end = memmem(data, buf->len, "\r\n\r\n", 4);
-    if (!hdr_end) goto done; /* incomplete */
+    if (!hdr_end) {
+        /* Bare LF terminator — reject as malformed                       */
+        if (memmem(data, buf->len, "\n\n", 2)) { ret = -1; goto done; }
+        goto done; /* genuinely incomplete */
+    }
 
     size_t headers_len = (size_t)(hdr_end - data) + 4;
 
@@ -239,7 +243,17 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
 
     /* ---- body ---- */
     const char *cl_str = http_request_get_header(req, "Content-Length");
-    size_t content_length = cl_str ? (size_t)strtoull(cl_str, NULL, 10) : 0;
+    size_t content_length = 0;
+    if (cl_str) {
+        /* Reject negative or non-numeric Content-Length                  */
+        const char *p = cl_str;
+        while (*p == ' ') p++;
+        if (*p == '-') { ret = -1; goto done; }
+        char *endptr = NULL;
+        unsigned long long val = strtoull(p, &endptr, 10);
+        if (endptr == p) { ret = -1; goto done; }   /* no digits */
+        content_length = (size_t)val;
+    }
     size_t body_start     = headers_len;
     size_t available      = buf->len > body_start ? buf->len - body_start : 0;
 

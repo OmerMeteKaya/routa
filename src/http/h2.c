@@ -336,11 +336,10 @@ static int write_ping_ack(buf_t *buf, const uint8_t *payload) {
 h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
     h2_conn_t *hc = calloc(1, sizeof(h2_conn_t));
     if (!hc) return NULL;
-
     hc->conn         = conn;
     hc->lookup_mode  = cfg->stream_lookup;
     hc->send_window  = H2_DEFAULT_WINDOW;
-    hc->recv_window  = H2_DEFAULT_WINDOW;
+    hc->recv_window  = 1048576;
     hc->initial_send_window = H2_DEFAULT_WINDOW;
 
     /* Peer SETTINGS defaults (before client sends SETTINGS)               */
@@ -384,9 +383,9 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
     };
     if (write_settings(&hc->write_buf, ids, vals, 5) < 0) goto fail;
     hc->settings_ack_pending = 1;
-    write_window_update(&hc->write_buf, 0, 65535);
-    LOG_INFO("h2: new connection (mode=%s)",
-             hc->lookup_mode == H2_STREAM_LOOKUP_HASHMAP ? "hashmap" : "pool");
+    write_window_update(&hc->write_buf, 0, 1048576);
+   /* LOG_INFO("h2: new connection (mode=%s)",
+             hc->lookup_mode == H2_STREAM_LOOKUP_HASHMAP ? "hashmap" : "pool");*/
     return hc;
 
 fail:
@@ -449,6 +448,7 @@ static int conn_error(h2_conn_t *hc, h2_error_code_t code) {
         write_goaway(&hc->write_buf, hc->last_stream_id, code);
         hc->goaway_sent = 1;
     }
+    hc->error = 1;
     return -1;
 }
 
@@ -457,7 +457,7 @@ static int conn_error(h2_conn_t *hc, h2_error_code_t code) {
 static int handle_settings(h2_conn_t *hc,
                             const uint8_t *payload, uint32_t length,
                             uint8_t flags) {
-    /* ACK — our SETTINGS was accepted                                     */
+    /* ACK — our SETTINGS was accepted      */
     if (flags & H2_FLAG_ACK) {
         if (length != 0)
             return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
@@ -571,6 +571,10 @@ static void flush_pending(h2_conn_t *hc, h2_stream_t *s) {
         /* All pending data sent                                           */
         buf_reset(&s->pending_data);
         s->pending_offset = 0;
+        if (s->state == H2_STREAM_HALF_CLOSED_REMOTE) {
+            s->state = H2_STREAM_CLOSED;
+            stream_remove(hc, s->id);
+        }
     }
 }
 
@@ -772,7 +776,6 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
             int32_t conn_win   = hc->send_window;
             int32_t stream_win = s->send_window;
             int32_t win        = conn_win < stream_win ? conn_win : stream_win;
-
             if (win <= 0) {
                 /* Window exhausted — buffer remaining data in stream     */
                 if (buf_append(&s->pending_data, ptr, rem) < 0) return -1;
@@ -916,14 +919,15 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
-        s->body.data = NULL;
-        s->body.len  = 0;
-        s->body.cap  = 0;
-        s->state = H2_STREAM_CLOSED;
-        stream_remove(hc, stream_id);
+        s->body.data = NULL; s->body.len = 0; s->body.cap = 0;
         write_window_update(&hc->write_buf, 0, (uint32_t)length);
-    } else {
-        s->state = H2_STREAM_OPEN;
+        /* Keep stream alive if pending data remains                      */
+        if (s->pending_data.len == 0) {
+            s->state = H2_STREAM_CLOSED;
+            stream_remove(hc, stream_id);
+        } else {
+            s->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        }
     }
     return 0;
 }
@@ -986,7 +990,7 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
 
     h2_stream_t *s = stream_find(hc, stream_id);
     if (!s) {
-        LOG_WARN("h2: DATA for unknown stream %u", stream_id);
+       // LOG_WARN("h2: DATA for unknown stream %u", stream_id);
         write_rst_stream(&hc->write_buf, stream_id, H2_ERR_STREAM_CLOSED);
         return 0;
     }
@@ -1020,15 +1024,14 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
 
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
-        s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
-
-        s->body.data = NULL;
-        s->body.len  = 0;
-        s->body.cap  = 0;
-
-        s->state = H2_STREAM_CLOSED;
-        stream_remove(hc, stream_id);
+        s->body.data = NULL; s->body.len = 0; s->body.cap = 0;
+        if (s->pending_data.len == 0) {
+            s->state = H2_STREAM_CLOSED;
+            stream_remove(hc, stream_id);
+        } else {
+            s->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        }
     }
     return 0;
 }
@@ -1043,16 +1046,16 @@ int h2_conn_recv(h2_conn_t *hc,
 
     buf_t *rb = &hc->conn->read_buf;
     /* ── Client preface check (first call only) ── */
-    if (!hc->last_stream_id && !hc->goaway_sent && !hc->goaway_received) {
-        if (rb->len < H2_CLIENT_PREFACE_LEN) return 0;  /* wait for more  */
+    if (!hc->preface_done) {
+        if (rb->len < H2_CLIENT_PREFACE_LEN) return 0;
         if (memcmp(rb->data, H2_CLIENT_PREFACE,
                    H2_CLIENT_PREFACE_LEN) != 0) {
             LOG_WARN("h2: bad client preface");
             return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
-        }
+                   }
         buf_consume(rb, H2_CLIENT_PREFACE_LEN);
+        hc->preface_done = 1;
     }
-
     /* ── Frame loop ── */
     while (rb->len >= H2_FRAME_HDR_SZ) {
         const uint8_t *hdr     = (const uint8_t *)rb->data;
@@ -1070,7 +1073,6 @@ int h2_conn_recv(h2_conn_t *hc,
         if (hc->continuation_stream_id != 0 &&
             type != H2_FRAME_CONTINUATION)
             return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
-
         int rc = 0;
         switch (type) {
         case H2_FRAME_SETTINGS:
@@ -1123,7 +1125,6 @@ int h2_conn_recv(h2_conn_t *hc,
 int h2_conn_flush(h2_conn_t *hc) {
     if (!hc || !hc->conn) return -1;
     if (hc->write_buf.len == 0) return 0;
-
     ssize_t n = io_write_from_buf(hc->conn->fd,
                                    &hc->write_buf,
                                    hc->conn->tls);

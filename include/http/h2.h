@@ -146,6 +146,11 @@ typedef struct h2_conn {
     /* Outbound buffer */
     buf_t             write_buf;
 
+    /* Errors */
+    int               error;
+
+    /* Done */
+    int               preface_done;
 } h2_conn_t;
 
 /* Forward declarations */

@@ -318,8 +318,15 @@ static void handle_events_worker(worker_t *w) {
                     }
                     int rrc = h2_conn_recv(conn->h2, w->router, w->chain);
                     if (rrc < 0) {
-                        conn->state = CONN_CLOSING;
-                        goto handle_state;
+                        if (conn->h2->write_buf.len > 0) {
+                            poller_mod(w->poller, conn->fd,
+                                       POLLER_READ | POLLER_WRITE | POLLER_ET,
+                                       conn);
+                        } else {
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                        continue;
                     }
                 }
 
@@ -696,13 +703,19 @@ static void handle_events_worker(worker_t *w) {
                     goto handle_state;
                 }
                 if (conn->h2->write_buf.len > 0) {
-                    /* Partial flush — keep watching for write                     */
+                    /* Partial flush — keep watching for write             */
                     poller_mod(w->poller, conn->fd,
                                POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
                 } else {
-                    /* All flushed — read only + drain any pending input           */
+                    /* All flushed */
+                    if (conn->h2->error) {
+                        conn->state = CONN_CLOSING;
+                        goto handle_state;
+                    }
+                    /* Drain any pending input */
                     while (1) {
-                        ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf,
+                        ssize_t n = io_read_into_buf(conn->fd,
+                                                     &conn->read_buf,
                                                      conn->tls);
                         if (n < 0) break;
                         if (n == 0) {
@@ -711,8 +724,15 @@ static void handle_events_worker(worker_t *w) {
                         }
                         int rrc = h2_conn_recv(conn->h2, w->router, w->chain);
                         if (rrc < 0) {
-                            conn->state = CONN_CLOSING;
-                            goto handle_state;
+                            if (conn->h2->write_buf.len > 0) {
+                                poller_mod(w->poller, conn->fd,
+                                           POLLER_READ | POLLER_WRITE | POLLER_ET,
+                                           conn);
+                            } else {
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                            break;
                         }
                     }
                     if (conn->h2->write_buf.len > 0) {
@@ -725,64 +745,41 @@ static void handle_events_worker(worker_t *w) {
                 }
                 continue;
             }
-            // WebSocket outbound flush
-            if (conn->state == CONN_WEBSOCKET) {
-                ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
-                if (n < 0) {
-                    ws_registry_remove(&w->ws_registry, conn);
-                    ws_frame_state_free(&conn->ws_fs);
-                    conn->state = CONN_CLOSING;
-                    goto handle_state;
-                }
-                if (conn->write_buf.len == 0) {
-                    // All flushed — back to read-only watch
-                    if (conn->ws_state == WS_STATE_CLOSED) {
+                // WebSocket outbound flush
+                if (conn->state == CONN_WEBSOCKET) {
+                    ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
+                    if (n < 0) {
                         ws_registry_remove(&w->ws_registry, conn);
                         ws_frame_state_free(&conn->ws_fs);
                         conn->state = CONN_CLOSING;
                         goto handle_state;
                     }
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_ET, conn);
+                    if (conn->write_buf.len == 0) {
+                        // All flushed — back to read-only watch
+                        if (conn->ws_state == WS_STATE_CLOSED) {
+                            ws_registry_remove(&w->ws_registry, conn);
+                            ws_frame_state_free(&conn->ws_fs);
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_ET, conn);
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            /* ── Upstream connecting ── */
-            if (conn->state == CONN_UPSTREAM_CONNECTING) {
-                if (upstream_conn_check_connected(conn->upstream_fd) < 0) {
-                    poller_del(w->poller, conn->upstream_fd);
-                    close(conn->upstream_fd);
-                    conn->upstream_fd = -1;
-                    if (w->lb && conn->upstream_conn)
-                        upstream_conn_release(
-                            (upstream_conn_t *)conn->upstream_conn, 0);
-                    conn->upstream_node = conn->upstream_conn = NULL;
-                    buf_reset(&conn->upstream_req_buf);
-                    buf_reset(&conn->upstream_resp_buf);
-                    buf_reset(&conn->write_buf);
-                    http_response_simple(&conn->write_buf, 502, "Bad Gateway",
-                                        "text/plain", "Bad Gateway\n");
-                    conn_reset_write_state(conn);
-                    conn->state = CONN_WRITING;
-                    goto handle_state;
-                }
-                /* Connected — transition to writing */
-                conn->state = CONN_UPSTREAM_WRITING;
-                /* fall through to UPSTREAM_WRITING immediately */
-            }
-
-            /* ── Upstream writing ── */
-            if (conn->state == CONN_UPSTREAM_WRITING) {
-                buf_t *rb = &conn->upstream_req_buf;
-                if (rb->len > 0) {
-                    ssize_t n = write(conn->upstream_fd,
-                                      rb->data + conn->upstream_req_sent,
-                                      rb->len - conn->upstream_req_sent);
-                    if (n < 0 && errno != EAGAIN) {
+                /* ── Upstream connecting ── */
+                if (conn->state == CONN_UPSTREAM_CONNECTING) {
+                    if (upstream_conn_check_connected(conn->upstream_fd) < 0) {
                         poller_del(w->poller, conn->upstream_fd);
                         close(conn->upstream_fd);
                         conn->upstream_fd = -1;
+                        if (w->lb && conn->upstream_conn)
+                            upstream_conn_release(
+                                (upstream_conn_t *)conn->upstream_conn, 0);
+                        conn->upstream_node = conn->upstream_conn = NULL;
+                        buf_reset(&conn->upstream_req_buf);
+                        buf_reset(&conn->upstream_resp_buf);
                         buf_reset(&conn->write_buf);
                         http_response_simple(&conn->write_buf, 502, "Bad Gateway",
                                             "text/plain", "Bad Gateway\n");
@@ -790,537 +787,560 @@ static void handle_events_worker(worker_t *w) {
                         conn->state = CONN_WRITING;
                         goto handle_state;
                     }
-                    if (n > 0) conn->upstream_req_sent += (size_t)n;
+                    /* Connected — transition to writing */
+                    conn->state = CONN_UPSTREAM_WRITING;
+                    /* fall through to UPSTREAM_WRITING immediately */
                 }
 
-                if (conn->upstream_req_sent >= rb->len) {
-                    /* All sent — wait for response */
-                    conn->upstream_req_sent = 0;
-                    buf_reset(&conn->upstream_req_buf);
-                    conn->state = CONN_UPSTREAM_READING;
-                    poller_mod(w->poller, conn->upstream_fd,
-                               POLLER_READ | POLLER_ET, conn);
-                }
-                continue;
-            }
-
-            /* TLS handshake */
-            if (conn->state == CONN_TLS_HANDSHAKE) {
-                int hs = tls_handshake(conn->tls);
-                if (hs == 0) {
-                    const char *proto = tls_negotiated_protocol(conn->tls);
-                    if (proto && strcmp(proto, "h2") == 0) {
-                        conn->h2 = h2_conn_new(conn, &w->h2_cfg);
-                        if (!conn->h2) {
-                            conn->state = CONN_CLOSING;
-                            goto handle_state;
-                        }
-                        conn->state = CONN_H2;
-                        h2_conn_flush(conn->h2);
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
-                    } else {
-                        conn->state = CONN_READING;
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_ET, conn);
-                    }
-                } else if (hs == 1 || hs == -1) {
-                    /* Always watch both during handshake — TLS 1.3 needs it         */
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
-                } else {
-                    poller_del(w->poller, conn->fd);
-                    conn_remove(w, conn);
-                    if (conn->tls) tls_shutdown(conn->tls);
-                    net_close(conn->fd); conn_free(conn); continue;
-                }
-                continue;
-            }
-
-            /* sendfile body */
-            if (conn->state == CONN_SENDFILE) {
-                ssize_t n = sendfile(conn->fd, conn->sendfile_fd,
-                                     &conn->sendfile_off, conn->sendfile_rem);
-                if (n > 0) {
-                    conn->sendfile_rem -= (size_t)n;
-                    if (conn->sendfile_rem == 0) {
-                        io_uncork(conn->fd);
-                        close(conn->sendfile_fd);
-                        conn->sendfile_fd = -1;
-                        if (conn->keep_alive) {
-                            buf_consume(&conn->read_buf, conn->consumed);
-                            conn->consumed = 0;
+                /* ── Upstream writing ── */
+                if (conn->state == CONN_UPSTREAM_WRITING) {
+                    buf_t *rb = &conn->upstream_req_buf;
+                    if (rb->len > 0) {
+                        ssize_t n = write(conn->upstream_fd,
+                                          rb->data + conn->upstream_req_sent,
+                                          rb->len - conn->upstream_req_sent);
+                        if (n < 0 && errno != EAGAIN) {
+                            poller_del(w->poller, conn->upstream_fd);
+                            close(conn->upstream_fd);
+                            conn->upstream_fd = -1;
+                            buf_reset(&conn->write_buf);
+                            http_response_simple(&conn->write_buf, 502, "Bad Gateway",
+                                                "text/plain", "Bad Gateway\n");
                             conn_reset_write_state(conn);
-                            conn->state = CONN_READING;
-                            conn->keepalive_deadline = time(NULL) + 30;
-                            poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
-                        } else {
-                            conn->state = CONN_CLOSING;
+                            conn->state = CONN_WRITING;
                             goto handle_state;
                         }
-                    }
-                } else if (n < 0 && errno != EAGAIN) {
-                    conn->state = CONN_CLOSING;
-                    goto handle_state;
-                }
-                continue;
-            }
-
-            /* ── Write path ── */
-            int write_complete = 0;
-
-            /* Legacy write_buf (400/404 simple error responses) */
-            if (conn->write_buf.len > 0 && conn->hdr_buf.len == 0
-                    && conn->resp_body_ptr == NULL) {
-                ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
-                if (n < 0) { conn->state = CONN_CLOSING; goto handle_state; }
-                if (conn->write_buf.len == 0) write_complete = 1;
-
-            } else {
-                /* writev path (normal responses) */
-                http_response_t view;
-                memset(&view, 0, sizeof(view));
-                view.body_fd  = -1;
-                view.body     = (char *)conn->resp_body_ptr;
-                view.body_len = conn->resp_body_len;
-
-                ssize_t n = io_writev_response(conn->fd, conn->tls,
-                                               &view, &conn->hdr_buf,
-                                               &conn->writev_written);
-                if (n < 0) { conn->state = CONN_CLOSING; goto handle_state; }
-
-                /* hdr_buf is populated by io_writev_response on first call */
-                size_t total = conn->hdr_buf.len + conn->resp_body_len;
-                if (total > 0 && conn->writev_written >= total)
-                    write_complete = 1;
-                else if (total == 0)
-                    write_complete = 1;  /* empty response edge case */
-            }
-
-            if (write_complete) {
-                // WebSocket handshake write complete — transition to WS mode
-                if (conn->ws_state == WS_STATE_HANDSHAKING) {
-                    conn->ws_state = WS_STATE_OPEN;
-                    conn->state    = CONN_WEBSOCKET;
-                    buf_reset(&conn->write_buf);
-                    conn_reset_write_state(conn);
-
-                    buf_consume(&conn->read_buf, conn->consumed);
-                    conn->consumed = 0;
-
-                    if (ws_registry_add(&w->ws_registry, conn) < 0) {
-                        LOG_ERROR("ws: failed to add to registry fd=%d", conn->fd);
-                        conn->state = CONN_CLOSING;
-                        goto handle_state;
+                        if (n > 0) conn->upstream_req_sent += (size_t)n;
                     }
 
-                    // Call on_open callback
-                    //ws_handler_t *wsh = ws_handler_find(NULL);
-                    if (conn->ws_handler && conn->ws_handler->on_open)
-                        conn->ws_handler->on_open(conn, conn->ws_handler->ctx);
-
-                    poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
-                    if (conn->read_buf.len > 0) {
-                        if (handle_ws_read(w, conn) < 0) {
-                            conn->state = CONN_CLOSING;
-                            goto handle_state;
-                        }
-                        if (conn->write_buf.len > 0) {
-                            poller_mod(w->poller, conn->fd,
-                                       POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
-                        }
+                    if (conn->upstream_req_sent >= rb->len) {
+                        /* All sent — wait for response */
+                        conn->upstream_req_sent = 0;
+                        buf_reset(&conn->upstream_req_buf);
+                        conn->state = CONN_UPSTREAM_READING;
+                        poller_mod(w->poller, conn->upstream_fd,
+                                   POLLER_READ | POLLER_ET, conn);
                     }
                     continue;
                 }
-                if (conn->sendfile_fd >= 0) {
-                    conn->state = CONN_SENDFILE;
-                    poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
-                } else if (conn->keep_alive) {
-                    buf_consume(&conn->read_buf, conn->consumed);
-                    conn->consumed = 0;
-                    conn_reset_write_state(conn);
-                    buf_reset(&conn->write_buf);
-                    conn->state = CONN_READING;
-                    conn->keepalive_deadline = time(NULL) + 30;
-                    poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
-                } else {
-                    conn->state = CONN_CLOSING;
-                    goto handle_state;
+
+                /* TLS handshake */
+                if (conn->state == CONN_TLS_HANDSHAKE) {
+                    int hs = tls_handshake(conn->tls);
+                    if (hs == 0) {
+                        const char *proto = tls_negotiated_protocol(conn->tls);
+                        if (proto && strcmp(proto, "h2") == 0) {
+                            conn->h2 = h2_conn_new(conn, &w->h2_cfg);
+                            if (!conn->h2) {
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                            conn->state = CONN_H2;
+                            h2_conn_flush(conn->h2);
+                            poller_mod(w->poller, conn->fd,
+                                       POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                        } else {
+                            conn->state = CONN_READING;
+                            poller_mod(w->poller, conn->fd,
+                                       POLLER_READ | POLLER_ET, conn);
+                        }
+                    } else if (hs == 1 || hs == -1) {
+                        /* Always watch both during handshake — TLS 1.3 needs it         */
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    } else {
+                        poller_del(w->poller, conn->fd);
+                        conn_remove(w, conn);
+                        if (conn->tls) tls_shutdown(conn->tls);
+                        net_close(conn->fd); conn_free(conn); continue;
+                    }
+                    continue;
                 }
-            }
-        } /* POLLER_WRITE */
 
-        handle_state:
-            switch (conn->state) {
-            case CONN_H2:
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_ET, conn);
-                    break;
-            case CONN_WEBSOCKET:
-                    poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
-                    break;
-            case CONN_WRITING:
-                poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
-                break;
-            case CONN_SENDFILE:
-                poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
-                break;
-            case CONN_CLOSING:
-                poller_del(w->poller, conn->fd);
-                conn_remove(w, conn);
-                if (conn->tls) tls_shutdown(conn->tls);
-                shutdown(conn->fd, SHUT_WR);
-                net_close(conn->fd);
-                conn_reset_write_state(conn);
-                conn_free(conn);
-                break;
-            default:
-                break;
-            }
-    }
-}
+                /* sendfile body */
+                if (conn->state == CONN_SENDFILE) {
+                    ssize_t n = sendfile(conn->fd, conn->sendfile_fd,
+                                         &conn->sendfile_off, conn->sendfile_rem);
+                    if (n > 0) {
+                        conn->sendfile_rem -= (size_t)n;
+                        if (conn->sendfile_rem == 0) {
+                            io_uncork(conn->fd);
+                            close(conn->sendfile_fd);
+                            conn->sendfile_fd = -1;
+                            if (conn->keep_alive) {
+                                buf_consume(&conn->read_buf, conn->consumed);
+                                conn->consumed = 0;
+                                conn_reset_write_state(conn);
+                                conn->state = CONN_READING;
+                                conn->keepalive_deadline = time(NULL) + 30;
+                                poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
+                            } else {
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                        }
+                    } else if (n < 0 && errno != EAGAIN) {
+                        conn->state = CONN_CLOSING;
+                        goto handle_state;
+                    }
+                    continue;
+                }
 
-/* ── epoll worker thread ────────────────────────────────────────────────────*/
-static void *worker_run(void *arg) {
-    worker_t *w = (worker_t *)arg;
+                /* ── Write path ── */
+                int write_complete = 0;
 
-    w->server_fd = net_server_socket(w->port, 128);
-    if (w->server_fd < 0) { LOG_ERROR("Worker: server socket failed"); return NULL; }
+                /* Legacy write_buf (400/404 simple error responses) */
+                if (conn->write_buf.len > 0 && conn->hdr_buf.len == 0
+                        && conn->resp_body_ptr == NULL) {
+                    ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
+                    if (n < 0) { conn->state = CONN_CLOSING; goto handle_state; }
+                    if (conn->write_buf.len == 0) write_complete = 1;
 
-    w->active_conns = calloc((size_t)w->max_connections, sizeof(conn_t *));
-    if (!w->active_conns) { net_close(w->server_fd); return NULL; }
+                        } else {
+                            /* writev path (normal responses) */
+                            http_response_t view;
+                            memset(&view, 0, sizeof(view));
+                            view.body_fd  = -1;
+                            view.body     = (char *)conn->resp_body_ptr;
+                            view.body_len = conn->resp_body_len;
 
-    w->poller = poller_new();
-    if (!w->poller) { net_close(w->server_fd); free(w->active_conns); return NULL; }
+                            ssize_t n = io_writev_response(conn->fd, conn->tls,
+                                                           &view, &conn->hdr_buf,
+                                                           &conn->writev_written);
+                            if (n < 0) { conn->state = CONN_CLOSING; goto handle_state; }
 
-    if (poller_add(w->poller, w->server_fd, POLLER_READ, NULL) < 0) {
-        net_close(w->server_fd); poller_free(w->poller); free(w->active_conns); return NULL;
-    }
-    // WebSocket setup
-    ws_registry_init(&w->ws_registry);
-    ws_msg_queue_init(&w->ws_broadcast_queue);
-    w->ws_notify_fd = ws_notify_fd_create();
-    if (w->ws_notify_fd >= 0) {
-        poller_add(w->poller, w->ws_notify_fd, POLLER_READ,
-                   (void *)(uintptr_t)w->ws_notify_fd);
-    }
+                            /* hdr_buf is populated by io_writev_response on first call */
+                            size_t total = conn->hdr_buf.len + conn->resp_body_len;
+                            if (total > 0 && conn->writev_written >= total)
+                                write_complete = 1;
+                            else if (total == 0)
+                                write_complete = 1;  /* empty response edge case */
+                        }
 
-    // Ping sweep — monotonic tick
-    uint64_t last_ping_sweep_ms = 0;
+                if (write_complete) {
+                    // WebSocket handshake write complete — transition to WS mode
+                    if (conn->ws_state == WS_STATE_HANDSHAKING) {
+                        conn->ws_state = WS_STATE_OPEN;
+                        conn->state    = CONN_WEBSOCKET;
+                        buf_reset(&conn->write_buf);
+                        conn_reset_write_state(conn);
 
-    while (!w->should_stop) {
-        handle_events_worker(w);
+                        buf_consume(&conn->read_buf, conn->consumed);
+                        conn->consumed = 0;
 
-        // Periodic ping sweep (~1 s resolution)
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t now_ms = (uint64_t)ts.tv_sec * 1000
-                        + (uint64_t)ts.tv_nsec / 1000000;
-        if (now_ms - last_ping_sweep_ms >= 1000) {
-            ws_config_t default_cfg;
-            ws_config_init(&default_cfg);
-            ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
-            last_ping_sweep_ms = now_ms;
+                        if (ws_registry_add(&w->ws_registry, conn) < 0) {
+                            LOG_ERROR("ws: failed to add to registry fd=%d", conn->fd);
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        }
+
+                        // Call on_open callback
+                        //ws_handler_t *wsh = ws_handler_find(NULL);
+                        if (conn->ws_handler && conn->ws_handler->on_open)
+                            conn->ws_handler->on_open(conn, conn->ws_handler->ctx);
+
+                        poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
+                        if (conn->read_buf.len > 0) {
+                            if (handle_ws_read(w, conn) < 0) {
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                            if (conn->write_buf.len > 0) {
+                                poller_mod(w->poller, conn->fd,
+                                           POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                            }
+                        }
+                        continue;
+                    }
+                    if (conn->sendfile_fd >= 0) {
+                        conn->state = CONN_SENDFILE;
+                        poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
+                    } else if (conn->keep_alive) {
+                        buf_consume(&conn->read_buf, conn->consumed);
+                        conn->consumed = 0;
+                        conn_reset_write_state(conn);
+                        buf_reset(&conn->write_buf);
+                        conn->state = CONN_READING;
+                        conn->keepalive_deadline = time(NULL) + 30;
+                        poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
+                    } else {
+                        conn->state = CONN_CLOSING;
+                        goto handle_state;
+                    }
+                }
+            } /* POLLER_WRITE */
+
+            handle_state:
+                switch (conn->state) {
+                case CONN_H2:
+                        poller_mod(w->poller, conn->fd,
+                                   POLLER_READ | POLLER_ET, conn);
+                        break;
+                case CONN_WEBSOCKET:
+                        poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
+                        break;
+                case CONN_WRITING:
+                        poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
+                        break;
+                case CONN_SENDFILE:
+                        poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
+                        break;
+                case CONN_CLOSING:
+                        poller_del(w->poller, conn->fd);
+                        conn_remove(w, conn);
+                        if (conn->tls) tls_shutdown(conn->tls);
+                        shutdown(conn->fd, SHUT_WR);
+                        net_close(conn->fd);
+                        conn_reset_write_state(conn);
+                        conn_free(conn);
+                        break;
+                default:
+                        break;
+                }
         }
     }
 
-    //while (!w->should_stop) handle_events_worker(w); WILL BE DELETED
+    /* ── epoll worker thread ────────────────────────────────────────────────────*/
+    static void *worker_run(void *arg) {
+        worker_t *w = (worker_t *)arg;
 
-    for (int i = 0; i < w->active_conn_count; i++) {
-        conn_t *c = w->active_conns[i];
-        poller_del(w->poller, c->fd);
-        if (c->sendfile_fd >= 0) close(c->sendfile_fd);
-        if (c->tls) tls_shutdown(c->tls);
-        conn_reset_write_state(c);
-        net_close(c->fd);
-        conn_free(c);
+        w->server_fd = net_server_socket(w->port, 128);
+        if (w->server_fd < 0) { LOG_ERROR("Worker: server socket failed"); return NULL; }
+
+        w->active_conns = calloc((size_t)w->max_connections, sizeof(conn_t *));
+        if (!w->active_conns) { net_close(w->server_fd); return NULL; }
+
+        w->poller = poller_new();
+        if (!w->poller) { net_close(w->server_fd); free(w->active_conns); return NULL; }
+
+        if (poller_add(w->poller, w->server_fd, POLLER_READ, NULL) < 0) {
+            net_close(w->server_fd); poller_free(w->poller); free(w->active_conns); return NULL;
+        }
+        // WebSocket setup
+        ws_registry_init(&w->ws_registry);
+        ws_msg_queue_init(&w->ws_broadcast_queue);
+        w->ws_notify_fd = ws_notify_fd_create();
+        if (w->ws_notify_fd >= 0) {
+            poller_add(w->poller, w->ws_notify_fd, POLLER_READ,
+                       (void *)(uintptr_t)w->ws_notify_fd);
+        }
+
+        // Ping sweep — monotonic tick
+        uint64_t last_ping_sweep_ms = 0;
+
+        while (!w->should_stop) {
+            handle_events_worker(w);
+
+            // Periodic ping sweep (~1 s resolution)
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_ms = (uint64_t)ts.tv_sec * 1000
+                            + (uint64_t)ts.tv_nsec / 1000000;
+            if (now_ms - last_ping_sweep_ms >= 1000) {
+                ws_config_t default_cfg;
+                ws_config_init(&default_cfg);
+                ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
+                last_ping_sweep_ms = now_ms;
+            }
+        }
+
+        //while (!w->should_stop) handle_events_worker(w); WILL BE DELETED
+
+        for (int i = 0; i < w->active_conn_count; i++) {
+            conn_t *c = w->active_conns[i];
+            poller_del(w->poller, c->fd);
+            if (c->sendfile_fd >= 0) close(c->sendfile_fd);
+            if (c->tls) tls_shutdown(c->tls);
+            conn_reset_write_state(c);
+            net_close(c->fd);
+            conn_free(c);
+        }
+        net_close(w->server_fd);
+        poller_free(w->poller);
+        free(w->active_conns);
+        return NULL;
     }
-    net_close(w->server_fd);
-    poller_free(w->poller);
-    free(w->active_conns);
-    return NULL;
-}
 
-/* ── io_uring worker ────────────────────────────────────────────────────────*/
+    /* ── io_uring worker ────────────────────────────────────────────────────────*/
 #if defined(__linux__) && defined(ROUTA_IO_URING)
 
-static void conn_close_uring(worker_t *w, conn_t *conn) {
-    if (conn->closing) return;
-    conn->closing = 1;
-    if (conn->tls) tls_shutdown(conn->tls);
-    if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
-    if (conn->fd >= 0) { shutdown(conn->fd, SHUT_WR); close(conn->fd); conn->fd = -1; }
-    if (conn->pending_io <= 0) { conn_remove(w, conn); conn_free(conn); }
-}
-
-static void handle_request_parsing(worker_t *w, conn_t *conn) {
-    http_request_t req;
-    size_t consumed = 0;
-    int pr = http_request_parse(&req, &conn->read_buf, &consumed);
-
-    if (pr == 1) {
-        if (!conn->recv_pending) {
-            conn->recv_pending = 1;
-            if (uring_submit_recv(w->uring, conn, conn->fd,
-                                  conn->recv_buf, RECV_BUF_SZ) < 0)
-                conn_close_uring(w, conn);
-        }
-        return;
+    static void conn_close_uring(worker_t *w, conn_t *conn) {
+        if (conn->closing) return;
+        conn->closing = 1;
+        if (conn->tls) tls_shutdown(conn->tls);
+        if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
+        if (conn->fd >= 0) { shutdown(conn->fd, SHUT_WR); close(conn->fd); conn->fd = -1; }
+        if (conn->pending_io <= 0) { conn_remove(w, conn); conn_free(conn); }
     }
-    if (pr == -1) {
-        buf_reset(&conn->write_buf);
-        http_response_simple(&conn->write_buf, 400, "Bad Request",
-                             "text/plain", "Bad Request\n");
-        conn->keep_alive   = 0;
+
+    static void handle_request_parsing(worker_t *w, conn_t *conn) {
+        http_request_t req;
+        size_t consumed = 0;
+        int pr = http_request_parse(&req, &conn->read_buf, &consumed);
+
+        if (pr == 1) {
+            if (!conn->recv_pending) {
+                conn->recv_pending = 1;
+                if (uring_submit_recv(w->uring, conn, conn->fd,
+                                      conn->recv_buf, RECV_BUF_SZ) < 0)
+                    conn_close_uring(w, conn);
+            }
+            return;
+        }
+        if (pr == -1) {
+            buf_reset(&conn->write_buf);
+            http_response_simple(&conn->write_buf, 400, "Bad Request",
+                                 "text/plain", "Bad Request\n");
+            conn->keep_alive   = 0;
+            conn->send_buf_len = conn->write_buf.len;
+            memcpy(conn->send_buf, conn->write_buf.data, conn->send_buf_len);
+            if (uring_submit_send(w->uring, conn, conn->fd,
+                                  conn->send_buf, conn->send_buf_len) < 0)
+                conn_close_uring(w, conn);
+            return;
+        }
+
+        conn->consumed   = consumed;
+        conn->keep_alive = req.keep_alive;
+
+        http_response_t resp;
+        http_response_init(&resp);
+        int allowed = 0;
+        route_t *route = router_match(w->router, &req, &allowed);
+
+        if (!route && allowed == 0) {
+            http_response_simple(&conn->write_buf, 404, "Not Found", "text/plain", "Not Found\n");
+        } else if (!route) {
+            http_response_set_status(&resp, 405, "Method Not Allowed");
+            http_response_set_body(&resp, "Method Not Allowed\n", 20);
+            buf_reset(&conn->write_buf);
+            http_response_serialize(&resp, &conn->write_buf);
+        } else {
+            if (w->chain) {
+                w->chain->current = 0;
+                middleware_chain_set_handler(w->chain, route->handler, route->ctx);
+                middleware_chain_execute(w->chain, &req, &resp);
+            } else {
+                route->handler(&req, &resp, route->ctx);
+            }
+            http_response_set_header(&resp, "Connection",
+                                     conn->keep_alive ? "keep-alive" : "close");
+            buf_reset(&conn->write_buf);
+            http_response_serialize(&resp, &conn->write_buf);
+            if (resp.body_fd >= 0 && !conn->tls) {
+                conn->sendfile_fd  = resp.body_fd;
+                conn->sendfile_off = resp.body_fd_off;
+                conn->sendfile_rem = resp.body_fd_len;
+                resp.body_fd = -1;
+            }
+        }
+
+        http_response_destroy(&resp);
+        http_request_free(&req);
+
         conn->send_buf_len = conn->write_buf.len;
+        if (conn->send_buf_len > SEND_BUF_SZ) conn->send_buf_len = SEND_BUF_SZ;
         memcpy(conn->send_buf, conn->write_buf.data, conn->send_buf_len);
         if (uring_submit_send(w->uring, conn, conn->fd,
                               conn->send_buf, conn->send_buf_len) < 0)
             conn_close_uring(w, conn);
-        return;
     }
 
-    conn->consumed   = consumed;
-    conn->keep_alive = req.keep_alive;
+    static void uring_cqe_handler(uring_udata_t *ud, int res,
+                                   uint32_t flags, void *arg) {
+        worker_t *w = (worker_t *)arg;
 
-    http_response_t resp;
-    http_response_init(&resp);
-    int allowed = 0;
-    route_t *route = router_match(w->router, &req, &allowed);
-
-    if (!route && allowed == 0) {
-        http_response_simple(&conn->write_buf, 404, "Not Found", "text/plain", "Not Found\n");
-    } else if (!route) {
-        http_response_set_status(&resp, 405, "Method Not Allowed");
-        http_response_set_body(&resp, "Method Not Allowed\n", 20);
-        buf_reset(&conn->write_buf);
-        http_response_serialize(&resp, &conn->write_buf);
-    } else {
-        if (w->chain) {
-            w->chain->current = 0;
-            middleware_chain_set_handler(w->chain, route->handler, route->ctx);
-            middleware_chain_execute(w->chain, &req, &resp);
-        } else {
-            route->handler(&req, &resp, route->ctx);
+        if (ud->op == URING_OP_ACCEPT) {
+            if (!(flags & IORING_CQE_F_MORE)) uring_submit_accept(w->uring);
+            if (res < 0) return;
+            conn_t *c = conn_new(res, "unknown", 0);
+            if (!c) { close(res); return; }
+            c->active = 1;
+            w->active_conns[w->active_conn_count++] = c;
+            c->recv_pending = 1;
+            if (uring_submit_recv(w->uring, c, res, c->recv_buf, RECV_BUF_SZ) < 0)
+                conn_close_uring(w, c);
+            return;
         }
-        http_response_set_header(&resp, "Connection",
-                                 conn->keep_alive ? "keep-alive" : "close");
-        buf_reset(&conn->write_buf);
-        http_response_serialize(&resp, &conn->write_buf);
-        if (resp.body_fd >= 0 && !conn->tls) {
-            conn->sendfile_fd  = resp.body_fd;
-            conn->sendfile_off = resp.body_fd_off;
-            conn->sendfile_rem = resp.body_fd_len;
-            resp.body_fd = -1;
+
+        conn_t *conn = (conn_t *)ud->conn;
+        if (!conn || conn->id != ud->conn_id || !conn->active) {
+            uring_udata_put(w->uring, ud); return;
         }
-    }
+        conn->pending_io--;
 
-    http_response_destroy(&resp);
-    http_request_free(&req);
-
-    conn->send_buf_len = conn->write_buf.len;
-    if (conn->send_buf_len > SEND_BUF_SZ) conn->send_buf_len = SEND_BUF_SZ;
-    memcpy(conn->send_buf, conn->write_buf.data, conn->send_buf_len);
-    if (uring_submit_send(w->uring, conn, conn->fd,
-                          conn->send_buf, conn->send_buf_len) < 0)
-        conn_close_uring(w, conn);
-}
-
-static void uring_cqe_handler(uring_udata_t *ud, int res,
-                               uint32_t flags, void *arg) {
-    worker_t *w = (worker_t *)arg;
-
-    if (ud->op == URING_OP_ACCEPT) {
-        if (!(flags & IORING_CQE_F_MORE)) uring_submit_accept(w->uring);
-        if (res < 0) return;
-        conn_t *c = conn_new(res, "unknown", 0);
-        if (!c) { close(res); return; }
-        c->active = 1;
-        w->active_conns[w->active_conn_count++] = c;
-        c->recv_pending = 1;
-        if (uring_submit_recv(w->uring, c, res, c->recv_buf, RECV_BUF_SZ) < 0)
-            conn_close_uring(w, c);
-        return;
-    }
-
-    conn_t *conn = (conn_t *)ud->conn;
-    if (!conn || conn->id != ud->conn_id || !conn->active) {
-        uring_udata_put(w->uring, ud); return;
-    }
-    conn->pending_io--;
-
-    if (res == -EAGAIN || res == -EINTR) {
-        if (ud->op == URING_OP_RECV) {
-            conn->recv_pending = 1;
-            uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
-        }
-        uring_udata_put(w->uring, ud); return;
-    }
-    if (conn->closing) {
-        if (conn->pending_io <= 0) { conn_remove(w, conn); conn_free(conn); }
-        uring_udata_put(w->uring, ud); return;
-    }
-
-    switch (ud->op) {
-    case URING_OP_RECV:
-        if (res <= 0) { conn_close_uring(w, conn); break; }
-        buf_append(&conn->read_buf, conn->recv_buf, (size_t)res);
-        handle_request_parsing(w, conn);
-        break;
-    case URING_OP_SEND:
-        if (res < 0) { conn_close_uring(w, conn); break; }
-        if ((size_t)res < conn->send_buf_len) {
-            conn->send_buf_len -= (size_t)res;
-            memmove(conn->send_buf, conn->send_buf + res, conn->send_buf_len);
-            uring_submit_send(w->uring, conn, conn->fd,
-                              conn->send_buf, conn->send_buf_len);
-            break;
-        }
-        conn->send_buf_len = 0;
-        buf_reset(&conn->write_buf);
-        if (conn->consumed > 0) { buf_consume(&conn->read_buf, conn->consumed); conn->consumed = 0; }
-        if (conn->keep_alive) {
-            if (conn->read_buf.len > 0) handle_request_parsing(w, conn);
-            else {
+        if (res == -EAGAIN || res == -EINTR) {
+            if (ud->op == URING_OP_RECV) {
                 conn->recv_pending = 1;
                 uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
             }
-        } else conn_close_uring(w, conn);
-        break;
-    case URING_OP_SPLICE:
-        if (res < 0) { conn_close_uring(w, conn); break; }
-        if (ud->splice_phase == 0) { if (ud->fd >= 0) { close(ud->fd); ud->fd = -1; } break; }
-        conn->sendfile_rem -= (size_t)res;
-        if (conn->sendfile_rem > 0)
-            uring_submit_splice(w->uring, conn, conn->sendfile_fd,
-                                conn->fd, conn->sendfile_rem);
-        else {
-            close(conn->sendfile_fd); conn->sendfile_fd = -1;
-            if (conn->keep_alive) {
-                conn->recv_pending = 1;
-                uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
-            } else conn_close_uring(w, conn);
+            uring_udata_put(w->uring, ud); return;
         }
-        break;
+        if (conn->closing) {
+            if (conn->pending_io <= 0) { conn_remove(w, conn); conn_free(conn); }
+            uring_udata_put(w->uring, ud); return;
+        }
+
+        switch (ud->op) {
+            case URING_OP_RECV:
+                if (res <= 0) { conn_close_uring(w, conn); break; }
+                buf_append(&conn->read_buf, conn->recv_buf, (size_t)res);
+                handle_request_parsing(w, conn);
+                break;
+            case URING_OP_SEND:
+                if (res < 0) { conn_close_uring(w, conn); break; }
+                if ((size_t)res < conn->send_buf_len) {
+                    conn->send_buf_len -= (size_t)res;
+                    memmove(conn->send_buf, conn->send_buf + res, conn->send_buf_len);
+                    uring_submit_send(w->uring, conn, conn->fd,
+                                      conn->send_buf, conn->send_buf_len);
+                    break;
+                }
+                conn->send_buf_len = 0;
+                buf_reset(&conn->write_buf);
+                if (conn->consumed > 0) { buf_consume(&conn->read_buf, conn->consumed); conn->consumed = 0; }
+                if (conn->keep_alive) {
+                    if (conn->read_buf.len > 0) handle_request_parsing(w, conn);
+                    else {
+                        conn->recv_pending = 1;
+                        uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
+                    }
+                } else conn_close_uring(w, conn);
+                break;
+            case URING_OP_SPLICE:
+                if (res < 0) { conn_close_uring(w, conn); break; }
+                if (ud->splice_phase == 0) { if (ud->fd >= 0) { close(ud->fd); ud->fd = -1; } break; }
+                conn->sendfile_rem -= (size_t)res;
+                if (conn->sendfile_rem > 0)
+                    uring_submit_splice(w->uring, conn, conn->sendfile_fd,
+                                        conn->fd, conn->sendfile_rem);
+                else {
+                    close(conn->sendfile_fd); conn->sendfile_fd = -1;
+                    if (conn->keep_alive) {
+                        conn->recv_pending = 1;
+                        uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
+                    } else conn_close_uring(w, conn);
+                }
+                break;
+        }
+        uring_udata_put(w->uring, ud);
     }
-    uring_udata_put(w->uring, ud);
-}
 
-static void *worker_run_uring(void *arg) {
-    worker_t *w = (worker_t *)arg;
-    w->server_fd = net_server_socket(w->port, 128);
-    if (w->server_fd < 0) return NULL;
+    static void *worker_run_uring(void *arg) {
+        worker_t *w = (worker_t *)arg;
+        w->server_fd = net_server_socket(w->port, 128);
+        if (w->server_fd < 0) return NULL;
 
-    w->active_conns = calloc((size_t)w->max_connections, sizeof(conn_t *));
-    if (!w->active_conns) { net_close(w->server_fd); return NULL; }
+        w->active_conns = calloc((size_t)w->max_connections, sizeof(conn_t *));
+        if (!w->active_conns) { net_close(w->server_fd); return NULL; }
 
-    w->uring = uring_new(w->server_fd, URING_QUEUE_DEPTH, URING_POOL_SZ);
-    if (!w->uring) { free(w->active_conns); net_close(w->server_fd); return NULL; }
+        w->uring = uring_new(w->server_fd, URING_QUEUE_DEPTH, URING_POOL_SZ);
+        if (!w->uring) { free(w->active_conns); net_close(w->server_fd); return NULL; }
 
-    while (!w->should_stop) {
-        int n = uring_wait(w->uring, uring_cqe_handler, w);
-        if (n < 0 && !w->should_stop) LOG_ERROR("uring_wait failed");
+        while (!w->should_stop) {
+            int n = uring_wait(w->uring, uring_cqe_handler, w);
+            if (n < 0 && !w->should_stop) LOG_ERROR("uring_wait failed");
+        }
+
+        for (int i = 0; i < w->active_conn_count; i++) {
+            conn_t *c = w->active_conns[i];
+            if (c->tls) tls_shutdown(c->tls);
+            if (c->sendfile_fd >= 0) close(c->sendfile_fd);
+            net_close(c->fd);
+            conn_free(c);
+        }
+        uring_free(w->uring);
+        free(w->active_conns);
+        net_close(w->server_fd);
+        return NULL;
     }
-
-    for (int i = 0; i < w->active_conn_count; i++) {
-        conn_t *c = w->active_conns[i];
-        if (c->tls) tls_shutdown(c->tls);
-        if (c->sendfile_fd >= 0) close(c->sendfile_fd);
-        net_close(c->fd);
-        conn_free(c);
-    }
-    uring_free(w->uring);
-    free(w->active_conns);
-    net_close(w->server_fd);
-    return NULL;
-}
 
 #endif /* ROUTA_IO_URING */
 
-/* ── Public API ─────────────────────────────────────────────────────────────*/
+    /* ── Public API ─────────────────────────────────────────────────────────────*/
 
-void event_loop_run(event_loop_t *loop) {
-    if (!loop) return;
-    LOG_INFO("\nEvent loop started\n");
-    for (int i = 0; i < loop->n_workers; i++) {
-        worker_t *w    = &loop->workers[i];
-        w->port        = loop->port;
-        w->max_connections = loop->max_connections;
-        w->tls_ctx     = loop->tls_ctx;
-        w->router      = g_router;
-        w->chain       = g_chain;
-        w->lb          = loop->lb;
-        w->should_stop = 0;
-        w->h2_cfg = loop->h2_cfg;
+    void event_loop_run(event_loop_t *loop) {
+        if (!loop) return;
+        LOG_INFO("\nEvent loop started\n");
+        for (int i = 0; i < loop->n_workers; i++) {
+            worker_t *w    = &loop->workers[i];
+            w->port        = loop->port;
+            w->max_connections = loop->max_connections;
+            w->tls_ctx     = loop->tls_ctx;
+            w->router      = g_router;
+            w->chain       = g_chain;
+            w->lb          = loop->lb;
+            w->should_stop = 0;
+            w->h2_cfg = loop->h2_cfg;
 #if defined(__linux__) && defined(ROUTA_IO_URING)
-        pthread_create(&w->thread, NULL, worker_run_uring, w);
+            pthread_create(&w->thread, NULL, worker_run_uring, w);
 #else
-        pthread_create(&w->thread, NULL, worker_run, w);
+            pthread_create(&w->thread, NULL, worker_run, w);
 #endif
+        }
+        for (int i = 0; i < loop->n_workers; i++)
+            pthread_join(loop->workers[i].thread, NULL);
+        LOG_INFO("Event loop stopped");
     }
-    for (int i = 0; i < loop->n_workers; i++)
-        pthread_join(loop->workers[i].thread, NULL);
-    LOG_INFO("Event loop stopped");
-}
 
-event_loop_t *event_loop_new(int port, int n_threads) {
-    event_loop_t *loop = calloc(1, sizeof(event_loop_t));
-    if (!loop) { LOG_ERROR("Failed to allocate event loop"); return NULL; }
-    loop->port            = port;
-    loop->n_workers       = n_threads;
-    loop->max_connections = 10000;
-    loop->workers         = calloc((size_t)n_threads, sizeof(worker_t));
-    if (!loop->workers)   { free(loop); return NULL; }
-    for (int i = 0; i < n_threads; i++)
-        loop->workers[i].ws_notify_fd = -1;
-    return loop;
-}
-
-void event_loop_add_route(event_loop_t *loop, const char *path,
-                          int methods, route_handler_t handler, void *ctx) {
-    (void)loop;
-    if (!g_router) {
-        g_router = router_new();
-        if (!g_router) { LOG_ERROR("Failed to create router"); return; }
+    event_loop_t *event_loop_new(int port, int n_threads) {
+        event_loop_t *loop = calloc(1, sizeof(event_loop_t));
+        if (!loop) { LOG_ERROR("Failed to allocate event loop"); return NULL; }
+        loop->port            = port;
+        loop->n_workers       = n_threads;
+        loop->max_connections = 10000;
+        loop->workers         = calloc((size_t)n_threads, sizeof(worker_t));
+        if (!loop->workers)   { free(loop); return NULL; }
+        for (int i = 0; i < n_threads; i++)
+            loop->workers[i].ws_notify_fd = -1;
+        return loop;
     }
-    router_add(g_router, path, methods, handler, ctx);
-}
 
-void event_loop_set_tls(event_loop_t *loop,
-                        const char *cert_file, const char *key_file) {
-    if (!loop || !cert_file || !key_file) return;
-    loop->tls_ctx = tls_context_new(cert_file, key_file);
-}
-
-void event_loop_set_lb(event_loop_t *loop, lb_t *lb) {
-    if (loop) loop->lb = lb;
-}
-
-void event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain) {
-    (void)loop; g_chain = chain;
-}
-
-void event_loop_set_max_connections(event_loop_t *loop, int max_connections) {
-    if (loop) loop->max_connections = max_connections;
-}
-
-void event_loop_free(event_loop_t *loop) {
-    if (!loop) return;
-    if (g_router)     { router_free(g_router); g_router = NULL; }
-    g_chain = NULL;
-    if (loop->tls_ctx){ tls_context_free(loop->tls_ctx); loop->tls_ctx = NULL; }
-    if (g_ws_handlers) {
-        free(g_ws_handlers);
-        g_ws_handlers      = NULL;
-        g_ws_handler_count = 0;
+    void event_loop_add_route(event_loop_t *loop, const char *path,
+                              int methods, route_handler_t handler, void *ctx) {
+        (void)loop;
+        if (!g_router) {
+            g_router = router_new();
+            if (!g_router) { LOG_ERROR("Failed to create router"); return; }
+        }
+        router_add(g_router, path, methods, handler, ctx);
     }
-    free(loop->workers);
-    free(loop);
-}
 
-void event_loop_stop(event_loop_t *loop) {
-    if (!loop) return;
-    loop->should_stop = 1;
-    for (int i = 0; i < loop->n_workers; i++)
-        loop->workers[i].should_stop = 1;
-}
+    void event_loop_set_tls(event_loop_t *loop,
+                            const char *cert_file, const char *key_file) {
+        if (!loop || !cert_file || !key_file) return;
+        loop->tls_ctx = tls_context_new(cert_file, key_file);
+    }
+
+    void event_loop_set_lb(event_loop_t *loop, lb_t *lb) {
+        if (loop) loop->lb = lb;
+    }
+
+    void event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain) {
+        (void)loop; g_chain = chain;
+    }
+
+    void event_loop_set_max_connections(event_loop_t *loop, int max_connections) {
+        if (loop) loop->max_connections = max_connections;
+    }
+
+    void event_loop_free(event_loop_t *loop) {
+        if (!loop) return;
+        if (g_router)     { router_free(g_router); g_router = NULL; }
+        g_chain = NULL;
+        if (loop->tls_ctx){ tls_context_free(loop->tls_ctx); loop->tls_ctx = NULL; }
+        if (g_ws_handlers) {
+            free(g_ws_handlers);
+            g_ws_handlers      = NULL;
+            g_ws_handler_count = 0;
+        }
+        free(loop->workers);
+        free(loop);
+    }
+
+    void event_loop_stop(event_loop_t *loop) {
+        if (!loop) return;
+        loop->should_stop = 1;
+        for (int i = 0; i < loop->n_workers; i++)
+            loop->workers[i].should_stop = 1;
+    }
