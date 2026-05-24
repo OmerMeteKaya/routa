@@ -18,12 +18,16 @@
 #include "http/request.h"
 #include "http/response.h"
 
+#define TEST_PORT_UPGRADE     18081
+#define TEST_PORT_UPGRADE_STR "18081"
 #define TEST_PORT      18443
 #define TEST_PORT_H2C  18080
 #define TEST_PORT_STR  "18443"
 #define TEST_PORT_H2C_STR "18080"
 #define TEST_CERT      "tests/certs/test.crt"
 #define TEST_KEY       "tests/certs/test.key"
+
+
 static int h2c_open(void);
 
 /* ── Test harness ────────────────────────────────────────────────────────── */
@@ -239,6 +243,18 @@ static void register_routes(event_loop_t *loop) {
     event_loop_add_route(loop, "/large",  1 << HTTP_GET,  handle_large, NULL);
 }
 
+static void run_server_upgrade(void) {
+    event_loop_t *loop = event_loop_new(TEST_PORT_UPGRADE, 1);
+    if (!loop) exit(1);
+    routa_config_t cfg;
+    routa_config_init(&cfg);
+    event_loop_set_h2_config(loop, &cfg.h2);
+    register_routes(loop);
+    event_loop_run(loop);
+    event_loop_free(loop);
+    exit(0);
+}
+
 /* TLS server (ALPN h2) */
 static void run_server_tls(void) {
     event_loop_t *loop = event_loop_new(TEST_PORT, 1);
@@ -299,7 +315,7 @@ static int wait_for_server(int port, int timeout_ms) {
         int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
         close(fd);
         if (rc == 0) return 0;
-        usleep(50000);
+        //usleep(50000);
         waited += 50;
     }
     return -1;
@@ -667,7 +683,7 @@ static void test_goaway(void) {
     /* Server should close — read should return 0 or error shortly        */
     uint8_t tmp[64];
     /* Give server a moment */
-    usleep(100000);
+    //usleep(100000);
     ssize_t n = recv_some(fd, tmp, sizeof(tmp));
     close(fd);
 
@@ -852,7 +868,7 @@ static void test_invalid_settings_length(void) {
     size_t off = frame_hdr(buf, 0, 7, FT_SETTINGS, 0, 0);
     memset(buf + off, 0, 7);
     send_all(fd, buf, off + 7);
-    usleep(100000);
+    //usleep(100000);
 
     /* Read until GOAWAY or timeout — may arrive in multiple segments     */
     uint8_t resp[512];
@@ -882,7 +898,7 @@ static void test_zero_window_update(void) {
     size_t off = frame_hdr(buf, 0, 4, FT_WINDOW_UPDATE, 0, 0);
     off = put_u32(buf, off, 0);
     send_all(fd, buf, off);
-    usleep(100000);
+    //usleep(100000);
 
     uint8_t resp[512];
     size_t  total = 0;
@@ -912,7 +928,7 @@ static void test_client_push_promise(void) {
     off = put_u32(buf, off, 2);
     memcpy(buf + off, "\x82\x87\x84", 3);
     send_all(fd, buf, off + 3);
-    usleep(100000);
+    //usleep(100000);
     uint8_t resp[512];
     size_t  total = 0;
     for (int i = 0; i < 5; i++) {
@@ -957,6 +973,80 @@ static void test_rapid_streams(void) {
         FAIL("rapid streams", "got %d/20 responses", atoi(out));
 }
 
+/* ── h2c Upgrade (HTTP/1.1 → h2c) ──────────────────────────────────────── */
+static void test_h2c_upgrade(void) {
+    int fd = tcp_connect(TEST_PORT_UPGRADE);
+    if (fd < 0) { FAIL("h2c upgrade", "connect failed"); return; }
+
+    const char *req =
+        "GET /hello HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: Upgrade, HTTP2-Settings\r\n"
+        "Upgrade: h2c\r\n"
+        "HTTP2-Settings: AAMAAABkAAQAAQAAAAIAAAAA\r\n"
+        "\r\n";
+    if (send_all(fd, (const uint8_t *)req, strlen(req)) < 0) {
+        FAIL("h2c upgrade", "send failed"); close(fd); return;
+    }
+
+    /* Read until we find end of 101 headers (\r\n\r\n) */
+    uint8_t resp[4096];
+    size_t  total = 0;
+    int     got_101 = 0;
+    for (int i = 0; i < 16; i++) {
+        ssize_t n = recv_some(fd, resp + total, sizeof(resp) - total - 1);
+        if (n <= 0) break;
+        total += (size_t)n;
+        resp[total] = '\0';
+        if (strstr((char *)resp, "101")) { got_101 = 1; }
+        if (strstr((char *)resp, "\r\n\r\n") && got_101) break;
+    }
+
+    if (!got_101) {
+        FAIL("h2c upgrade", "expected 101, got: %.64s", (char *)resp);
+        close(fd); return;
+    }
+
+    /* Find end of HTTP headers in response buffer */
+    char *hdr_end = strstr((char *)resp, "\r\n\r\n");
+    size_t h2_start = 0;
+    if (hdr_end) {
+        h2_start = (size_t)(hdr_end - (char *)resp) + 4;
+    }
+
+    /* Send H2 client preface */
+    uint8_t preface_buf[64];
+    size_t  off = 0;
+    memcpy(preface_buf, H2_PREFACE, H2_PREFACE_LEN);
+    off += H2_PREFACE_LEN;
+    off = frame_hdr(preface_buf, off, 0, FT_SETTINGS, 0, 0);
+    send_all(fd, preface_buf, off);
+
+    /* Read H2 frames — server should send SETTINGS + response            */
+    uint8_t rbuf[4096];
+    size_t  rtotal = 0;
+
+    /* First check if 101 response already had H2 frames appended         */
+    if (h2_start < total) {
+        size_t leftover = total - h2_start;
+        memcpy(rbuf, resp + h2_start, leftover);
+        rtotal = leftover;
+    }
+
+    /* Read more if needed */
+    for (int i = 0; i < 8 && rtotal < 9; i++) {
+        ssize_t n = recv_some(fd, rbuf + rtotal, sizeof(rbuf) - rtotal);
+        if (n <= 0) break;
+        rtotal += (size_t)n;
+    }
+    close(fd);
+
+    if (rtotal >= 9)
+        OK("h2c upgrade — 101 received, H2 frames exchanged");
+    else
+        FAIL("h2c upgrade", "no H2 frames after upgrade (got %zu bytes)", rtotal);
+}
+
 /* ── SETTINGS flood protection ───────────────────────────────────────────── */
 static void test_settings_flood(void) {
     int fd = h2c_open();
@@ -967,7 +1057,7 @@ static void test_settings_flood(void) {
         frame_hdr(buf, 0, 0, FT_SETTINGS, 0, 0);
         if (send_all(fd, buf, 9) < 0) break;
     }
-    usleep(300000);
+    //usleep(300000);
 
     uint8_t resp[4096];
     size_t total = 0;
@@ -1012,7 +1102,7 @@ static void test_continuation_flood(void) {
         }
     }
 
-    usleep(200000);
+    //usleep(200000);
     uint8_t resp[512];
     size_t total = 0;
     for (int i = 0; i < 5; i++) {
@@ -1044,7 +1134,7 @@ static void test_max_frame_size_enforcement(void) {
                            FL_END_HEADERS | FL_END_STREAM, 1);
     memcpy(frame + off, big, sizeof(big));
     send_all(fd, frame, off + sizeof(big));
-    usleep(200000);
+   // usleep(200000);
 
     uint8_t resp[512];
     size_t total = 0;
@@ -1117,9 +1207,18 @@ int main(void) {
         kill(pid_tls, SIGTERM); waitpid(pid_tls, NULL, 0);
         perror("fork"); return 1;
     }
+
+
+
     if (pid_h2c == 0) run_server_h2c();
 
     int startup_ok = 1;
+    pid_t pid_upgrade = fork();
+    if (pid_upgrade == 0) run_server_upgrade();
+    if (wait_for_server(TEST_PORT_UPGRADE, 3000) < 0) {
+        FAIL("server startup", "upgrade server timeout");
+        startup_ok = 0;
+    }
     if (wait_for_server(TEST_PORT, 3000) < 0) {
         FAIL("server startup", "TLS server timeout"); startup_ok = 0;
     }
@@ -1140,6 +1239,7 @@ int main(void) {
     test_concurrent_streams();
 
     /* ── h2c raw frame tests ── */
+    test_h2c_upgrade();
     test_h2c_get();
     test_settings_ack();
     test_ping_pong();
@@ -1166,10 +1266,8 @@ done:
     int h2c_status = 0;
     kill(pid_h2c, SIGTERM);
     waitpid(pid_h2c, &h2c_status, 0);
-   /* if (WIFSIGNALED(h2c_status))
-        printf("h2c server killed by signal %d\n", WTERMSIG(h2c_status));
-    else if (WIFEXITED(h2c_status))
-        printf("h2c server exited with code %d\n", WEXITSTATUS(h2c_status));*/
+    kill(pid_upgrade, SIGTERM);
+    waitpid(pid_upgrade, NULL, 0);
 
     return g_fail > 0 ? 1 : 0;
 }

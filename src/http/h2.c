@@ -1312,17 +1312,29 @@ int h2_upgrade_from_h1(h2_conn_t      *hc,
                         struct router  *router,
                         struct middleware_chain *chain) {
     if (!hc || !req) return -1;
-
+    buf_t saved;
+    buf_init(&saved);
+    if (hc->write_buf.len > 0) {
+        if (buf_append(&saved, hc->write_buf.data,
+                       hc->write_buf.len) < 0) return -1;
+        hc->write_buf.len = 0;
+    }
     /* ── 1. 101 Switching Protocols ──────────────────────────────────── */
     static const char switching[] =
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Connection: Upgrade\r\n"
         "Upgrade: h2c\r\n"
         "\r\n";
-    if (buf_append(&hc->write_buf,
-                   (const uint8_t *)switching,
-                   sizeof(switching) - 1) < 0) return -1;
-
+    if (buf_append(&hc->write_buf, (const uint8_t *)switching,
+                   sizeof(switching) - 1) < 0) {
+        buf_free(&saved); return -1;
+                   }
+    if (saved.len > 0) {
+        if (buf_append(&hc->write_buf, saved.data, saved.len) < 0) {
+            buf_free(&saved); return -1;
+        }
+    }
+    buf_free(&saved);
     /* ── 2. Server preface: SETTINGS + WINDOW_UPDATE already written by
      *       h2_conn_new — nothing extra needed here.                    */
 

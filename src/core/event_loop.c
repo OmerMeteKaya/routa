@@ -516,9 +516,53 @@ static void handle_events_worker(worker_t *w) {
             conn->consumed  = consumed;
             conn->keep_alive = req.keep_alive;
 
+            /* ── h2c Upgrade (RFC 7540 §3.2) ────────────────────────── */
+            {
+                const char *upgrade = http_request_get_header(&req, "Upgrade");
+                if (upgrade && strcasecmp(upgrade, "h2c") == 0) {
+                    conn->h2 = h2_conn_new(conn, &w->h2_cfg);
+                    if (!conn->h2) {
+                        buf_reset(&conn->write_buf);
+                        http_response_simple(&conn->write_buf, 500,
+                                            "Internal Server Error",
+                                            "text/plain",
+                                            "Internal Server Error\n");
+                        conn->keep_alive = 0;
+                        conn_reset_write_state(conn);
+                        http_request_free(&req);
+                        conn->state = CONN_WRITING;
+                        goto handle_state;
+                    }
+                    if (h2_upgrade_from_h1(conn->h2, &req,
+                                           w->router, w->chain) < 0) {
+                        h2_conn_free(conn->h2);
+                        conn->h2 = NULL;
+                        buf_reset(&conn->write_buf);
+                        http_response_simple(&conn->write_buf, 500,
+                                            "Internal Server Error",
+                                            "text/plain",
+                                            "Internal Server Error\n");
+                        conn->keep_alive = 0;
+                        conn_reset_write_state(conn);
+                        http_request_free(&req);
+                        conn->state = CONN_WRITING;
+                        goto handle_state;
+                    }
+                    /* Switch connection to H2 mode                       */
+                    h2_conn_flush(conn->h2);
+                    buf_consume(&conn->read_buf, consumed);
+                    conn->consumed = 0;
+                    conn->state    = CONN_H2;
+                    http_request_free(&req);
+                    h2_conn_flush(conn->h2);
+                    poller_mod(w->poller, conn->fd,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    continue;
+                }
+            }
+
             /* Copy client IP for LB algo */
             strncpy(req.remote_ip, conn->remote_ip, sizeof(req.remote_ip) - 1);
-
             http_response_t resp;
             http_response_init(&resp);
 
