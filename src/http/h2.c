@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 /* ── Client connection preface (RFC 7540 §3.5) ───────────────────────────── */
 static const uint8_t H2_CLIENT_PREFACE[] =
@@ -383,7 +384,10 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
     hc->send_window  = H2_DEFAULT_WINDOW;
     hc->recv_window  = 1048576;
     hc->initial_send_window = H2_DEFAULT_WINDOW;
-
+    hc->cfg_stream_timeout_ms    = cfg->stream_timeout_ms    > 0
+                                   ? (uint32_t)cfg->stream_timeout_ms    : 30000;
+    hc->cfg_keepalive_timeout_ms = cfg->keepalive_timeout_ms > 0
+                                   ? (uint32_t)cfg->keepalive_timeout_ms : 120000;
     hc->peer_header_table_size      = 4096;
     hc->peer_max_concurrent_streams = 128;
     hc->peer_max_frame_size         = 16384;
@@ -426,7 +430,12 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
 
     /* Connection-level recv window advertisement (one-time)               */
     write_window_update(&hc->write_buf, 0, 1048576);
-
+    /* Initialize timeout tracking */
+    struct timespec _ts;
+    clock_gettime(CLOCK_MONOTONIC, &_ts);
+    uint64_t _now = (uint64_t)_ts.tv_sec * 1000 + _ts.tv_nsec / 1000000;
+    hc->last_recv_ts   = _now;
+    hc->last_stream_ts = _now;
     return hc;
 
 fail:
@@ -1105,6 +1114,12 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
             return 0;
         }
         hc->last_stream_id = stream_id;
+        {
+            struct timespec _sts;
+            clock_gettime(CLOCK_MONOTONIC, &_sts);
+            hc->last_stream_ts = (uint64_t)_sts.tv_sec * 1000 +
+                                 (uint64_t)_sts.tv_nsec / 1000000;
+        }
     }
 
     if (buf_append(&s->header_block, hdr_data, hdr_len) < 0)
@@ -1393,6 +1408,13 @@ int h2_conn_recv(h2_conn_t *hc,
             return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
         }
         buf_consume(rb, H2_CLIENT_PREFACE_LEN);
+        /* Update last_recv_ts on every frame */
+        {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            hc->last_recv_ts = (uint64_t)_ts.tv_sec * 1000 +
+                               (uint64_t)_ts.tv_nsec / 1000000;
+        }
         hc->preface_done = 1;
     }
 
@@ -1457,7 +1479,12 @@ int h2_conn_recv(h2_conn_t *hc,
             /* Unknown frame types MUST be ignored (RFC 7540 §4.1)        */
             break;
         }
-
+        {
+            struct timespec _rts;
+            clock_gettime(CLOCK_MONOTONIC, &_rts);
+            hc->last_recv_ts = (uint64_t)_rts.tv_sec * 1000 +
+                               (uint64_t)_rts.tv_nsec / 1000000;
+        }
         buf_consume(rb, H2_FRAME_HDR_SZ + pay_len);
         if (rc < 0) return -1;
     }
@@ -1475,6 +1502,46 @@ int h2_conn_flush(h2_conn_t *hc) {
                                    &hc->write_buf,
                                    hc->conn->tls);
     if (n < 0) return -1;
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * h2_conn_check_timeouts
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
+int h2_conn_check_timeouts(h2_conn_t *hc, uint64_t now_ms) {
+    if (!hc || hc->error || hc->goaway_sent) return 0;
+
+    const routa_h2_config_t *cfg = NULL;
+    /* Timeouts come from config stored at conn_new time.
+     * We use hardcoded defaults here; event_loop passes now_ms.
+     * stream_timeout_ms default: 30000, keepalive_timeout_ms default: 120000 */
+    uint32_t stream_timeout_ms    = hc->cfg_stream_timeout_ms;
+    uint32_t keepalive_timeout_ms = hc->cfg_keepalive_timeout_ms;
+
+    /* Connection-level idle: no frames received for keepalive_timeout_ms */
+    if (keepalive_timeout_ms > 0 &&
+        (now_ms - hc->last_recv_ts) > keepalive_timeout_ms) {
+        LOG_WARN("h2: connection idle timeout (%u ms)", keepalive_timeout_ms);
+        write_goaway(&hc->write_buf, hc->last_stream_id,
+                     H2_ERR_NO_ERROR);
+        hc->goaway_sent = 1;
+        hc->error       = 1;
+        return -1;
+        }
+
+    /* Stream-level: open streams with no activity for stream_timeout_ms  */
+    if (stream_timeout_ms > 0 &&
+        stream_count(hc) > 0 &&
+        (now_ms - hc->last_stream_ts) > stream_timeout_ms) {
+        LOG_WARN("h2: stream idle timeout (%u ms)", stream_timeout_ms);
+        write_goaway(&hc->write_buf, hc->last_stream_id,
+                     H2_ERR_SETTINGS_TIMEOUT);
+        hc->goaway_sent = 1;
+        hc->error       = 1;
+        return -1;
+        }
+
     return 0;
 }
 

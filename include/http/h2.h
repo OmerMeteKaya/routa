@@ -166,6 +166,11 @@ typedef struct h2_conn {
     int               error;
     int               preface_done;
 
+    /* Idle timeout tracking                                              */
+    uint64_t          last_stream_ts;    /* monotonic ms, last stream activity */
+    uint64_t          last_recv_ts;      /* monotonic ms, last frame received  */
+    uint32_t          cfg_stream_timeout_ms;
+    uint32_t          cfg_keepalive_timeout_ms;
 } h2_conn_t;
 
 /* Forward declarations */
@@ -181,6 +186,8 @@ h2_conn_t *h2_conn_new(struct conn             *conn,
                         const routa_h2_config_t *cfg);
 
 void       h2_conn_free(h2_conn_t *hc);
+
+int h2_conn_check_timeouts(h2_conn_t *hc, uint64_t now_ms);
 
 int        h2_conn_recv(h2_conn_t               *hc,
                         struct router           *router,

@@ -1040,6 +1040,15 @@ static void handle_events_worker(worker_t *w) {
                 ws_config_t default_cfg;
                 ws_config_init(&default_cfg);
                 ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
+                /* H2 idle timeout sweep */
+                for (int _i = 0; _i < w->active_conn_count; _i++) {
+                    conn_t *_c = w->active_conns[_i];
+                    if (_c->state != CONN_H2 || !_c->h2) continue;
+                    if (h2_conn_check_timeouts(_c->h2, now_ms) < 0) {
+                        h2_conn_flush(_c->h2);
+                        _c->state = CONN_CLOSING;
+                    }
+                }
                 last_ping_sweep_ms = now_ms;
             }
         }
