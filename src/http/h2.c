@@ -399,9 +399,13 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
     hc->push_enabled = cfg->server_push_enabled;
     hc->next_push_stream_id = 2;   /* server-initiated streams are even    */
 
-    hpack_ctx_init(&hc->hpack_rx, cfg->header_table_size, 0, 0);
-    hpack_ctx_init(&hc->hpack_tx, cfg->header_table_size,
-                   cfg->huffman_encoding, cfg->dynamic_table_update);
+    if (hpack_ctx_init(&hc->hpack_rx, cfg->header_table_size,
+                      0, 0,
+                      cfg->max_header_list_size) < 0) goto fail;
+    if (hpack_ctx_init(&hc->hpack_tx, cfg->header_table_size,
+                       cfg->huffman_encoding,
+                       cfg->dynamic_table_update,
+                       cfg->max_header_list_size) < 0) goto fail;
 
     if (hc->lookup_mode == H2_STREAM_LOOKUP_HASHMAP) {
         int cap = 1;

@@ -36,7 +36,7 @@ static const uint8_t rfc_c41[] = {
 
 static void test_static_indexed(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 1, 1);
+    hpack_ctx_init(&ctx, 4096, 1, 1, 0);
     uint8_t wire[] = { 0x82 };
     hpack_header_t headers[8];
     int n = hpack_decode(&ctx, wire, sizeof(wire), headers, 8);
@@ -53,7 +53,7 @@ done:
 
 static void test_rfc_c31(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 0, 1);
+    hpack_ctx_init(&ctx, 4096, 0, 1, 0);
     hpack_header_t headers[8];
     int n = hpack_decode(&ctx, rfc_c31, sizeof(rfc_c31), headers, 8);
     if (n != 4) { FAIL("RFC C.3.1", "got %d headers, want 4", n); goto done; }
@@ -75,7 +75,7 @@ done:
 
 static void test_rfc_c41_huffman(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 1, 1);
+    hpack_ctx_init(&ctx, 4096, 1, 1, 0);
     hpack_header_t headers[8];
     int n = hpack_decode(&ctx, rfc_c41, sizeof(rfc_c41), headers, 8);
     if (n != 4) { FAIL("RFC C.4.1", "got %d headers, want 4", n); goto done; }
@@ -90,13 +90,13 @@ done:
 
 static void test_dyntab_eviction(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 64, 0, 1);
+    hpack_ctx_init(&ctx, 64, 0, 1, 0);
     hpack_header_t h[2] = {
         { "x-foo", "aaaaaaaaaaaaaaaa" },
         { "x-bar", "bbbbbbbbbbbbbbbb" },
     };
     hpack_ctx_t enc;
-    hpack_ctx_init(&enc, 64, 0, 1);
+    hpack_ctx_init(&enc, 64, 0, 1, 0);
     uint8_t wire[256];
     int wlen = hpack_encode(&enc, h, 2, wire, sizeof(wire));
     hpack_ctx_free(&enc);
@@ -120,8 +120,8 @@ static void test_roundtrip(void) {
         { "content-type", "application/json" }, { "x-custom", "hello-world" },
     };
     hpack_ctx_t enc, dec;
-    hpack_ctx_init(&enc, 4096, 1, 1);
-    hpack_ctx_init(&dec, 4096, 1, 1);
+    hpack_ctx_init(&enc, 4096, 1, 1, 0);
+    hpack_ctx_init(&dec, 4096, 1, 1, 0);
     uint8_t wire[1024];
     int wlen = hpack_encode(&enc, in, 6, wire, sizeof(wire));
     if (wlen < 0) { FAIL("roundtrip", "encode failed"); goto done; }
@@ -144,8 +144,8 @@ static void test_roundtrip_no_huffman(void) {
         { ":status", "200" }, { "content-type", "text/plain" }, { "x-trace-id", "abc123" },
     };
     hpack_ctx_t enc, dec;
-    hpack_ctx_init(&enc, 4096, 0, 1);
-    hpack_ctx_init(&dec, 4096, 0, 1);
+    hpack_ctx_init(&enc, 4096, 0, 1, 0);
+    hpack_ctx_init(&dec, 4096, 0, 1, 0);
     uint8_t wire[512];
     int wlen = hpack_encode(&enc, in, 3, wire, sizeof(wire));
     if (wlen < 0) { FAIL("roundtrip no-huffman", "encode failed"); goto done; }
@@ -165,10 +165,10 @@ done:
 
 static void test_dyntab_resize(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 0, 1);
+    hpack_ctx_init(&ctx, 4096, 0, 1, 0);
     hpack_header_t h[] = { {"x-a","val1"}, {"x-b","val2"}, {"x-c","val3"} };
     hpack_ctx_t enc;
-    hpack_ctx_init(&enc, 4096, 0, 1);
+    hpack_ctx_init(&enc, 4096, 0, 1, 0);
     uint8_t wire[512];
     int wlen = hpack_encode(&enc, h, 3, wire, sizeof(wire));
     hpack_ctx_free(&enc);
@@ -186,7 +186,7 @@ static void test_dyntab_resize(void) {
 
 static void test_malformed(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 0, 1);
+    hpack_ctx_init(&ctx, 4096, 0, 1, 0);
     uint8_t bad_idx[] = { 0x80 };
     hpack_header_t out[4];
     int n = hpack_decode(&ctx, bad_idx, sizeof(bad_idx), out, 4);
@@ -203,8 +203,8 @@ static void test_malformed(void) {
 
 static void test_no_dyntab_write(void) {
     hpack_ctx_t enc, dec;
-    hpack_ctx_init(&enc, 4096, 1, 0);
-    hpack_ctx_init(&dec, 4096, 1, 0);
+    hpack_ctx_init(&enc, 4096, 1, 0, 0);
+    hpack_ctx_init(&dec, 4096, 1, 0, 0);
     hpack_header_t in[] = { {"x-custom","value"}, {"x-other","data"} };
     uint8_t wire[256];
     int wlen = hpack_encode(&enc, in, 2, wire, sizeof(wire));
@@ -240,8 +240,8 @@ static void test_giant_huffman(void) {
     hpack_header_t in[1] = {{ "x-big", big_val }};
 
     hpack_ctx_t enc, dec;
-    hpack_ctx_init(&enc, 4096, 1, 0);   /* huffman on, no dyntab          */
-    hpack_ctx_init(&dec, 4096, 1, 0);
+    hpack_ctx_init(&enc, 4096, 1, 0, 0);   /* huffman on, no dyntab          */
+    hpack_ctx_init(&dec, 4096, 1, 0, 0);
 
     uint8_t *wire = malloc(vlen * 2);
     if (!wire) { free(big_val); FAIL("giant huffman", "malloc failed"); return; }
@@ -274,8 +274,8 @@ done:
 static void test_dyntab_overflow_spam(void) {
     const int N = 200;
     hpack_ctx_t enc, dec;
-    hpack_ctx_init(&enc, 256, 0, 1);
-    hpack_ctx_init(&dec, 256, 0, 1);
+    hpack_ctx_init(&enc, 256, 0, 1, 0);
+    hpack_ctx_init(&dec, 256, 0, 1, 0);
 
     int failed = 0;
     for (int i = 0; i < N && !failed; i++) {
@@ -314,7 +314,7 @@ static void test_duplicate_pseudo_headers(void) {
     /* Manually craft: two indexed :method GET entries (0x82 0x82)        */
     uint8_t wire[] = { 0x82, 0x82 };
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 0, 1);
+    hpack_ctx_init(&ctx, 4096, 0, 1, 0);
     hpack_header_t out[8];
     int n = hpack_decode(&ctx, wire, sizeof(wire), out, 8);
     /* Should decode 2 headers (both :method GET) without crashing        */
@@ -340,8 +340,8 @@ static void test_header_case(void) {
         { "content-type", "text/html" },  /* already lowercase            */
     };
     hpack_ctx_t enc, dec;
-    hpack_ctx_init(&enc, 4096, 0, 0);
-    hpack_ctx_init(&dec, 4096, 0, 0);
+    hpack_ctx_init(&enc, 4096, 0, 0, 0);
+    hpack_ctx_init(&dec, 4096, 0, 0, 0);
 
     uint8_t wire[256];
     int wlen = hpack_encode(&enc, in, 1, wire, sizeof(wire));
@@ -369,7 +369,7 @@ done:
 /* Index > 61 with empty dynamic table must return error.                   */
 static void test_invalid_index(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 0, 1);
+    hpack_ctx_init(&ctx, 4096, 0, 1, 0);
 
     /* 0xff = indexed representation, index=127 (5-bit prefix all ones +
      * continuation byte 0x3e → index = 31+62 = 93)                       */
@@ -390,7 +390,7 @@ static void test_invalid_index(void) {
  * Decoder must not crash or allocate 1MB.                                  */
 static void test_compression_bomb(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 0, 1);
+    hpack_ctx_init(&ctx, 4096, 0, 1, 0);
 
     /* Literal not indexed, new name.
      * Name length encoded as 5-byte integer: 0x7f 0x81 0x80 0x80 0x04
@@ -416,7 +416,7 @@ static void test_compression_bomb(void) {
  * but we must not segfault or corrupt memory (ASAN will catch it).         */
 static void test_fuzz_random(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 1, 1);
+    hpack_ctx_init(&ctx, 4096, 1, 1, 0);
 
     /* Fixed seed for reproducibility */
     unsigned int seed = 0xdeadbeef;
@@ -460,8 +460,8 @@ static void test_header_count_boundary(void) {
     }
 
     hpack_ctx_t enc, dec;
-    hpack_ctx_init(&enc, 65536, 0, 0);
-    hpack_ctx_init(&dec, 65536, 0, 0);
+    hpack_ctx_init(&enc, 65536, 0, 0, 0);
+    hpack_ctx_init(&dec, 65536, 0, 0, 0);
 
     uint8_t *wire = malloc((size_t)N * 64);
     if (!wire) {
@@ -489,7 +489,7 @@ done:
  * Wrong padding → decoding error.                                          */
 static void test_huffman_bad_padding(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 1, 1);
+    hpack_ctx_init(&ctx, 4096, 1, 1, 0);
 
     /* Literal not indexed, new name, Huffman-encoded name.
      * 0x82 = Huffman flag + length 2.
@@ -517,7 +517,7 @@ static void test_huffman_bad_padding(void) {
  * reference the evicted index — must get error, not stale data.            */
 static void test_stale_index_after_eviction(void) {
     hpack_ctx_t ctx;
-    hpack_ctx_init(&ctx, 4096, 0, 1);
+    hpack_ctx_init(&ctx, 4096, 0, 1, 0);
 
     /* Decode a header that adds to dyntab (index 62 after decode)        */
     uint8_t add_wire[] = {

@@ -30,13 +30,16 @@ typedef struct {
 /* ── Context (one per direction per h2_conn) ─────────────────────────────── */
 typedef struct {
     hpack_dynamic_table_t table;
+    size_t   max_header_list_size;  /* 0 = unlimited; set from SETTINGS   */
+    size_t   current_header_list_size; /* running total for decode         */
     int                   huffman_encode;    /* outbound: from config        */
     int                   dynamic_table_update; /* outbound: from config     */
 } hpack_ctx_t;
 
 /* ── Init / free ─────────────────────────────────────────────────────────── */
 int  hpack_ctx_init(hpack_ctx_t *ctx, size_t max_size,
-                    int huffman_encode, int dynamic_table_update);
+                    int huffman_encode, int dynamic_table_update,
+                    size_t max_header_list_size);
 void hpack_ctx_free(hpack_ctx_t *ctx);
 
 /* ── Dynamic table resize (on SETTINGS_HEADER_TABLE_SIZE update) ─────────── */

@@ -572,26 +572,37 @@ static int dyntab_lookup(const hpack_dynamic_table_t *t, int idx,
 /* Decode a string (RFC 7541 §5.2): length-prefixed, optionally Huffman.
  * Returns bytes consumed from src, -1 on error.
  * *out is malloc'd — caller frees.                                          */
+/* Hard limit: single header name or value cannot exceed 64KB             */
+#define HPACK_MAX_STRING_LEN  65536
+
 static int decode_string(const uint8_t *src, size_t src_len, char **out) {
     if (src_len == 0) return -1;
     int is_huffman = (src[0] & 0x80) != 0;
     uint64_t slen;
     int consumed = hpack_decode_int(src, src_len, 7, &slen);
     if (consumed < 0 || (size_t)consumed + slen > src_len) return -1;
+    if (slen > HPACK_MAX_STRING_LEN) return -1;  /* bomb protection      */
 
     const uint8_t *data = src + consumed;
     if (is_huffman) {
-        char tmp[8192];
-        int n = huffman_decode(data, (size_t)slen, tmp, sizeof(tmp));
-        if (n < 0) return -1;
+        /* Huffman expands at most 8/5 — safe upper bound                 */
+        size_t   cap = (size_t)slen * 2 + 16;
+        if (cap > HPACK_MAX_STRING_LEN * 2) cap = HPACK_MAX_STRING_LEN * 2;
+        char    *tmp = malloc(cap);
+        if (!tmp) return -1;
+        int n = huffman_decode(data, (size_t)slen, tmp, cap);
+        if (n < 0 || (size_t)n > HPACK_MAX_STRING_LEN) {
+            free(tmp); return -1;
+        }
         *out = malloc((size_t)n + 1);
-        if (!*out) return -1;
+        if (!*out) { free(tmp); return -1; }
         memcpy(*out, tmp, (size_t)n);
         (*out)[n] = '\0';
+        free(tmp);
     } else {
-        *out = malloc(slen + 1);
+        *out = malloc((size_t)slen + 1);
         if (!*out) return -1;
-        memcpy(*out, data, slen);
+        memcpy(*out, data, (size_t)slen);
         (*out)[slen] = '\0';
     }
     return consumed + (int)slen;
@@ -628,11 +639,14 @@ static int encode_string(uint8_t *dst, size_t dst_len,
  * ═══════════════════════════════════════════════════════════════════════════*/
 
 int hpack_ctx_init(hpack_ctx_t *ctx, size_t max_size,
-                   int huffman_encode, int dynamic_table_update) {
+                   int huffman_encode, int dynamic_table_update,
+                   size_t max_header_list_size) {
     memset(ctx, 0, sizeof(*ctx));
-    ctx->table.max_size         = max_size;
-    ctx->huffman_encode         = huffman_encode;
-    ctx->dynamic_table_update   = dynamic_table_update;
+    ctx->table.max_size           = max_size;
+    ctx->huffman_encode           = huffman_encode;
+    ctx->dynamic_table_update     = dynamic_table_update;
+    ctx->max_header_list_size     = max_header_list_size;
+    ctx->current_header_list_size = 0;
     return 0;
 }
 
@@ -664,7 +678,7 @@ int hpack_decode(hpack_ctx_t *ctx,
     /* Zero all slots so cleanup on error is safe */
     for (int i = 0; i < max_headers; i++)
         headers[i].name = headers[i].value = NULL;
-
+    ctx->current_header_list_size = 0;
     while (pos < src_len && count < max_headers) {
         uint8_t first = src[pos];
         hpack_header_t *h = &headers[count];
@@ -686,6 +700,15 @@ int hpack_decode(hpack_ctx_t *ctx,
                                   &name, &value) < 0) goto fail;
                 h->name  = strdup(name);
                 h->value = strdup(value);
+            }
+            /* RFC 7541 §4.1: header list size = sum of (name_len + value_len + 32) */
+            if (h->name && h->value) {
+                size_t entry_size = strlen(h->name) + strlen(h->value) + 32;
+                ctx->current_header_list_size += entry_size;
+                if (ctx->max_header_list_size > 0 &&
+                    ctx->current_header_list_size > ctx->max_header_list_size) {
+                    goto fail;
+                    }
             }
             if (!h->name || !h->value) goto fail;
             count++;
@@ -742,7 +765,15 @@ int hpack_decode(hpack_ctx_t *ctx,
 
         if (incremental)
             dyntab_add(&ctx->table, h->name, h->value);
-
+        /* RFC 7541 §4.1: header list size = sum of (name_len + value_len + 32) */
+        if (h->name && h->value) {
+            size_t entry_size = strlen(h->name) + strlen(h->value) + 32;
+            ctx->current_header_list_size += entry_size;
+            if (ctx->max_header_list_size > 0 &&
+                ctx->current_header_list_size > ctx->max_header_list_size) {
+                goto fail;
+                }
+        }
         count++;
     }
     return count;
