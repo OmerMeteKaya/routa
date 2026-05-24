@@ -51,6 +51,7 @@ target_link_libraries(routa_core PUBLIC
         Threads::Threads
         ZLIB::ZLIB
 )
+target_link_libraries(routa_core PRIVATE z)
 
 # ── io_uring (Linux only, opt-in) ────────────────────────────────────────────
 if(ROUTA_IO_URING)

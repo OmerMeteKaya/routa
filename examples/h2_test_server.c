@@ -52,7 +52,7 @@ int main(void) {
            "-out /tmp/routa_certs/test.crt "
            "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null");
 
-    event_loop_t *loop = event_loop_new(18443, 1);
+    event_loop_t *loop = event_loop_new(18443, 12);
     if (!loop) { fprintf(stderr, "loop failed\n"); return 1; }
 
     event_loop_set_tls(loop, "/tmp/routa_certs/test.crt",

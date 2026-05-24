@@ -231,6 +231,7 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
             req->header_count++;
         }
         hp = le + 2;
+
     }
 
     /* ---- keep-alive ---- */

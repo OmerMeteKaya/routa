@@ -68,6 +68,12 @@ typedef struct {
 
     int          fin;
     int          rsv1;
+
+    /* permessage-deflate (RFC 7692) */
+    int          pmd_enabled;       /* negotiated per-connection           */
+    int          pmd_server_no_context_takeover;
+    int          pmd_client_no_context_takeover;
+
     ws_opcode_t  opcode;
     int          masked;
     uint8_t      mask[4];
@@ -146,6 +152,8 @@ typedef struct {
     ws_on_error_fn   on_error;
     void            *ctx;
     ws_config_t      cfg;
+    /* permessage-deflate negotiated state (set during handshake)         */
+    int          pmd_negotiated;
 } ws_handler_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -184,5 +192,7 @@ void ws_frame_state_free(ws_frame_state_t *fs);
 
 int  ws_is_upgrade_request(const http_request *req);
 
+int  ws_send_pmd(conn_t *conn, const uint8_t *data, size_t len,
+                 ws_opcode_t opcode, const ws_config_t *cfg);
 
 #endif /* ROUTA_HTTP_WS_H */

@@ -14,6 +14,7 @@
 #include <openssl/evp.h>
 #include <errno.h>
 #include <unistd.h>
+#include <zlib.h>
 
 /* ── Constants ──────────────────────────────────────────────────────────── */
 #define WS_GUID         "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -93,12 +94,165 @@ static int compute_accept(const char *key, char *out) {
     return 0;
 }
 
+/* ── permessage-deflate negotiation helpers ─────────────────────────────── */
+
+/* Parse "permessage-deflate" extension from Sec-WebSocket-Extensions header.
+ * Returns 1 if found and negotiated, 0 otherwise.
+ * Fills server_no_ctx and client_no_ctx flags.                             */
+static int pmd_negotiate(const char *ext_header,
+                          int *server_no_ctx, int *client_no_ctx) {
+    if (!ext_header) return 0;
+    *server_no_ctx = 0;
+    *client_no_ctx = 0;
+
+    /* Look for "permessage-deflate" token */
+    const char *p = strcasestr(ext_header, "permessage-deflate");
+    if (!p) return 0;
+
+    /* Scan params after the token on the same extension entry */
+    const char *end = strchr(p, ',');   /* next extension */
+    char entry[256];
+    if (end) {
+        size_t len = (size_t)(end - p);
+        if (len >= sizeof(entry)) len = sizeof(entry) - 1;
+        memcpy(entry, p, len);
+        entry[len] = '\0';
+    } else {
+        strncpy(entry, p, sizeof(entry) - 1);
+        entry[sizeof(entry) - 1] = '\0';
+    }
+
+    if (strcasestr(entry, "server_no_context_takeover")) *server_no_ctx = 1;
+    if (strcasestr(entry, "client_no_context_takeover")) *client_no_ctx = 1;
+
+    return 1;
+}
+
+/* Build the response extension header value for permessage-deflate.       */
+static void pmd_response_header(char *out, size_t cap,
+                                 int server_no_ctx, int client_no_ctx) {
+    snprintf(out, cap, "permessage-deflate%s%s",
+             server_no_ctx ? "; server_no_context_takeover" : "",
+             client_no_ctx ? "; client_no_context_takeover" : "");
+}
+
+/* Compress src into dst using raw deflate (no zlib header).
+ * Returns compressed byte count, -1 on error.
+ * Caller must free *dst_out.                                               */
+static int pmd_compress(const uint8_t *src, size_t src_len,
+                         uint8_t **dst_out, size_t *dst_len_out) {
+    if (!src || src_len == 0) return -1;
+
+    /* Worst case: src_len + 10% + 12 bytes */
+    size_t   cap = src_len + src_len / 10 + 64;
+    uint8_t *dst = malloc(cap);
+    if (!dst) return -1;
+
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    /* Raw deflate: windowBits = -15 */
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                     -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        free(dst); return -1;
+    }
+
+    zs.next_in   = (Bytef *)src;
+    zs.avail_in  = (uInt)src_len;
+    zs.next_out  = dst;
+    zs.avail_out = (uInt)cap;
+
+    int rc = deflate(&zs, Z_SYNC_FLUSH);
+    size_t out_len = cap - zs.avail_out;
+    deflateEnd(&zs);
+
+    if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+        free(dst); return -1;
+    }
+
+    /* RFC 7692 §7.2.1: remove trailing 0x00 0x00 0xff 0xff */
+    if (out_len >= 4 &&
+        dst[out_len-4] == 0x00 && dst[out_len-3] == 0x00 &&
+        dst[out_len-2] == 0xff && dst[out_len-1] == 0xff) {
+        out_len -= 4;
+    }
+
+    *dst_out     = dst;
+    *dst_len_out = out_len;
+    return (int)out_len;
+}
+
+/* Decompress raw deflate stream (permessage-deflate recv path).
+ * RFC 7692 §7.2.2: append 0x00 0x00 0xff 0xff before inflate.
+ * Returns decompressed byte count, -1 on error.
+ * Caller must free *dst_out.                                               */
+static int pmd_decompress(const uint8_t *src, size_t src_len,
+                            uint8_t **dst_out, size_t *dst_len_out) {
+    if (!src || src_len == 0) return -1;
+
+    /* Append RFC 7692 tail */
+    size_t   padded_len = src_len + 4;
+    uint8_t *padded     = malloc(padded_len);
+    if (!padded) return -1;
+    memcpy(padded, src, src_len);
+    padded[src_len+0] = 0x00;
+    padded[src_len+1] = 0x00;
+    padded[src_len+2] = 0xff;
+    padded[src_len+3] = 0xff;
+
+    /* Initial output buffer — grow if needed */
+    size_t   cap = src_len * 4 + 256;
+    uint8_t *dst = malloc(cap);
+    if (!dst) { free(padded); return -1; }
+
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, -15) != Z_OK) {
+        free(padded); free(dst); return -1;
+    }
+
+    zs.next_in  = padded;
+    zs.avail_in = (uInt)padded_len;
+
+    size_t out_len = 0;
+    int    rc;
+    do {
+        zs.next_out  = dst + out_len;
+        zs.avail_out = (uInt)(cap - out_len);
+
+        rc = inflate(&zs, Z_SYNC_FLUSH);
+        out_len = cap - zs.avail_out;
+
+        if (rc == Z_BUF_ERROR || (rc == Z_OK && zs.avail_out == 0)) {
+            /* Grow buffer */
+            cap *= 2;
+            uint8_t *tmp = realloc(dst, cap);
+            if (!tmp) { inflateEnd(&zs); free(padded); free(dst); return -1; }
+            dst = tmp;
+        }
+    } while (rc == Z_OK || rc == Z_BUF_ERROR);
+
+    inflateEnd(&zs);
+    free(padded);
+
+    if (rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+        free(dst); return -1;
+    }
+
+    *dst_out     = dst;
+    *dst_len_out = out_len;
+    return (int)out_len;
+}
+
 int ws_handshake(conn_t *conn, const http_request_t *req,
                  buf_t *out, const ws_config_t *cfg) {
     (void)cfg;   /* reserved for future origin/subprotocol checks          */
 
     if (!conn || !req || !out) return -1;
-
+    int pmd_ok = 0, srv_no_ctx = 0, cli_no_ctx = 0;
+    if (cfg && cfg->permessage_deflate) {
+        const char *ext = http_request_get_header(req, "Sec-WebSocket-Extensions");
+        pmd_ok = pmd_negotiate(ext, &srv_no_ctx, &cli_no_ctx);
+    }
     const char *key = http_request_get_header(req, "Sec-WebSocket-Key");
     if (!key || strlen(key) == 0) {
         LOG_WARN("ws: missing Sec-WebSocket-Key from %s", conn->remote_ip);
@@ -126,7 +280,15 @@ int ws_handshake(conn_t *conn, const http_request_t *req,
     buf_append_str(out, "Connection: Upgrade\r\n");
     buf_append_str(out, "Sec-WebSocket-Accept: ");
     buf_append_str(out, accept);
-    buf_append_str(out, "\r\n\r\n");
+    if (pmd_ok) {
+        char pmd_hdr[256];
+        pmd_response_header(pmd_hdr, sizeof(pmd_hdr), srv_no_ctx, cli_no_ctx);
+        buf_append_str(out, "Sec-WebSocket-Extensions: ");
+        buf_append_str(out, pmd_hdr);
+        buf_append_str(out, "\r\n");
+        conn->ws_pmd_enabled = 1;
+    }
+    buf_append_str(out, "\r\n");
 
     conn->ws_state = WS_STATE_OPEN;
     ws_frame_state_init(&conn->ws_fs);
@@ -184,6 +346,37 @@ int ws_ping(conn_t *conn, const uint8_t *payload, size_t len) {
 int ws_pong(conn_t *conn, const uint8_t *payload, size_t len) {
     if (len > 125) return -1;
     return ws_send(conn, payload, len, WS_OP_PONG);
+}
+
+int ws_send_pmd(conn_t *conn, const uint8_t *data, size_t len,
+                ws_opcode_t opcode, const ws_config_t *cfg) {
+    if (!conn || !cfg) return -1;
+
+    /* Only compress text/binary, not control frames */
+    int should_compress = conn->ws_pmd_enabled &&
+                          cfg->permessage_deflate &&
+                          len >= cfg->compression_threshold &&
+                          (opcode == WS_OP_TEXT || opcode == WS_OP_BINARY);
+
+    if (!should_compress)
+        return ws_send(conn, data, len, opcode);
+
+    uint8_t *compressed = NULL;
+    size_t   comp_len   = 0;
+    if (pmd_compress(data, len, &compressed, &comp_len) < 0)
+        return ws_send(conn, data, len, opcode);  /* fallback to uncompressed */
+
+    /* RSV1 bit set — byte 0 of frame header */
+    uint8_t hdr[14];
+    int hdr_len = build_frame_header(hdr, opcode, 1, (uint64_t)comp_len);
+    hdr[0] |= 0x40;   /* RSV1 = 1 */
+
+    int rc = 0;
+    if (buf_append(&conn->write_buf, hdr, (size_t)hdr_len) < 0) rc = -1;
+    if (rc == 0 && buf_append(&conn->write_buf, compressed, comp_len) < 0) rc = -1;
+
+    free(compressed);
+    return rc;
 }
 
 int ws_close(conn_t *conn, ws_close_code_t code, const char *reason) {
@@ -417,15 +610,29 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
 
             /* Full frame received */
             if (fs->fin) {
-                /* Complete message ready — dispatch to handler */
-                if (handler->on_message) {
-                    handler->on_message(conn,
-                                        (const uint8_t *)fs->frag_buf.data,
-                                        fs->frag_buf.len,
-                                        fs->frag_opcode,
-                                        handler->ctx);
+                const uint8_t *msg_data = (const uint8_t *)fs->frag_buf.data;
+                size_t         msg_len  = fs->frag_buf.len;
+                uint8_t       *decomp   = NULL;
+                size_t         decomp_len = 0;
+                int            used_pmd  = 0;
+
+                /* Decompress if RSV1 was set on the first frame */
+                if (conn->ws_pmd_enabled && fs->rsv1) {
+                    if (pmd_decompress(msg_data, msg_len,
+                                       &decomp, &decomp_len) >= 0) {
+                        msg_data  = decomp;
+                        msg_len   = decomp_len;
+                        used_pmd  = 1;
+                                       }
+                    /* If decompression fails, pass raw data — handler decides */
                 }
-                /* Reset fragment state */
+
+                if (handler->on_message) {
+                    handler->on_message(conn, msg_data, msg_len,
+                                        fs->frag_opcode, handler->ctx);
+                }
+
+                if (used_pmd) free(decomp);
                 fs->frag_buf.len = 0;
                 fs->in_fragment  = 0;
             }

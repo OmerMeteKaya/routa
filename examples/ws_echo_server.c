@@ -51,7 +51,7 @@ static int handle_broadcast(const http_request_t *req,
 int main(void) {
     signal(SIGINT, on_sigint);
 
-    g_loop = event_loop_new(8080, 1);
+    g_loop = event_loop_new(8080, 12);
     g_loop_ref = g_loop;
     event_loop_add_route(g_loop, "/broadcast", 1 << HTTP_GET,
                          handle_broadcast, NULL);

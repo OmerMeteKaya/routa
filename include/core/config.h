@@ -85,6 +85,10 @@ typedef struct {
     /* Timeouts */
     int      stream_timeout_ms;          /* idle stream, default: 30000       */
     int      keepalive_timeout_ms;       /* h2 conn idle, default: 120000     */
+
+    /* H2 */
+    int      server_push_enabled;       /* default: 1                        */
+    int      h2c_upgrade_enabled;       /* default: 1                        */
     h2_stream_lookup_t stream_lookup;        /* default: H2_STREAM_LOOKUP_LINEAR  */
     uint32_t           max_concurrent_streams_hard_cap; /* pool hard cap, default: 256 */
 } routa_h2_config_t;

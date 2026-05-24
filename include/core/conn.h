@@ -86,6 +86,7 @@ typedef struct conn {
     uint64_t         ws_last_ping_ms;   /* monotonic ms of last ping sent   */
     int              ws_ping_misses;    /* consecutive unanswered pings     */
     int              ws_write_queued;   /* frames waiting in write_buf      */
+    int              ws_pmd_enabled;    /* permessage-deflate active       */
     ws_handler_t     *ws_handler;
 
     /* ── Cold metadata ──────────────────────────────────────────────────*/

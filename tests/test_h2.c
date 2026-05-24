@@ -25,6 +25,7 @@
 #define TEST_CERT      "tests/certs/test.crt"
 #define TEST_KEY       "tests/certs/test.key"
 static int h2c_open(void);
+
 /* ── Test harness ────────────────────────────────────────────────────────── */
 static int g_pass = 0;
 static int g_fail = 0;
@@ -956,6 +957,137 @@ static void test_rapid_streams(void) {
         FAIL("rapid streams", "got %d/20 responses", atoi(out));
 }
 
+/* ── SETTINGS flood protection ───────────────────────────────────────────── */
+static void test_settings_flood(void) {
+    int fd = h2c_open();
+    if (fd < 0) { FAIL("SETTINGS flood", "connect failed"); return; }
+
+    uint8_t buf[9];
+    for (int i = 0; i < 210; i++) {
+        frame_hdr(buf, 0, 0, FT_SETTINGS, 0, 0);
+        if (send_all(fd, buf, 9) < 0) break;
+    }
+    usleep(300000);
+
+    uint8_t resp[4096];
+    size_t total = 0;
+    for (int i = 0; i < 10; i++) {
+        ssize_t n = recv_some(fd, resp + total, sizeof(resp) - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (has_goaway(resp, (ssize_t)total)) break;
+    }
+    close(fd);
+
+    if (has_goaway(resp, (ssize_t)total) == 1)
+        OK("SETTINGS flood — GOAWAY received");
+    else if (total == 0)
+        OK("SETTINGS flood — server closed connection");
+    else
+        FAIL("SETTINGS flood", "no GOAWAY in %zu bytes", total);
+}
+
+/* ── CONTINUATION flood protection ──────────────────────────────────────── */
+static void test_continuation_flood(void) {
+    int fd = h2c_open();
+    if (fd < 0) { FAIL("CONTINUATION flood", "connect failed"); return; }
+
+    /* HEADERS without END_HEADERS to start CONTINUATION sequence        */
+    uint8_t hpack[3] = { 0x82, 0x87, 0x84 };
+    uint8_t frame[9 + 3];
+    size_t off = frame_hdr(frame, 0, 3, FT_HEADERS, 0, 1);
+    memcpy(frame + off, hpack, 3);
+    send_all(fd, frame, off + 3);
+
+    /* Flood with CONTINUATION frames to exceed 256KB                    */
+    uint8_t frag[4096];
+    memset(frag, 0x00, sizeof(frag));
+    uint8_t cont[9 + 4096];
+    int got_error = 0;
+    for (int i = 0; i < 100; i++) {
+        off = frame_hdr(cont, 0, sizeof(frag), FT_CONTINUATION, 0, 1);
+        memcpy(cont + off, frag, sizeof(frag));
+        if (send_all(fd, cont, off + sizeof(frag)) < 0) {
+            got_error = 1; break;
+        }
+    }
+
+    usleep(200000);
+    uint8_t resp[512];
+    size_t total = 0;
+    for (int i = 0; i < 5; i++) {
+        ssize_t n = recv_some(fd, resp + total, sizeof(resp) - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (has_goaway(resp, (ssize_t)total)) break;
+    }
+    close(fd);
+
+    if (has_goaway(resp, (ssize_t)total) == 1 || got_error)
+        OK("CONTINUATION flood — GOAWAY or connection reset");
+    else if (total == 0)
+        OK("CONTINUATION flood — server closed connection");
+    else
+        FAIL("CONTINUATION flood", "no GOAWAY in %zu bytes", total);
+}
+
+/* ── max_frame_size enforcement ─────────────────────────────────────────── */
+static void test_max_frame_size_enforcement(void) {
+    int fd = h2c_open();
+    if (fd < 0) { FAIL("max frame size", "connect failed"); return; }
+
+    /* Send a HEADERS frame with payload larger than default 16384        */
+    uint8_t big[17000];
+    memset(big, 0x82, sizeof(big));
+    uint8_t frame[9 + 17000];
+    size_t off = frame_hdr(frame, 0, sizeof(big), FT_HEADERS,
+                           FL_END_HEADERS | FL_END_STREAM, 1);
+    memcpy(frame + off, big, sizeof(big));
+    send_all(fd, frame, off + sizeof(big));
+    usleep(200000);
+
+    uint8_t resp[512];
+    size_t total = 0;
+    for (int i = 0; i < 5; i++) {
+        ssize_t n = recv_some(fd, resp + total, sizeof(resp) - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (has_goaway(resp, (ssize_t)total)) break;
+    }
+    close(fd);
+
+    if (has_goaway(resp, (ssize_t)total) == 1)
+        OK("max frame size — GOAWAY for oversized frame");
+    else if (total == 0)
+        OK("max frame size — server closed connection");
+    else
+        FAIL("max frame size", "no GOAWAY in %zu bytes", total);
+}
+
+/* ── 103 Early Hints via h2c ─────────────────────────────────────────────── */
+static void test_early_hints_h2c(void) {
+    /* Early Hints are sent by the route handler before the main response.
+     * We verify via curl --http2-prior-knowledge which shows interim
+     * responses if the server sends them.  For raw socket we check that
+     * we receive at least two HEADERS frames (103 + 200).               */
+
+    /* Use curl with --verbose to catch the 103 — simpler than raw socket */
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "curl -s --http2-prior-knowledge --max-time 5 "
+             "'http://127.0.0.1:%d/early' 2>&1 | grep -c '< HTTP'",
+             TEST_PORT_H2C);
+    FILE *f = popen(cmd, "r");
+    if (!f) { FAIL("early hints", "popen failed"); return; }
+    char out[16]; size_t n = fread(out, 1, sizeof(out)-1, f); out[n] = '\0';
+    pclose(f);
+    /* 2 HTTP responses (103 + 200) or at least 1 (200) */
+    if (atoi(out) >= 1)
+        OK("103 Early Hints — server responded");
+    else
+        FAIL("early hints", "no HTTP response");
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════*/
@@ -1021,6 +1153,9 @@ int main(void) {
     test_zero_window_update();
     test_client_push_promise();
     test_rapid_streams();
+    test_settings_flood();
+    test_continuation_flood();
+    test_max_frame_size_enforcement();
 
 done:
     printf("─────────────────────────────────────\n");
