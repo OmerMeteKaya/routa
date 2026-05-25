@@ -360,7 +360,9 @@ static int hpack_decode_int(const uint8_t *src, size_t src_len,
         if (i >= src_len) return -1;
         val += ((uint64_t)(src[i] & 0x7f)) << m;
         m += 7;
-        if (m > 63) return -1;   /* overflow guard */
+        if (m > 63) return -1;
+        /* Overflow guard: HPACK index cannot exceed 2^20 in practice    */
+        if (val > 0xFFFFF) return -1;
     } while (src[i++] & 0x80);
 
     *out = val;
@@ -696,6 +698,10 @@ int hpack_decode(hpack_ctx_t *ctx,
                 h->value = strdup(e->value);
             } else {
                 const char *name, *value;
+                /* Bounds check before dynamic table lookup              */
+                int dyn_idx = (int)idx - HPACK_STATIC_COUNT - 1;
+                if (dyn_idx < 0 || (size_t)dyn_idx >= ctx->table.count)
+                    goto fail;
                 if (dyntab_lookup(&ctx->table, (int)idx,
                                   &name, &value) < 0) goto fail;
                 h->name  = strdup(name);

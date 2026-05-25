@@ -1080,7 +1080,6 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     if ((stream_id & 1) == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
-    /* FIX: max_frame_size enforcement                                    */
     if (length > hc->peer_max_frame_size)
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
 
@@ -1089,6 +1088,7 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
         return 0;
     }
 
+    /* ── Strip padding and priority BEFORE creating the stream ────────── */
     const uint8_t *hdr_data = payload;
     uint32_t       hdr_len  = length;
 
@@ -1108,6 +1108,7 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
         hdr_len  -= 5;
     }
 
+    /* ── Now create stream — all frame-level validation passed ─────────── */
     h2_stream_t *s = stream_find(hc, stream_id);
     if (!s) {
         if (stream_id <= hc->last_stream_id)
@@ -1118,19 +1119,12 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
             return 0;
         }
         hc->last_stream_id = stream_id;
-        {
-            struct timespec _sts;
-            clock_gettime(CLOCK_MONOTONIC, &_sts);
-            hc->last_stream_ts = (uint64_t)_sts.tv_sec * 1000 +
-                                 (uint64_t)_sts.tv_nsec / 1000000;
-        }
     }
 
     if (buf_append(&s->header_block, hdr_data, hdr_len) < 0)
         if (s->header_block.len > 262144)  /* 256 KB CONTINUATION flood limit */
             return conn_error(hc, H2_ERR_ENHANCE_YOUR_CALM);
 
-    /* FIX: CONTINUATION flood — cap total header block size             */
     if (s->header_block.len > H2_MAX_CONTINUATION_BYTES)
         return conn_error(hc, H2_ERR_ENHANCE_YOUR_CALM);
 
@@ -1162,7 +1156,7 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
-        s->body.data = NULL; s->body.len = 0; s->body.cap = 0;
+        buf_reset(&s->body);
         write_window_update(&hc->write_buf, 0, (uint32_t)length);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
@@ -1223,9 +1217,7 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
         /* FIX: match handle_headers pending_data pattern                */
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
-        s->body.data = NULL;
-        s->body.len  = 0;
-        s->body.cap  = 0;
+        buf_reset(&s->body);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
             stream_remove(hc, stream_id);
@@ -1281,7 +1273,7 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
-        s->body.data = NULL; s->body.len = 0; s->body.cap = 0;
+        buf_reset(&s->body);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
             stream_remove(hc, stream_id);

@@ -34,7 +34,9 @@ static char *url_decode(const char *src, size_t len) {
     size_t i = 0, j = 0;
     while (i < len) {
         if (src[i] == '%' && i + 2 < len && is_hex(src[i+1]) && is_hex(src[i+2])) {
-            out[j++] = (char)((hex_val(src[i+1]) << 4) | hex_val(src[i+2]));
+            char c = (char)((hex_val(src[i+1]) << 4) | hex_val(src[i+2]));
+            if (c == '\0') { free(out); return NULL; }  /* reject %00 */
+            out[j++] = c;
             i += 3;
         } else if (src[i] == '+') {
             out[j++] = ' ';
@@ -145,6 +147,10 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
     /* path_len is bounded by rl_len which is bounded by buf->len — safe */
     char *raw_path = strndup(rl + path_start, path_len);
     if (!raw_path) { ret = -1; goto done; }
+    /* Reject null bytes in raw path */
+    if (memchr(raw_path, '\0', path_len) != NULL) {
+        free(raw_path); ret = -1; goto done;
+    }
 
     char *q = memchr(raw_path, '?', path_len);
     if (q) {
