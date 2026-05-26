@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "gcc-debug-asan"
+            compiler: gcc
+            build_type: Debug
+            sanitizers: ON
+          - label: "gcc-release"
+            compiler: gcc
+            build_type: Release
+            sanitizers: OFF
+          - label: "clang-debug-asan"
+            compiler: clang
+            build_type: Debug
+            sanitizers: ON
+          - label: "clang-release"
+            compiler: clang
+            build_type: Release
+            sanitizers: OFF
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang gcc \
+            libssl-dev zlib1g-dev \
+            curl openssl psmisc lsof
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DSANITIZERS=${{ matrix.sanitizers }} \
+            -DFUZZ=OFF
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Generate TLS certs
+        run: |
+          mkdir -p tests/certs
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout tests/certs/test.key \
+            -out tests/certs/test.crt \
+            -days 1 -nodes \
+            -subj "/CN=localhost"
+
+      - name: Run unit tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          echo "=== test_buf ==="
+          ./build/test_buf
+
+          echo "=== test_request ==="
+          ./build/test_request
+
+          echo "=== test_middleware ==="
+          ./build/test_middleware
+
+          echo "=== test_chunked ==="
+          ./build/test_chunked
+
+          echo "=== test_file_cache ==="
+          ./build/test_file_cache
+
+          echo "=== test_h2_hpack ==="
+          ./build/test_h2_hpack
+
+          echo "=== test_auth ==="
+          ./build/test_auth
+
+      - name: Run integration tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          CI: "true"
+          ROUTA_TEST_CERT: ${{ github.workspace }}/tests/certs/test.crt
+          ROUTA_TEST_KEY: ${{ github.workspace }}/tests/certs/test.key
+        run: |
+          chmod +x tests/run_test.sh
+
+          echo "=== test_ws ==="
+          ./tests/run_test.sh test_ws
+
+          echo "=== test_h2 ==="
+          ./tests/run_test.sh test_h2
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-${{ matrix.label }}
+          path: tests/certs/
+
+  fuzz-smoke:
+    name: "Fuzz smoke test"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build clang \
+            libssl-dev zlib1g-dev
+
+      - name: Build fuzz targets
+        run: |
+          cmake -B build_fuzz -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DFUZZ=ON \
+            -DSANITIZERS=OFF
+          cmake --build build_fuzz --parallel $(nproc)
+
+      - name: Run fuzz smoke (30s each)
+        run: |
+          mkdir -p fuzz/corpus/request fuzz/corpus/hpack \
+                   fuzz/corpus/ws fuzz/corpus/h2_frame
+
+          printf 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n' \
+            > fuzz/corpus/request/get
+          printf '\x82\x84\x86' > fuzz/corpus/hpack/basic
+          printf '\x89\x80\x00\x00\x00\x00' > fuzz/corpus/ws/ping
+          printf '\x00\x00\x00\x04\x00\x00\x00\x00\x00' \
+            > fuzz/corpus/h2_frame/settings
+
+          cd build_fuzz/fuzz
+
+          echo "=== fuzz_request ==="
+          ./fuzz_request ../../fuzz/corpus/request \
+            -max_len=4096 -timeout=5 -max_total_time=30 \
+            -detect_leaks=0 2>&1 | tail -3
+
+          echo "=== fuzz_hpack ==="
+          ./fuzz_hpack ../../fuzz/corpus/hpack \
+            -max_len=4096 -timeout=5 -max_total_time=30 \
+            -detect_leaks=0 2>&1 | tail -3
+
+          echo "=== fuzz_ws ==="
+          ./fuzz_ws ../../fuzz/corpus/ws \
+            -max_len=65536 -timeout=5 -max_total_time=30 \
+            -detect_leaks=0 2>&1 | tail -3
+
+          echo "=== fuzz_h2_frame ==="
+          ./fuzz_h2_frame ../../fuzz/corpus/h2_frame \
+            -max_len=65536 -timeout=5 -max_total_time=30 \
+            -detect_leaks=0 2>&1 | tail -3

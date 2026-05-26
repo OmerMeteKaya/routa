@@ -1113,7 +1113,7 @@ static void handle_events_worker(worker_t *w) {
         free(w->active_conns);
         return NULL;
     }
-
+#ifdef ROUTA_IO_URING
     /* ── io_uring worker ────────────────────────────────────────────────────────*/
 #if defined(__linux__) && defined(ROUTA_IO_URING)
 
@@ -1233,7 +1233,7 @@ static void handle_events_worker(worker_t *w) {
             if (conn->pending_io <= 0) { conn_remove(w, conn); conn_free(conn); }
             uring_udata_put(w->uring, ud); return;
         }
-
+#endif /* ROUTA_IO_URING */
         switch (ud->op) {
             case URING_OP_RECV:
                 if (res <= 0) { conn_close_uring(w, conn); break; }

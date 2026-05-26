@@ -36,7 +36,7 @@ struct worker {
     lb_t           *lb;
 
     /* io_uring (optional) */
-    uring_t        *uring;
+   // uring_t        *uring;
     uint8_t        *recv_bufs;
     uint8_t        *send_bufs;
 

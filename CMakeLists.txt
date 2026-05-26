@@ -41,7 +41,11 @@ add_library(routa_core STATIC ${ROUTA_SOURCES}
         include/http/ws_registry.h
         src/http/h2.c
         src/http/h2_hpack.c
-        include/http/h2.h)
+        include/http/h2.h
+        include/http/cookie.h
+        src/http/cookie.c
+        include/http/mw_auth.h
+        src/http/mw_auth.c)
 
 target_include_directories(routa_core PUBLIC include)
 
@@ -58,11 +62,14 @@ if(ROUTA_IO_URING)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR "io_uring is Linux-only")
     endif()
+    find_library(LIBURING_LIB uring REQUIRED)
     target_sources(routa_core PRIVATE src/net/uring.c)
-    target_compile_definitions(routa_core PRIVATE ROUTA_IO_URING=1)
     target_link_libraries(routa_core PRIVATE uring)
+    target_compile_definitions(routa_core PUBLIC ROUTA_IO_URING)
+    message(STATUS "io_uring: enabled")
+else()
+    message(STATUS "io_uring: disabled")
 endif()
-
 # ── Examples ─────────────────────────────────────────────────────────────────
 foreach(example hello_world config_example chunked_example ws_echo_server h2_test_server)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
@@ -73,7 +80,7 @@ foreach(example hello_world config_example chunked_example ws_echo_server h2_tes
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_h2_hpack test_h2)
+foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_h2_hpack test_h2 test_auth)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
         add_executable(${test} tests/${test}.c)
         target_link_libraries(${test} PRIVATE routa_core)
@@ -95,3 +102,7 @@ add_test(NAME test_file_cache    COMMAND test_file_cache)
 add_test(NAME test_ws    COMMAND test_ws)
 add_test(NAME test_h2_hpack    COMMAND test_h2_hpack)
 add_test(NAME test_h2    COMMAND test_h2)
+add_test(NAME test_auth    COMMAND test_auth)
+
+
+add_subdirectory(fuzz)
