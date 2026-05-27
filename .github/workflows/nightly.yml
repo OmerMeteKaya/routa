@@ -503,6 +503,26 @@ jobs:
           path: /tmp/bench_*.txt
 
   # ══════════════════════════════════════════════════════════════════════
+  # Dependency vulnerability scan — trivy (HIGH + CRITICAL)
+  # ══════════════════════════════════════════════════════════════════════
+  dependency-scan:
+    name: "Dependency scan (trivy)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+          format: 'table'
+          ignore-unfixed: true
+
+  # ══════════════════════════════════════════════════════════════════════
   # Nightly summary
   # ══════════════════════════════════════════════════════════════════════
   summary:
@@ -517,6 +537,7 @@ jobs:
       - fault-injection
       - fuzz-long
       - perf-regression
+      - dependency-scan
     if: always()
     steps:
       - name: Summary
@@ -532,3 +553,4 @@ jobs:
           echo "| Fault injection | ${{ needs.fault-injection.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Fuzz long | ${{ needs.fuzz-long.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Perf regression | ${{ needs.perf-regression.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency scan | ${{ needs.dependency-scan.result }} |" >> $GITHUB_STEP_SUMMARY

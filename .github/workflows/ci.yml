@@ -209,3 +209,84 @@ jobs:
         with:
           name: fuzz-crashes-ci
           path: build_fuzz/fuzz/crash-*
+
+  # ══════════════════════════════════════════════════════════════════════
+  # SAST — static analysis (cppcheck + clang-tidy), blocks on findings
+  # ══════════════════════════════════════════════════════════════════════
+  static-analysis:
+    name: "SAST (cppcheck + clang-tidy)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cppcheck clang-tidy cmake ninja-build \
+            libssl-dev zlib1g-dev
+
+      - name: Generate compile_commands.json
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DFUZZ=OFF -DSANITIZERS=OFF
+
+      - name: cppcheck
+        run: |
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --error-exitcode=1 \
+            --suppress=missingInclude \
+            --suppress=missingIncludeSystem \
+            --inline-suppr \
+            -Iinclude \
+            src/ \
+            2>&1 | tee cppcheck.txt
+          # Preserve exit code from cppcheck (tee swallows it)
+          exit "${PIPESTATUS[0]}"
+
+      - name: clang-tidy
+        run: |
+          # Run on all C sources tracked by compile_commands.json
+          SOURCES=$(find src -name '*.c' | sort)
+          FAILED=0
+          for f in $SOURCES; do
+            clang-tidy -p build \
+              --checks='-*,clang-analyzer-*,bugprone-*,cert-*' \
+              --warnings-as-errors='*' \
+              "$f" 2>&1 | tee -a clang-tidy.txt
+            RC=${PIPESTATUS[0]}
+            [ $RC -ne 0 ] && FAILED=$RC
+          done
+          exit $FAILED
+
+      - name: Upload SAST results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results
+          path: |
+            cppcheck.txt
+            clang-tidy.txt
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Secret scanning — gitleaks, runs on every push and PR
+  # ══════════════════════════════════════════════════════════════════════
+  secret-scan:
+    name: "Secret scanning (gitleaks)"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
