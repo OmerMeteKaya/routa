@@ -169,6 +169,75 @@ void tls_context_free(tls_context_t *ctx) {
     free(ctx);
 }
 
+/* ── tls_context_reload ────────────────────────────────────────────────────
+ * Atomically swaps the SSL_CTX with one loaded from new cert/key files.
+ * Caller must hold an exclusive write lock to prevent concurrent SSL_new()
+ * from racing the ctx pointer swap.
+ * Existing tls_conn_t objects are unaffected: each SSL* holds its own
+ * internal reference to the old SSL_CTX, which OpenSSL frees when the last
+ * SSL* referencing it is freed.                                              */
+
+int tls_context_reload(tls_context_t *tls_ctx,
+                       const char *cert_file, const char *key_file) {
+    if (!tls_ctx || !cert_file || !key_file) return -1;
+
+    SSL_CTX *new_ctx = SSL_CTX_new(TLS_server_method());
+    if (!new_ctx) { log_ssl_error("reload: SSL_CTX_new"); return -1; }
+
+    if (!SSL_CTX_set_min_proto_version(new_ctx, TLS1_3_VERSION) ||
+        !SSL_CTX_set_max_proto_version(new_ctx, TLS1_3_VERSION)) {
+        log_ssl_error("reload: set TLS version");
+        SSL_CTX_free(new_ctx);
+        return -1;
+    }
+
+    SSL_CTX_set_mode(new_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                               SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_num_tickets(new_ctx, 1);
+
+    if (SSL_CTX_use_certificate_file(new_ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
+        log_ssl_error("reload: load certificate");
+        SSL_CTX_free(new_ctx);
+        return -1;
+    }
+    if (SSL_CTX_use_PrivateKey_file(new_ctx, key_file, SSL_FILETYPE_PEM) <= 0) {
+        log_ssl_error("reload: load private key");
+        SSL_CTX_free(new_ctx);
+        return -1;
+    }
+    if (!SSL_CTX_check_private_key(new_ctx)) {
+        log_ssl_error("reload: check private key");
+        SSL_CTX_free(new_ctx);
+        return -1;
+    }
+
+    /* ALPN: prefer h2, fall back to http/1.1 */
+    SSL_CTX_set_alpn_select_cb(new_ctx, alpn_select_cb, NULL);
+
+    /* Update back-pointer so OCSP callback reaches tls_ctx */
+    SSL_CTX_set_app_data(new_ctx, tls_ctx);
+
+    /* Re-attach OCSP stapling callback if a response is loaded */
+    pthread_rwlock_rdlock(&tls_ctx->ocsp_lock);
+    int has_ocsp = (tls_ctx->ocsp_response != NULL);
+    pthread_rwlock_unlock(&tls_ctx->ocsp_lock);
+    if (has_ocsp) {
+        SSL_CTX_set_tlsext_status_cb(new_ctx,  ocsp_stapling_cb);
+        SSL_CTX_set_tlsext_status_arg(new_ctx, tls_ctx);
+    }
+
+    /* Swap — caller holds the exclusive lock, so no concurrent SSL_new() */
+    SSL_CTX *old_ctx = tls_ctx->ctx;
+    tls_ctx->ctx     = new_ctx;
+
+    /* SSL_CTX_free decrements the refcount; existing SSL* objects each hold
+     * their own reference and will keep old_ctx alive until freed.          */
+    SSL_CTX_free(old_ctx);
+
+    LOG_INFO("TLS context reloaded (cert: %s)", cert_file);
+    return 0;
+}
+
 /* ── tls_context_enable_session_cache ─────────────────────────────────────
  * TLS 1.3 doesn't use session IDs but keep this for forward compatibility
  * if someone re-enables 1.2 later.                                         */

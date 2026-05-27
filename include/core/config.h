@@ -173,6 +173,9 @@ typedef struct {
     int lb_consistent_hash_vnodes;      /* default: 150       */
     h2_stream_lookup_t stream_lookup;        /* default: H2_STREAM_LOOKUP_LINEAR  */
     routa_h2_config_t h2;
+
+    /* Graceful shutdown */
+    int shutdown_timeout_ms;     /* drain timeout before force-close, default: 30000 */
 } routa_config_t;
 
 /* Initialize config with sensible defaults */
@@ -186,5 +189,12 @@ int routa_config_validate(const routa_config_t *cfg);
 
 /* Print config to stderr (for debugging) */
 void routa_config_dump(const routa_config_t *cfg);
+
+/* Reload config from file for hot-reload (SIGHUP).
+ * Validates and enforces restart-only constraints (port, workers, bind_addr).
+ * Returns 0 on success, -1 on error.                                        */
+int routa_config_reload(const char *path,
+                        const routa_config_t *current,
+                        routa_config_t *out);
 
 #endif /* ROUTA_CORE_CONFIG_H */

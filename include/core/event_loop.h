@@ -2,6 +2,7 @@
 #define ROUTA_CORE_EVENT_LOOP_H
 
 #include <pthread.h>
+#include <signal.h>
 #include "core/conn.h"
 #include "http/router.h"
 #include "net/poller.h"
@@ -31,6 +32,14 @@ struct worker {
     router_t       *router;
     middleware_chain_t *chain;
     pthread_t       thread;
+
+    /* Identity & parent */
+    int             worker_id;
+    event_loop_t   *loop;            /* parent loop — read-only after init */
+
+    /* Graceful shutdown */
+    int             draining;
+    int             shutdown_timeout_ms;  /* ms to wait before force-close  */
 
     /* Load balancer — shared across workers, thread-safe internally */
     lb_t           *lb;
@@ -64,6 +73,21 @@ event_loop_t *event_loop_new(int port, int n_threads);
 void          event_loop_run(event_loop_t *loop);
 void          event_loop_stop(event_loop_t *loop);
 void          event_loop_free(event_loop_t *loop);
+
+/* Initiate graceful shutdown: stop accepting new connections, drain
+ * in-flight requests, then stop.  Falls back to force-close after
+ * shutdown_timeout_ms (configurable, default 30 s).                         */
+void          event_loop_drain_start(event_loop_t *loop);
+
+/* Register a SIGHUP reload flag and config path for hot-reload support.
+ * Worker 0 polls the flag each second and applies runtime-changeable
+ * config values (log_level, TLS cert/key) on each trigger.                  */
+void          event_loop_set_config_reload(event_loop_t *loop,
+                                           volatile sig_atomic_t *flag,
+                                           const char *path);
+
+/* Override the graceful-shutdown drain timeout (ms).  Call before run().    */
+void          event_loop_set_shutdown_timeout(event_loop_t *loop, int ms);
 int event_loop_broadcast(event_loop_t *loop,
                          const uint8_t *data, size_t len,
                          ws_opcode_t opcode);

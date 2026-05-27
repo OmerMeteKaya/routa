@@ -10,11 +10,20 @@
 #include <unistd.h>
 #include <string.h>
 
-static struct event_loop *g_loop = NULL;
+static struct event_loop  *g_loop        = NULL;
+static volatile sig_atomic_t g_reload_flag = 0;
+static char                g_config_path[512] = {0};
 
+/* SIGTERM / SIGINT — initiate graceful drain */
 static void signal_handler(int sig) {
     (void)sig;
-    if (g_loop) event_loop_stop(g_loop);
+    if (g_loop) event_loop_drain_start(g_loop);
+}
+
+/* SIGHUP — hot reload: set flag, worker 0 processes it asynchronously */
+static void sighup_handler(int sig) {
+    (void)sig;
+    g_reload_flag = 1;
 }
 
 /* ── server_new ─────────────────────────────────────────────────────────────*/
@@ -162,10 +171,22 @@ int server_lb_route(server_t *s, const char *path, int methods) {
 void server_run(server_t *s) {
     if (!s || !s->loop) return;
 
+    /* SIGTERM / SIGINT → graceful drain */
     struct sigaction sa = { .sa_handler = signal_handler, .sa_flags = 0 };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    /* SIGHUP → hot reload (worker 0 picks up g_reload_flag) */
+    struct sigaction sa_hup = { .sa_handler = sighup_handler, .sa_flags = 0 };
+    sigemptyset(&sa_hup.sa_mask);
+    sigaction(SIGHUP, &sa_hup, NULL);
+
+    /* Wire reload flag into event loop; path may be empty if server_new() was
+     * used directly — reload_flag is always registered so SIGHUP is handled  */
+    event_loop_set_config_reload((event_loop_t *)s->loop,
+                                 &g_reload_flag,
+                                 g_config_path[0] ? g_config_path : NULL);
 
     if (s->chain)
         event_loop_set_chain((event_loop_t *)s->loop, s->chain);
@@ -241,6 +262,11 @@ server_t *server_from_config_file(const char *path) {
     routa_config_t cfg;
     routa_config_init(&cfg);
     if (routa_config_load(&cfg, path) < 0) return NULL;
+
+    /* Store path so server_run() can wire SIGHUP hot-reload */
+    if (path)
+        strncpy(g_config_path, path, sizeof(g_config_path) - 1);
+
     return server_from_config(&cfg);
 }
 

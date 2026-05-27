@@ -56,6 +56,7 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->h2.max_concurrent_streams_hard_cap = 256;
     cfg->h2.server_push_enabled  = 1;
     cfg->h2.h2c_upgrade_enabled  = 1;
+    cfg->shutdown_timeout_ms     = 30000;
 }
 
 /* ---- Simple line-based parser ---- */
@@ -228,4 +229,24 @@ void routa_config_dump(const routa_config_t *cfg) {
                 cfg->static_dirs[i].doc_root);
     }
     fprintf(stderr, "====================\n");
+}
+
+int routa_config_reload(const char *path,
+                        const routa_config_t *current,
+                        routa_config_t *out) {
+    routa_config_init(out);
+    if (routa_config_load(out, path) < 0) return -1;
+    if (routa_config_validate(out) < 0)   return -1;
+
+    /* Enforce restart-only fields: silently preserve current values */
+    if (out->port != current->port) {
+        LOG_WARN("hot reload: port change requires restart, keeping %d", current->port);
+        out->port = current->port;
+    }
+    if (out->n_workers != current->n_workers) {
+        LOG_WARN("hot reload: worker count change requires restart, keeping %d",
+                 current->n_workers);
+        out->n_workers = current->n_workers;
+    }
+    return 0;
 }

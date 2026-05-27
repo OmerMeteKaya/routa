@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
+#include <signal.h>
 #include "net/uring.h"
 #include "http/ws.h"
 #include "http/ws_registry.h"
@@ -51,6 +52,18 @@ struct event_loop {
     lb_t          *lb;
     int            should_stop;
     routa_h2_config_t h2_cfg;
+
+    /* Graceful shutdown */
+    int            draining;
+    int            shutdown_timeout_ms;  /* default: 30000                  */
+
+    /* Hot reload (SIGHUP) — set via event_loop_set_config_reload()         */
+    volatile sig_atomic_t *reload_flag;
+    char           config_path[512];
+
+    /* Protects tls_ctx pointer during hot reload: readers (accept path)
+     * hold rdlock; reloader (worker 0) holds wrlock while swapping.        */
+    pthread_rwlock_t tls_reload_lock;
 };
 static int ws_route_placeholder(const http_request_t *req,
                                  http_response_t *resp, void *ctx) {
@@ -242,6 +255,9 @@ static void handle_events_worker(worker_t *w) {
 
         /* ── Accept ── */
         if (events[i].ptr == NULL) {
+            /* Refuse new connections during graceful drain */
+            if (w->draining) continue;
+
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
             int client_fd = accept(w->server_fd,
@@ -267,14 +283,20 @@ static void handle_events_worker(worker_t *w) {
                 conn_free(conn); net_close(client_fd); continue;
             }
 
-            if (w->tls_ctx) {
-                conn->tls = tls_conn_new(w->tls_ctx, client_fd);
-                if (!conn->tls) {
-                    LOG_ERROR("Failed to create TLS connection");
-                    conn_remove(w, conn); conn_free(conn); net_close(client_fd); continue;
-                }
-                conn->state = CONN_TLS_HANDSHAKE;
+            /* Use loop->tls_ctx under read-lock so hot-reload can safely
+             * swap the SSL_CTX pointer while workers are accepting.         */
+            pthread_rwlock_rdlock(&w->loop->tls_reload_lock);
+            tls_context_t *cur_tls = w->loop->tls_ctx;
+            if (cur_tls) {
+                conn->tls = tls_conn_new(cur_tls, client_fd);
             }
+            pthread_rwlock_unlock(&w->loop->tls_reload_lock);
+
+            if (cur_tls && !conn->tls) {
+                LOG_ERROR("Failed to create TLS connection");
+                conn_remove(w, conn); conn_free(conn); net_close(client_fd); continue;
+            }
+            if (conn->tls) conn->state = CONN_TLS_HANDSHAKE;
 
             if (poller_add(w->poller, client_fd, POLLER_READ | POLLER_ET, conn) < 0) {
                 LOG_ERROR("Failed to add client to poller");
@@ -1044,6 +1066,43 @@ static void handle_events_worker(worker_t *w) {
         }
     }
 
+    /* ── Hot-reload helper (runs only on worker 0) ─────────────────────────────*/
+    static void worker_apply_reload(worker_t *w) {
+        if (!w->loop || !w->loop->config_path[0]) {
+            LOG_WARN("hot reload: no config path stored, skipping");
+            return;
+        }
+
+        routa_config_t new_cfg;
+        /* current has port/workers preserved by routa_config_reload() */
+        routa_config_t current;
+        routa_config_init(&current);
+        current.port      = w->loop->port;
+        current.n_workers = w->loop->n_workers;
+
+        if (routa_config_reload(w->loop->config_path, &current, &new_cfg) < 0) {
+            LOG_ERROR("hot reload: config load/validate failed, ignoring SIGHUP");
+            return;
+        }
+
+        /* Apply log level — global, safe to call from any thread */
+        log_set_level((log_level_t)new_cfg.log_level);
+        LOG_INFO("hot reload: log_level -> %d", new_cfg.log_level);
+
+        /* Reload TLS cert/key if TLS is active and paths are provided */
+        if (w->loop->tls_ctx && new_cfg.tls_enabled &&
+            new_cfg.tls_cert[0] && new_cfg.tls_key[0]) {
+            pthread_rwlock_wrlock(&w->loop->tls_reload_lock);
+            int rc = tls_context_reload(w->loop->tls_ctx,
+                                        new_cfg.tls_cert, new_cfg.tls_key);
+            pthread_rwlock_unlock(&w->loop->tls_reload_lock);
+            if (rc < 0)
+                LOG_ERROR("hot reload: TLS reload failed, keeping old certificates");
+        }
+
+        LOG_INFO("hot reload complete");
+    }
+
     /* ── epoll worker thread ────────────────────────────────────────────────────*/
     static void *worker_run(void *arg) {
         worker_t *w = (worker_t *)arg;
@@ -1060,7 +1119,7 @@ static void handle_events_worker(worker_t *w) {
         if (poller_add(w->poller, w->server_fd, POLLER_READ, NULL) < 0) {
             net_close(w->server_fd); poller_free(w->poller); free(w->active_conns); return NULL;
         }
-        // WebSocket setup
+
         ws_registry_init(&w->ws_registry);
         ws_msg_queue_init(&w->ws_broadcast_queue);
         w->ws_notify_fd = ws_notify_fd_create();
@@ -1069,22 +1128,80 @@ static void handle_events_worker(worker_t *w) {
                        (void *)(uintptr_t)w->ws_notify_fd);
         }
 
-        // Ping sweep — monotonic tick
         uint64_t last_ping_sweep_ms = 0;
+        int      drain_init_done    = 0;
+        uint64_t drain_start_ms     = 0;
 
         while (!w->should_stop) {
             handle_events_worker(w);
 
-            // Periodic ping sweep (~1 s resolution)
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             uint64_t now_ms = (uint64_t)ts.tv_sec * 1000
                             + (uint64_t)ts.tv_nsec / 1000000;
+
+            /* ── Graceful drain ── */
+            if (w->draining && !drain_init_done) {
+                drain_init_done = 1;
+                drain_start_ms  = now_ms;
+                LOG_INFO("Worker %d: graceful drain started", w->worker_id);
+
+                /* Stop accepting new connections */
+                if (w->server_fd >= 0) {
+                    poller_del(w->poller, w->server_fd);
+                    net_close(w->server_fd);
+                    w->server_fd = -1;
+                }
+
+                /* Close connections that are idle (not mid-request) */
+                int ci = 0;
+                while (ci < w->active_conn_count) {
+                    conn_t *c = w->active_conns[ci];
+                    if (c->state == CONN_READING    ||
+                        c->state == CONN_KEEPALIVE  ||
+                        c->state == CONN_TLS_HANDSHAKE) {
+                        poller_del(w->poller, c->fd);
+                        /* swap-remove to avoid shifting the entire array */
+                        w->active_conns[ci] =
+                            w->active_conns[--w->active_conn_count];
+                        if (c->tls) tls_shutdown(c->tls);
+                        net_close(c->fd);
+                        conn_reset_write_state(c);
+                        conn_free(c);
+                        /* do not increment ci — check swapped-in element  */
+                    } else {
+                        ci++;
+                    }
+                }
+            }
+
+            if (w->draining && drain_init_done) {
+                if (w->active_conn_count == 0) {
+                    LOG_INFO("Worker %d: all connections drained, stopping",
+                             w->worker_id);
+                    w->should_stop = 1;
+                } else if (now_ms - drain_start_ms >=
+                           (uint64_t)w->shutdown_timeout_ms) {
+                    LOG_WARN("Worker %d: drain timeout (%d ms), "
+                             "force-closing %d connection(s)",
+                             w->worker_id, w->shutdown_timeout_ms,
+                             w->active_conn_count);
+                    w->should_stop = 1;
+                }
+            }
+
+            /* ── Hot reload (worker 0 only) ── */
+            if (w->worker_id == 0 && w->loop &&
+                w->loop->reload_flag && *w->loop->reload_flag) {
+                *w->loop->reload_flag = 0;
+                worker_apply_reload(w);
+            }
+
+            /* ── Periodic ping + H2 timeout sweep (~1 s) ── */
             if (now_ms - last_ping_sweep_ms >= 1000) {
                 ws_config_t default_cfg;
                 ws_config_init(&default_cfg);
                 ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
-                /* H2 idle timeout sweep */
                 for (int _i = 0; _i < w->active_conn_count; _i++) {
                     conn_t *_c = w->active_conns[_i];
                     if (_c->state != CONN_H2 || !_c->h2) continue;
@@ -1097,8 +1214,7 @@ static void handle_events_worker(worker_t *w) {
             }
         }
 
-        //while (!w->should_stop) handle_events_worker(w); WILL BE DELETED
-
+        /* Force-close any remaining connections */
         for (int i = 0; i < w->active_conn_count; i++) {
             conn_t *c = w->active_conns[i];
             poller_del(w->poller, c->fd);
@@ -1108,7 +1224,7 @@ static void handle_events_worker(worker_t *w) {
             net_close(c->fd);
             conn_free(c);
         }
-        net_close(w->server_fd);
+        if (w->server_fd >= 0) net_close(w->server_fd);
         poller_free(w->poller);
         free(w->active_conns);
         return NULL;
@@ -1316,15 +1432,19 @@ static void handle_events_worker(worker_t *w) {
         if (!loop) return;
         LOG_INFO("\nEvent loop started\n");
         for (int i = 0; i < loop->n_workers; i++) {
-            worker_t *w    = &loop->workers[i];
-            w->port        = loop->port;
-            w->max_connections = loop->max_connections;
-            w->tls_ctx     = loop->tls_ctx;
-            w->router      = g_router;
-            w->chain       = g_chain;
-            w->lb          = loop->lb;
-            w->should_stop = 0;
-            w->h2_cfg = loop->h2_cfg;
+            worker_t *w           = &loop->workers[i];
+            w->port               = loop->port;
+            w->max_connections    = loop->max_connections;
+            w->tls_ctx            = loop->tls_ctx;
+            w->router             = g_router;
+            w->chain              = g_chain;
+            w->lb                 = loop->lb;
+            w->should_stop        = 0;
+            w->draining           = 0;
+            w->worker_id          = i;
+            w->loop               = loop;
+            w->shutdown_timeout_ms = loop->shutdown_timeout_ms;
+            w->h2_cfg             = loop->h2_cfg;
 #if defined(__linux__) && defined(ROUTA_IO_URING)
             pthread_create(&w->thread, NULL, worker_run_uring, w);
 #else
@@ -1339,13 +1459,15 @@ static void handle_events_worker(worker_t *w) {
     event_loop_t *event_loop_new(int port, int n_threads) {
         event_loop_t *loop = calloc(1, sizeof(event_loop_t));
         if (!loop) { LOG_ERROR("Failed to allocate event loop"); return NULL; }
-        loop->port            = port;
-        loop->n_workers       = n_threads;
-        loop->max_connections = 10000;
-        loop->workers         = calloc((size_t)n_threads, sizeof(worker_t));
-        if (!loop->workers)   { free(loop); return NULL; }
+        loop->port                = port;
+        loop->n_workers           = n_threads;
+        loop->max_connections     = 10000;
+        loop->shutdown_timeout_ms = 30000;
+        loop->workers             = calloc((size_t)n_threads, sizeof(worker_t));
+        if (!loop->workers)       { free(loop); return NULL; }
         for (int i = 0; i < n_threads; i++)
             loop->workers[i].ws_notify_fd = -1;
+        pthread_rwlock_init(&loop->tls_reload_lock, NULL);
         return loop;
     }
 
@@ -1387,6 +1509,7 @@ static void handle_events_worker(worker_t *w) {
             g_ws_handlers      = NULL;
             g_ws_handler_count = 0;
         }
+        pthread_rwlock_destroy(&loop->tls_reload_lock);
         free(loop->workers);
         free(loop);
     }
@@ -1396,4 +1519,27 @@ static void handle_events_worker(worker_t *w) {
         loop->should_stop = 1;
         for (int i = 0; i < loop->n_workers; i++)
             loop->workers[i].should_stop = 1;
+    }
+
+    void event_loop_drain_start(event_loop_t *loop) {
+        if (!loop) return;
+        loop->draining = 1;
+        for (int i = 0; i < loop->n_workers; i++)
+            loop->workers[i].draining = 1;
+        LOG_INFO("Graceful shutdown initiated (timeout %d ms)",
+                 loop->shutdown_timeout_ms);
+    }
+
+    void event_loop_set_config_reload(event_loop_t *loop,
+                                      volatile sig_atomic_t *flag,
+                                      const char *path) {
+        if (!loop) return;
+        loop->reload_flag = flag;
+        if (path)
+            strncpy(loop->config_path, path, sizeof(loop->config_path) - 1);
+    }
+
+    void event_loop_set_shutdown_timeout(event_loop_t *loop, int ms) {
+        if (!loop || ms <= 0) return;
+        loop->shutdown_timeout_ms = ms;
     }

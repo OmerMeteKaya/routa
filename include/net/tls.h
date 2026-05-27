@@ -39,6 +39,14 @@ void tls_init(void);
 tls_context_t *tls_context_new(const char *cert_file, const char *key_file);
 void           tls_context_free(tls_context_t *ctx);
 
+/* Hot-reload TLS certificates without disrupting existing connections.
+ * Caller MUST hold an exclusive write lock before calling (e.g. a
+ * pthread_rwlock_t owned by the event loop) to prevent concurrent SSL_new()
+ * calls from racing with the SSL_CTX swap.
+ * Returns 0 on success, -1 on error (original ctx is left intact).         */
+int tls_context_reload(tls_context_t *ctx,
+                       const char *cert_file, const char *key_file);
+
 /* ── Session cache (TLS 1.2 session IDs, optional) ─────────────────────── */
 int tls_context_enable_session_cache(tls_context_t *ctx, int timeout_seconds);
 
