@@ -1,7 +1,9 @@
 //
 // Created by mete on 4.05.2026.
 //
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/mw_compress.h"
 #include "http/response.h"
 #include "http/request.h"
@@ -164,7 +166,7 @@ void mw_compress(middleware_chain_t *chain,
 
     /* Rewrite Content-Length */
     char len_str[32];
-    snprintf(len_str, sizeof(len_str), "%zu", comp_len);
+    (void)snprintf(len_str, sizeof(len_str), "%zu", comp_len);
     http_response_set_header(resp, "Content-Length", len_str);
 
     /* Vary header — required for correct proxy caching */

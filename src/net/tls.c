@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "net/tls.h"
 #include "util/logger.h"
 #include <openssl/err.h>
@@ -259,26 +261,26 @@ int tls_context_enable_ocsp_stapling(tls_context_t *ctx, const char *ocsp_file) 
     FILE *f = fopen(ocsp_file, "rb");
     if (!f) { LOG_ERROR("OCSP: cannot open %s", ocsp_file); return -1; }
 
-    fseek(f, 0, SEEK_END);
+    (void)fseek(f, 0, SEEK_END);
     long len = ftell(f);
-    rewind(f);
+    if (fseek(f, 0, SEEK_SET) != 0) { (void)fclose(f); return -1; }
 
     if (len <= 0 || len > 65536) {
         LOG_ERROR("OCSP: invalid file size %ld", len);
-        fclose(f);
+        (void)fclose(f);
         return -1;
     }
 
     unsigned char *buf = OPENSSL_malloc((size_t)len);
-    if (!buf) { fclose(f); return -1; }
+    if (!buf) { (void)fclose(f); return -1; }
 
     if ((long)fread(buf, 1, (size_t)len, f) != len) {
         LOG_ERROR("OCSP: read error");
         OPENSSL_free(buf);
-        fclose(f);
+        (void)fclose(f);
         return -1;
     }
-    fclose(f);
+    (void)fclose(f);
 
     /* Swap under write-lock — zero window for readers to see torn state */
     pthread_rwlock_wrlock(&ctx->ocsp_lock);

@@ -1,4 +1,3 @@
-// test_file_cache.c
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>

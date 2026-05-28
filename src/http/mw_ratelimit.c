@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/mw_ratelimit.h"
 #include "http/response.h"
 #include "util/logger.h"

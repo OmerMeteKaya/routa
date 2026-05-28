@@ -17,21 +17,20 @@ static int handle_hello(const http_request_t *req,
 }
 
 int main(void) {
-    server_t *s = server_new(8080, 12);
-
-    cors_config_t       *cors_cfg = mw_cors_config_new("*",
+    const char *workers_env = getenv("ROUTA_WORKERS");
+    int n_workers = workers_env ? (int)strtol(workers_env, NULL, 10) : 4;
+    if (n_workers < 1) n_workers = 1;
+    server_t *s = server_new(8080, n_workers);
+    cors_config_t *cors_cfg = mw_cors_config_new("*",
         "GET, POST, PUT, DELETE, OPTIONS",
         "Content-Type, Authorization");
-    rate_limit_config_t *rl_cfg   = mw_rate_limit_config_new(1999000, 2999000); // 1000 2000
-
+    rate_limit_config_t *rl_cfg = mw_rate_limit_config_new(1000, 2000); // Default : 1000/2000
     server_use(s, mw_logger,     NULL);
     server_use(s, mw_cors,       cors_cfg);
     server_use(s, mw_rate_limit, rl_cfg);
-
     server_route(s, "/api/hello", HTTP_GET_M | HTTP_HEAD_M | HTTP_OPTIONS_M,
                  handle_hello, NULL);
     server_static(s, "/", "./public", 1);
-
     server_run(s);
     server_free(s);
 

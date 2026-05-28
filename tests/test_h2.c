@@ -1,3 +1,4 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -384,10 +385,10 @@ static void test_multiplexing(void) {
     if (!f) { FAIL("multiplexing", "popen failed"); return; }
     char out[16]; size_t n = fread(out, 1, sizeof(out)-1, f); out[n] = '\0';
     pclose(f);
-    if (atoi(out) >= 2)
+    if ((int)strtol(out, NULL, 10) >= 2)
         OK("multiplexing — 2 responses on same connection");
     else
-        FAIL("multiplexing", "got %d responses want 2", atoi(out));
+        FAIL("multiplexing", "got %d responses want 2", (int)strtol(out, NULL, 10));
 }
 
 static void test_http_version(void) {
@@ -481,10 +482,10 @@ static void test_concurrent_streams(void) {
     if (!f) { FAIL("concurrent streams", "popen failed"); return; }
     char out[16]; size_t n = fread(out, 1, sizeof(out)-1, f); out[n] = '\0';
     pclose(f);
-    if (atoi(out) >= 10)
+    if ((int)strtol(out, NULL, 10) >= 10)
         OK("concurrent 10 streams — all responded");
     else
-        FAIL("concurrent streams", "got %d/10 responses", atoi(out));
+        FAIL("concurrent streams", "got %d/10 responses", (int)strtol(out, NULL, 10));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -971,10 +972,10 @@ static void test_rapid_streams(void) {
     char out[16]; size_t n = fread(out, 1, sizeof(out)-1, f); out[n] = '\0';
     pclose(f);
 
-    if (atoi(out) >= 20)
+    if ((int)strtol(out, NULL, 10) >= 20)
         OK("rapid open/close — 20 streams processed");
     else
-        FAIL("rapid streams", "got %d/20 responses", atoi(out));
+        FAIL("rapid streams", "got %d/20 responses", (int)strtol(out, NULL, 10));
 }
 
 /* ── h2c Upgrade (HTTP/1.1 → h2c) ──────────────────────────────────────── */
@@ -1176,7 +1177,7 @@ static void test_early_hints_h2c(void) {
     char out[16]; size_t n = fread(out, 1, sizeof(out)-1, f); out[n] = '\0';
     pclose(f);
     /* 2 HTTP responses (103 + 200) or at least 1 (200) */
-    if (atoi(out) >= 1)
+    if ((int)strtol(out, NULL, 10) >= 1)
         OK("103 Early Hints — server responded");
     else
         FAIL("early hints", "no HTTP response");
@@ -1310,3 +1311,4 @@ done:
 
     return g_fail > 0 ? 1 : 0;
 }
+#endif

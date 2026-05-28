@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "lb/upstream.h"
 #include "util/logger.h"
 #include <stdlib.h>
@@ -44,7 +46,7 @@ static int node_connect(upstream_node_t *node, int timeout_ms) {
     /* Wait for connect to complete */
     struct timeval tv = {
         .tv_sec  =  timeout_ms / 1000,
-        .tv_usec = (timeout_ms % 1000) * 1000,
+        .tv_usec = (long)((timeout_ms % 1000) * 1000),
     };
     fd_set wfds;
     FD_ZERO(&wfds);
@@ -293,8 +295,7 @@ static int probe_node(upstream_node_t *node) {
 
     /* Expect "HTTP/1.x 2xx" */
     if (strncmp(resp, "HTTP/1.", 7) != 0) return 0;
-    int status = 0;
-    sscanf(resp + 9, "%d", &status);
+    int status = (int)strtol(resp + 9, NULL, 10);
     if (status < 200 || status >= 300) return 0;
 
     if (hc->type == HC_CUSTOM) {
@@ -382,13 +383,13 @@ void upstream_pool_free(upstream_pool_t *pool) {
         pthread_spin_destroy(&n->state_lock);
         free(n);
     }
-    free(pool->nodes);
-    free(pool->hash_ring);
+    free((void *)pool->nodes);
+    free((void *)pool->hash_ring);
     free(pool);
 }
 
 int upstream_pool_add_node(upstream_pool_t *pool, upstream_node_t *node) {
-    upstream_node_t **tmp = realloc(pool->nodes,
+    upstream_node_t **tmp = (upstream_node_t **)realloc((void *)pool->nodes,
         (size_t)(pool->node_count + 1) * sizeof(upstream_node_t *));
     if (!tmp) return -1;
     pool->nodes = tmp;

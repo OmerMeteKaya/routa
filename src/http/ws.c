@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/ws.h"
 #include "http/request.h"
 #include "core/conn.h"
@@ -31,8 +33,8 @@ void ws_config_init(ws_config_t *cfg) {
     cfg->max_connections        = 10000;
     cfg->handshake_timeout_ms   = 5000;
     cfg->idle_timeout_ms        = 0;
-    cfg->max_frame_size         = 16 * 1024 * 1024;   /* 16 MB             */
-    cfg->max_message_size       = 64 * 1024 * 1024;   /* 64 MB             */
+    cfg->max_frame_size         = (size_t)16 * 1024 * 1024;   /* 16 MB             */
+    cfg->max_message_size       = (size_t)64 * 1024 * 1024;   /* 64 MB             */
     cfg->ping_interval_ms       = 30000;
     cfg->ping_timeout_ms        = 10000;
     cfg->max_ping_misses        = 3;
@@ -131,7 +133,7 @@ static int pmd_negotiate(const char *ext_header,
 /* Build the response extension header value for permessage-deflate.       */
 static void pmd_response_header(char *out, size_t cap,
                                  int server_no_ctx, int client_no_ctx) {
-    snprintf(out, cap, "permessage-deflate%s%s",
+    (void)snprintf(out, cap, "permessage-deflate%s%s",
              server_no_ctx ? "; server_no_context_takeover" : "",
              client_no_ctx ? "; client_no_context_takeover" : "");
 }
@@ -392,7 +394,7 @@ int ws_close(conn_t *conn, ws_close_code_t code, const char *reason) {
     payload[0] = (uint8_t)((code >> 8) & 0xFF);
     payload[1] = (uint8_t)(code & 0xFF);
     if (reason_len > 0)
-        memcpy(payload + 2, reason, reason_len);
+        memcpy(payload + 2, reason, reason_len);  // NOLINT(bugprone-not-null-terminated-result)
 
     conn->ws_state = WS_STATE_CLOSING;
     return ws_send(conn, payload, payload_len, WS_OP_CLOSE);
@@ -449,7 +451,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
             if      (raw_len == 126) extra += 2;
             else if (raw_len == 127) extra += 8;
 
-            if (rb->len < (size_t)(2 + extra)) return 0; /* wait for more  */
+            if (rb->len < (size_t)2 + (size_t)extra) return 0; /* wait for more  */
 
             /* Read extended length */
             const uint8_t *p = (uint8_t *)rb->data + 2;
@@ -490,7 +492,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
                                fs->opcode == WS_OP_CLOSE);
                 if (is_ctrl) {
                     if (fs->opcode == WS_OP_PING) {
-                        int r = ws_pong(conn, NULL, 0);
+                        (void)ws_pong(conn, NULL, 0);
                     } else if (fs->opcode == WS_OP_PONG) {
                         conn->ws_ping_misses = 0;
                     } else if (fs->opcode == WS_OP_CLOSE) {
@@ -542,7 +544,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
                 if (to_read < (size_t)fs->payload_len) return 0;
 
                 if (fs->opcode == WS_OP_PING) {
-                    int r = ws_pong(conn, payload_ptr, (size_t)fs->payload_len);
+                    (void)ws_pong(conn, payload_ptr, (size_t)fs->payload_len);
                 } else if (fs->opcode == WS_OP_PONG) {
                     conn->ws_ping_misses = 0;   /* reset miss counter      */
 

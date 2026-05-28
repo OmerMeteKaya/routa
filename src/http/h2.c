@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/h2.h"
 #include "http/router.h"
 #include "http/middleware.h"
@@ -24,7 +26,7 @@ static const uint8_t H2_CLIENT_PREFACE[] =
 #define H2_DEFAULT_WINDOW 65535
 
 /* ── Flood / hardening limits ────────────────────────────────────────────── */
-#define H2_MAX_CONTINUATION_BYTES  (256 * 1024)   /* 256 KB per header block */
+#define H2_MAX_CONTINUATION_BYTES  ((size_t)256 * 1024)   /* 256 KB per header block */
 #define H2_MAX_SETTINGS_BURST      200            /* SETTINGS frames per conn */
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -82,11 +84,11 @@ static void pool_remove(h2_stream_pool_t *p, uint32_t id) {
 static int map_init(h2_stream_map_t *m, int capacity) {
     m->capacity = capacity;
     m->count    = 0;
-    m->buckets  = calloc((size_t)capacity, sizeof(h2_stream_t *));
-    m->keys     = calloc((size_t)capacity, sizeof(uint32_t));
+    m->buckets  = (h2_stream_t **)calloc((size_t)capacity, sizeof(h2_stream_t *));
+    m->keys     = (uint32_t *)calloc((size_t)capacity, sizeof(uint32_t));
     if (!m->buckets || !m->keys) {
-        free(m->buckets);
-        free(m->keys);
+        free((void *)m->buckets);
+        free((void *)m->keys);
         return -1;
     }
     return 0;
@@ -106,8 +108,8 @@ static void map_free_entries(h2_stream_map_t *m) {
             free(m->buckets[i]);
         }
     }
-    free(m->buckets);
-    free(m->keys);
+    free((void *)m->buckets);
+    free((void *)m->keys);
     m->buckets  = NULL;
     m->keys     = NULL;
     m->capacity = 0;
@@ -566,9 +568,11 @@ static int handle_settings(h2_conn_t *hc,
                 return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
             hc->peer_max_frame_size = val;
             break;
-        case H2_SETTINGS_MAX_HEADER_LIST_SIZE:
+        case H2_SETTINGS_MAX_HEADER_LIST_SIZE:  // NOLINT(bugprone-branch-clone)
+            /* not used */
             break;
         default:
+            /* unknown settings are ignored */
             break;
         }
     }
@@ -727,6 +731,8 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
             else req->method = HTTP_METHOD_UNKNOWN;
         } else if (strcmp(name, ":path") == 0) {
             const char *q = strchr(value, '?');
+            free(req->path);
+            free(req->query);
             if (q) {
                 req->path  = strndup(value, (size_t)(q - value));
                 req->query = strdup(q + 1);
@@ -734,16 +740,24 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
                 req->path  = strdup(value);
                 req->query = NULL;
             }
-        } else if (strcmp(name, ":authority") == 0) {
+        } else if (strcmp(name, ":authority") == 0) {  // NOLINT(bugprone-branch-clone)
+            /* handled elsewhere */
         } else if (strcmp(name, "content-length") == 0) {
+            /* handled elsewhere */
         }
 
         if (req->header_count < 64) {
             req->headers[req->header_count].key   = strdup(name);
             req->headers[req->header_count].value = strdup(value);
             if (req->headers[req->header_count].key &&
-                req->headers[req->header_count].value)
+                req->headers[req->header_count].value) {
                 req->header_count++;
+                } else {
+                    free(req->headers[req->header_count].key);
+                    free(req->headers[req->header_count].value);
+                    req->headers[req->header_count].key   = NULL;
+                    req->headers[req->header_count].value = NULL;
+                }
         }
     }
     if (!req->path) req->path = strdup("/");
@@ -762,7 +776,7 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
 static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                           http_response_t *resp) {
     char status_str[4];
-    snprintf(status_str, sizeof(status_str), "%d", resp->status);
+    (void)snprintf(status_str, sizeof(status_str), "%d", resp->status);
 
     int max_h = resp->header_count + 3;
     hpack_header_t *enc_headers = calloc((size_t)max_h,
@@ -776,7 +790,7 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
 
     char cl_val[32];
     if (resp->body_len > 0) {
-        snprintf(cl_val, sizeof(cl_val), "%zu", resp->body_len);
+        (void)snprintf(cl_val, sizeof(cl_val), "%zu", resp->body_len);
         enc_headers[nhdr].name  = "content-length";
         enc_headers[nhdr].value = cl_val;
         nhdr++;
@@ -1552,4 +1566,3 @@ int h2_conn_check_timeouts(h2_conn_t *hc, uint64_t now_ms) {
 
     return 0;
 }
-

@@ -1,4 +1,5 @@
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #include "core/event_loop.h"
 #include "core/config.h"
@@ -73,3 +74,4 @@ int main(void) {
     event_loop_free(loop);
     return 0;
 }
+#endif

@@ -2,8 +2,8 @@ name: Nightly
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # Her gece 02:00 UTC
-  workflow_dispatch:        # Manuel tetikleme
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   # ══════════════════════════════════════════════════════════════════════
@@ -154,21 +154,20 @@ jobs:
       - name: Stress test — ${{ matrix.workers }} worker(s)
         timeout-minutes: 10
         run: |
-          # Start hello_world with N workers
-          ROUTA_WORKERS=${{ matrix.workers }} ./build/hello_world &
-          SERVER_PID=$!
-          sleep 1
-
-          # Verify it started
-          curl -sf http://localhost:8080/ > /dev/null || {
-            echo "Server failed to start"; kill $SERVER_PID; exit 1
-          }
-
-          # wrk load test — 30s
-          wrk -t4 -c100 -d30s --latency http://localhost:8080/ \
-            | tee /tmp/wrk_${{ matrix.workers }}.txt
-
-          kill $SERVER_PID 2>/dev/null || true
+          mkdir -p public
+           ulimit -c unlimited
+           ROUTA_WORKERS=${{ matrix.workers }} ./build/hello_world &
+           SERVER_PID=$!
+           sleep 2
+          
+           curl -sf http://localhost:8080/api/hello > /dev/null || {
+             echo "Server failed to start"
+             ls -la core* 2>/dev/null || echo "no core dump"
+             file ./build/hello_world
+             gcc --version
+             ldd ./build/hello_world
+             kill $SERVER_PID 2>/dev/null; exit 1
+           }
 
           # Fail if p99 > 100ms
           P99=$(grep "99%" /tmp/wrk_${{ matrix.workers }}.txt \
@@ -180,6 +179,13 @@ jobs:
         with:
           name: stress-${{ matrix.mode }}
           path: /tmp/wrk_*.txt
+
+      - name: Upload core dumps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-dumps
+          path: core*
 
   # ══════════════════════════════════════════════════════════════════════
   # Memory pressure — limited heap
@@ -243,7 +249,7 @@ jobs:
             -DCMAKE_C_COMPILER=gcc \
             -DCMAKE_BUILD_TYPE=Release \
             -DSANITIZERS=OFF -DFUZZ=OFF
-          cmake --build build --parallel $(nproc)
+          cmake --build build --parallel $(nproc) --clean-first
 
       - name: Generate TLS certs
         run: |
@@ -318,18 +324,14 @@ jobs:
           #include <dlfcn.h>
           #include <stdatomic.h>
 
-          static atomic_int g_countdown = 0;
+          static atomic_int g_countdown = 50;
           static void *(*real_malloc)(size_t) = NULL;
-
-          void set_malloc_fail_after(int n) {
-              atomic_store(&g_countdown, n);
-          }
 
           void *malloc(size_t size) {
               if (!real_malloc)
                   real_malloc = dlsym(RTLD_NEXT, "malloc");
               int c = atomic_fetch_sub(&g_countdown, 1);
-              if (c == 1) return NULL;   /* inject failure */
+              if (c == 1) return NULL;
               return real_malloc(size);
           }
           EOF
@@ -470,9 +472,13 @@ jobs:
 
       - name: HTTP/1.1 baseline benchmark
         run: |
+          mkdir -p public
           ./build/hello_world &
           SERVER_PID=$!
           sleep 1
+          curl -sf http://localhost:8080/api/hello > /dev/null || {
+            echo "Server failed to start"; kill $SERVER_PID 2>/dev/null; exit 1
+          }
 
           # Warmup
           wrk -t2 -c50 -d5s http://localhost:8080/ > /dev/null

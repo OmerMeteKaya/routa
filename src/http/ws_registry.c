@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/ws_registry.h"
 #include "http/ws.h"
 #include "core/conn.h"

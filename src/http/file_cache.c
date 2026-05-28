@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/file_cache.h"
 #include "util/logger.h"
 #include <stdlib.h>
@@ -119,7 +121,7 @@ static int entry_valid(tl_slot_t *slot, time_t now) {
     }
 
     /* INOTIFY fallback: TTL x10 */
-    return (now - slot->entry.cached_at) < (ttl * 10);
+    return (now - slot->entry.cached_at) < ((time_t)ttl * 10);
 }
 
 /* ── Public API ─────────────────────────────────────────────────────────── */

@@ -1,5 +1,7 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
-#if defined(__linux__)
+#endif
+#if defined(__linux__) && defined(ROUTA_IO_URING)
 #include "net/uring.h"
 #include <stdlib.h>
 #include <string.h>

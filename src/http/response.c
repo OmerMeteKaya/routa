@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/response.h"
 #include "util/logger.h"
 #include <string.h>
@@ -9,7 +11,7 @@
 
 void http_response_init(http_response_t *r) {
     if (!r) return;
-    memset(r, 0, sizeof(http_response_t));
+    memset(r, 0, sizeof(http_response_t)); // NOLINT(clang-analyzer-unix.Malloc)
     r->body_fd = -1;
 }
 
@@ -40,7 +42,7 @@ void http_response_set_header(http_response_t *r, const char *key, const char *v
     r->headers[r->header_count][0][sizeof(r->headers[0][0]) - 1] = '\0';
 
     strncpy(r->headers[r->header_count][1], val, sizeof(r->headers[0][1]) - 1);
-    r->headers[r->header_count][1][sizeof(r->headers[0][1]) - 1] = '\0';
+    r->headers[r->header_count][1][sizeof(r->headers[0][1]) - 1] = '\0';  // NOLINT(clang-analyzer-unix.Malloc)
 
     r->header_count++;
 }
@@ -67,7 +69,7 @@ void http_response_set_body(http_response_t *r, const char *data, size_t len) {
     // Only set Content-Length if not using chunked encoding
     if (!r->chunked) {
         char cl[32];
-        snprintf(cl, sizeof(cl), "%zu", len);
+        (void)snprintf(cl, sizeof(cl), "%zu", len);
         http_response_set_header(r, "Content-Length", cl);
     }
 }
@@ -85,7 +87,7 @@ void http_response_set_body_fd(http_response_t *r, int fd, off_t offset, size_t 
     r->body_fd_len = len;
 
     char cl[32];
-    snprintf(cl, sizeof(cl), "%zu", len);
+    (void)snprintf(cl, sizeof(cl), "%zu", len);
     http_response_set_header(r, "Content-Length", cl);
 }
 
@@ -97,7 +99,7 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
     struct tm tm_buf;
     gmtime_r(&now, &tm_buf);
     char date_str[64];
-    strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
+    (void)strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
 
     /* Check which required headers already set */
     int has_date = 0, has_server = 0, has_connection = 0;

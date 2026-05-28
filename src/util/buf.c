@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "util/buf.h"
 #include "util/logger.h"
 #include <string.h>

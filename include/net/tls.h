@@ -8,13 +8,6 @@
 #include <pthread.h>
 #include "util/buf.h"
 
-/* ── Session Ticket Encryption Key (STEK) ─────────────────────────────────
- * One STEK lives in tls_context_t and is shared across all workers via the
- * same SSL_CTX pointer.  Rotate with tls_context_rotate_stek() periodically
- * (e.g. every 6-24 h).  Forward-secrecy: old sessions cannot be decrypted
- * after rotation.
- * -------------------------------------------------------------------------*/
-
 /* ── Context ───────────────────────────────────────────────────────────────*/
 typedef struct {
     SSL_CTX        *ctx;

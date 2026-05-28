@@ -1,3 +1,4 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #include "http/request.h"
 #include "util/buf.h"
@@ -614,3 +615,4 @@ int main(void) {
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;
 }
+#endif

@@ -525,7 +525,7 @@ static int dyntab_add(hpack_dynamic_table_t *t,
                                      new_cap * sizeof(hpack_entry_t));
         if (!nb) return -1;
         /* Linearize ring on grow */
-        if (t->head != 0) {
+        if (t->head != 0 && t->count > 0) {
             hpack_entry_t *tmp = malloc(t->count * sizeof(hpack_entry_t));
             if (!tmp) { free(nb); return -1; }
             for (size_t i = 0; i < t->count; i++)
@@ -589,7 +589,7 @@ static int decode_string(const uint8_t *src, size_t src_len, char **out) {
     if (is_huffman) {
         /* Huffman expands at most 8/5 — safe upper bound                 */
         size_t   cap = (size_t)slen * 2 + 16;
-        if (cap > HPACK_MAX_STRING_LEN * 2) cap = HPACK_MAX_STRING_LEN * 2;
+        if (cap > (size_t)HPACK_MAX_STRING_LEN * 2) cap = (size_t)HPACK_MAX_STRING_LEN * 2;
         char    *tmp = malloc(cap);
         if (!tmp) return -1;
         int n = huffman_decode(data, (size_t)slen, tmp, cap);
@@ -623,7 +623,7 @@ static int encode_string(uint8_t *dst, size_t dst_len,
         if (hn > 0 && (size_t)hn < str_len) {
             /* Huffman is shorter — use it */
             int hdr = hpack_encode_int(dst, dst_len, 0x80, 7, (uint64_t)hn);
-            if (hdr < 0 || (size_t)(hdr + hn) > dst_len) return -1;
+            if (hdr < 0 || (size_t)hdr + (size_t)hn > dst_len) return -1;
             memcpy(dst + hdr, tmp, (size_t)hn);
             return hdr + hn;
         }
@@ -632,7 +632,7 @@ static int encode_string(uint8_t *dst, size_t dst_len,
     /* Literal */
     int hdr = hpack_encode_int(dst, dst_len, 0x00, 7, str_len);
     if (hdr < 0 || (size_t)hdr + str_len > dst_len) return -1;
-    memcpy(dst + hdr, str, str_len);
+    memcpy(dst + hdr, str, str_len);  // NOLINT(bugprone-not-null-terminated-result)
     return hdr + (int)str_len;
 }
 
@@ -738,10 +738,8 @@ int hpack_decode(hpack_ctx_t *ctx,
 
         if ((first & 0xc0) == 0x40) {
             incremental = 1; prefix_bits = 6;
-        } else if ((first & 0xf0) == 0x00) {
-            prefix_bits = 4;
-        } else if ((first & 0xf0) == 0x10) {
-            prefix_bits = 4;
+        } else if ((first & 0xf0) == 0x00 || (first & 0xf0) == 0x10) {
+            prefix_bits = 4;  /* both literal without and never indexed use 4-bit prefix */
         } else {
             goto fail;
         }

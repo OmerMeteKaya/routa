@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -86,7 +88,7 @@ static int serialize_headers_only(const http_response_t *r, buf_t *hdr_buf) {
     struct tm tm_buf;
     gmtime_r(&now, &tm_buf);
     char date_str[64];
-    strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
+    (void)strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
 
     /* Presence flags */
     int has_date = 0, has_server = 0, has_connection = 0;

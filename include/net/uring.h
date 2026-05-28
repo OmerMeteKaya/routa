@@ -1,7 +1,8 @@
 #ifndef ROUTA_NET_URING_H
 #define ROUTA_NET_URING_H
 
-#ifdef ROUTA_IO_URING
+#pragma once
+#if defined(ROUTA_IO_URING) && defined(__linux__)
 #include <liburing.h>
 
 typedef enum {
@@ -48,5 +49,6 @@ int uring_wait(uring_t *u, uring_cqe_cb_t cb, void *arg);
 uring_udata_t *uring_udata_get(uring_t *u);
 void           uring_udata_put(uring_t *u, uring_udata_t *ud);
 
-#endif /* ROUTA_IO_URING */
+//#endif /* ROUTA_IO_URING */
+#endif
 #endif /* ROUTA_NET_URING_H */

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/request.h"
 #include "util/logger.h"
 #include <string.h>
@@ -31,6 +33,7 @@ static int hex_val(char c) {
 static char *url_decode(const char *src, size_t len) {
     char *out = malloc(len + 1);
     if (!out) return NULL;
+    out[len] = '\0';
     size_t i = 0, j = 0;
     while (i < len) {
         if (src[i] == '%' && i + 2 < len && is_hex(src[i+1]) && is_hex(src[i+2])) {
@@ -50,9 +53,11 @@ static char *url_decode(const char *src, size_t len) {
 }
 
 static char *normalize_path(const char *path) {
+
     size_t len = strlen(path);
     char *out = malloc(len + 2);
     if (!out) return NULL;
+    out[0] = '\0';
     size_t i = 0, j = 0;
     if (path[0] != '/') out[j++] = '/';
     while (i < len) {
@@ -78,7 +83,7 @@ static char *normalize_path(const char *path) {
 }
 
 /* Find next \r\n-terminated line inside [start, end). */
-static char *find_next_line(char *start, char *end, char **line_end) {
+static char *find_next_line(char *start,const char *end, char **line_end) {
     for (char *p = start; p + 1 <= end; p++) {
         if (p[0] == '\r' && p[1] == '\n') {
             *line_end = p;
@@ -208,8 +213,8 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
     /* version string is null-terminated because data is null-terminated */
     char *dot = strchr(rl + vs, '.');
     if (!dot || dot >= rl_end) { ret = -1; goto done; }
-    req->version_major = atoi(rl + vs);
-    req->version_minor = atoi(dot + 1);
+    req->version_major = (int)strtol(rl + vs, NULL, 10);
+    req->version_minor = (int)strtol(dot + 1, NULL, 10);
 
     /* ---- headers ---- */
     char *hp = rl_end + 2; /* skip first \r\n */

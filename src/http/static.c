@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/static.h"
 #include "http/response.h"
 #include "util/logger.h"
@@ -47,7 +49,7 @@ static int resolve_path(const http_request_t *req,
                         struct stat *st)
 {
     size_t      prefix_len = strlen(cfg->url_prefix);
-    const char *req_path   = req->path;
+    const char *req_path;
 
     if (prefix_len == 1 && cfg->url_prefix[0] == '/') {
         req_path = req->path + 1;
@@ -63,7 +65,7 @@ static int resolve_path(const http_request_t *req,
     }
 
     char full_path[1024];
-    snprintf(full_path, sizeof(full_path), "%s/%s", cfg->doc_root, req_path);
+    (void)snprintf(full_path, sizeof(full_path), "%s/%s", cfg->doc_root, req_path);
 
     if (!realpath(full_path, resolved)) return 404;
 
@@ -78,7 +80,7 @@ static int resolve_path(const http_request_t *req,
     if (S_ISDIR(st->st_mode)) {
         if (!cfg->enable_index) return 403;
         char idx[1024];
-        snprintf(idx, sizeof(idx), "%.1000s/index.html", resolved);
+        (void)snprintf(idx, sizeof(idx), "%.1000s/index.html", resolved);
         if (stat(idx, st) != 0 || !S_ISREG(st->st_mode)) return 403;
         strncpy(resolved, idx, resolved_sz - 1);
         resolved[resolved_sz - 1] = '\0';
@@ -134,18 +136,18 @@ int static_serve(const http_request_t *req, http_response_t *resp,
         }
 
         /* Build ETag and Last-Modified */
-        snprintf(etag, sizeof(etag), "\"%lx-%lx\"",
+        (void)snprintf(etag, sizeof(etag), "\"%lx-%lx\"",
                  (unsigned long)st.st_mtime, (unsigned long)st.st_size);
         struct tm tm_buf;
         gmtime_r(&st.st_mtime, &tm_buf);
-        strftime(last_modified, sizeof(last_modified),
+        (void)strftime(last_modified, sizeof(last_modified),
                  "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
 
         mime = get_mime_type(resolved);
 
         /* ── mmap small files and cache the pointer ── */
         if ((size_t)st.st_size > 0 &&
-            (size_t)st.st_size < FILE_CACHE_MMAP_THRESHOLD) {
+            (size_t)st.st_size < (size_t)FILE_CACHE_MMAP_THRESHOLD) {
 
             int fd = open(resolved, O_RDONLY);
             if (fd >= 0) {
@@ -195,8 +197,8 @@ int static_serve(const http_request_t *req, http_response_t *resp,
         const char *dash = strchr(spec, '-');
         if (dash) {
             long long first = -1, last = -1;
-            if (dash != spec)        first = atoll(spec);
-            if (*(dash + 1) != '\0') last  = atoll(dash + 1);
+            if (dash != spec)        first = strtoll(spec, NULL, 10);
+            if (*(dash + 1) != '\0') last  = strtoll(dash + 1, NULL, 10);
 
             if (first < 0 && last > 0) {
                 first = (long long)st.st_size - last;
@@ -213,7 +215,7 @@ int static_serve(const http_request_t *req, http_response_t *resp,
                 is_range    = 1;
             } else {
                 char cr[64];
-                snprintf(cr, sizeof(cr), "bytes */%lld", (long long)st.st_size);
+                (void)snprintf(cr, sizeof(cr), "bytes */%lld", (long long)st.st_size);
                 http_response_set_status(resp, 416, "Range Not Satisfiable");
                 http_response_set_header(resp, "Content-Range", cr);
                 return 0;
@@ -230,7 +232,7 @@ int static_serve(const http_request_t *req, http_response_t *resp,
     if (is_range) {
         http_response_set_status(resp, 206, "Partial Content");
         char cr[128];
-        snprintf(cr, sizeof(cr), "bytes %lld-%lld/%lld",
+        (void)snprintf(cr, sizeof(cr), "bytes %lld-%lld/%lld",
                  (long long)range_start,
                  (long long)(range_start + (off_t)range_len - 1),
                  (long long)st.st_size);
@@ -242,7 +244,7 @@ int static_serve(const http_request_t *req, http_response_t *resp,
     /* ── HEAD: no body ── */
     if (req->method == HTTP_HEAD) {
         char len_str[32];
-        snprintf(len_str, sizeof(len_str), "%zu", range_len);
+        (void)snprintf(len_str, sizeof(len_str), "%zu", range_len);
         http_response_set_header(resp, "Content-Length", len_str);
         /* mmap_ptr stays owned by cache — do not munmap here */
         return 0;

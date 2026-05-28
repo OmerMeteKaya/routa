@@ -1,3 +1,4 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #include "core/event_loop.h"
 #include "http/ws.h"
@@ -70,3 +71,4 @@ int main(void) {
     event_loop_free(g_loop);
     return 0;
 }
+#endif

@@ -32,7 +32,4 @@ int router_dispatch(router_t *r, const http_request_t *req,
 // Match a route without executing it. Returns the route or NULL.
 route_t *router_match(router_t *r, const http_request_t *req, int *allowed_methods);
 
-
-extern int router_add(router_t *r, const char *path, int methods,
-               route_handler_t handler, void *ctx);
 #endif // ROUTA_HTTP_ROUTER_H

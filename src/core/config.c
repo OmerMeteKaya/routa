@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "../include/core/config.h"
 #include "util/logger.h"
 #include <string.h>
@@ -6,6 +8,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 
 
@@ -77,8 +80,9 @@ void routa_config_init(routa_config_t *cfg) {
 */
 
 static char *trim(char *s) {
-    while (isspace((unsigned char)*s)) s++;
-    char *end = s + strlen(s) - 1;
+    size_t slen = strlen(s);
+    if (slen == 0) return s;
+    char *end = s + slen - 1;
     while (end > s && isspace((unsigned char)*end)) *end-- = '\0';
     return s;
 }
@@ -91,12 +95,21 @@ static void strip_quotes(char *s) {
     }
 }
 
+static int cfg_atoi(const char *val, int default_val) {
+    if (!val || !*val) return default_val;
+    char *end;
+    errno = 0;
+    long n = strtol(val, &end, 10);
+    if (errno != 0 || end == val || *end != '\0') return default_val;
+    return (int)n;
+}
+
 static int parse_log_level(const char *val) {
     if (strcasecmp(val, "debug") == 0) return 0;
     if (strcasecmp(val, "info")  == 0) return 1;
     if (strcasecmp(val, "warn")  == 0) return 2;
     if (strcasecmp(val, "error") == 0) return 3;
-    return atoi(val);
+    return cfg_atoi(val, 0);
 }
 
 int routa_config_load(routa_config_t *cfg, const char *path) {
@@ -125,11 +138,11 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
         strip_quotes(val);
 
         if (strcmp(key, "port") == 0) {
-            cfg->port = atoi(val);
+            cfg->port =cfg_atoi(val, 8080);
         } else if (strcmp(key, "workers") == 0) {
-            cfg->n_workers = atoi(val);
+            cfg->n_workers = cfg_atoi(val, 12);
         } else if (strcmp(key, "backlog") == 0) {
-            cfg->backlog = atoi(val);
+            cfg->backlog = cfg_atoi(val, 128);
         } else if (strcmp(key, "tls_cert") == 0) {
             strncpy(cfg->tls_cert, val, sizeof(cfg->tls_cert) - 1);
             cfg->tls_enabled = 1;
@@ -141,13 +154,13 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
         } else if (strcmp(key, "log_file") == 0) {
             strncpy(cfg->log_file, val, sizeof(cfg->log_file) - 1);
         } else if (strcmp(key, "keepalive_timeout") == 0) {
-            cfg->keepalive_timeout_ms = atoi(val) * 1000;
+            cfg->keepalive_timeout_ms = cfg_atoi(val, 30) * 1000;
         } else if (strcmp(key, "request_timeout") == 0) {
-            cfg->request_timeout_ms = atoi(val) * 1000;
+            cfg->request_timeout_ms = cfg_atoi(val, 10) * 1000;
         } else if (strcmp(key, "max_connections") == 0) {
-            cfg->max_connections = atoi(val);
+            cfg->max_connections = cfg_atoi(val, 10000);
         } else if (strcmp(key, "cache_memory_mb") == 0) {
-            cfg->cache_memory_mb = (size_t)atoi(val);
+            cfg->cache_memory_mb = (size_t)cfg_atoi(val, 64);
         } else if (strcmp(key, "cache_dir") == 0) {
             strncpy(cfg->cache_dir, val, sizeof(cfg->cache_dir) - 1);
             cfg->cache_enabled = 1;
@@ -161,9 +174,11 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                     char *prefix  = trim(val);
                     char *docroot = trim(arrow + 2);
                     strncpy(cfg->static_dirs[cfg->static_count].url_prefix,
-                            prefix, 255);
+                          prefix,
+                          sizeof(cfg->static_dirs[cfg->static_count].url_prefix) - 1);
                     strncpy(cfg->static_dirs[cfg->static_count].doc_root,
-                            docroot, 511);
+                            docroot,
+                            sizeof(cfg->static_dirs[cfg->static_count].doc_root) - 1);
                     cfg->static_dirs[cfg->static_count].enable_index = 1;
                     cfg->static_count++;
                 } else {
@@ -172,18 +187,18 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                 }
             }
         } else if (strcmp(key, "file_cache_enabled") == 0) {
-            cfg->file_cache_enabled = atoi(val);
+            cfg->file_cache_enabled = cfg_atoi(val, 1);
         } else if (strcmp(key, "file_cache_entries") == 0) {
-            cfg->file_cache_max_entries = atoi(val);
+            cfg->file_cache_max_entries = cfg_atoi(val, 512);
         } else if (strcmp(key, "file_cache_ttl") == 0) {
-            cfg->file_cache_ttl = atoi(val);
+            cfg->file_cache_ttl = cfg_atoi(val, 5);
         } else if (strcmp(key, "file_cache_strategy") == 0) {
             if (strcasecmp(val, "ttl") == 0)          cfg->file_cache_strategy = 0;
             else if (strcasecmp(val, "stat_ttl") == 0) cfg->file_cache_strategy = 1;
             else if (strcasecmp(val, "inotify") == 0)  cfg->file_cache_strategy = 2;
-            else cfg->file_cache_strategy = atoi(val);
+            else cfg->file_cache_strategy = cfg_atoi(val, 1);
         } else if (strcmp(key, "tls_session_timeout") == 0) {
-            cfg->tls_session_timeout = atoi(val);
+            cfg->tls_session_timeout = cfg_atoi(val, 3600);
         } else if (strcmp(key, "tls_ocsp_response") == 0) {
             strncpy(cfg->tls_ocsp_response, val, sizeof(cfg->tls_ocsp_response) - 1);
         } else {
@@ -191,7 +206,7 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
         }
     }
 
-    fclose(f);
+    (void)fclose(f);
     LOG_INFO("Config loaded from %s", path);
     return 0;
 }
@@ -215,20 +230,20 @@ int routa_config_validate(const routa_config_t *cfg) {
 }
 
 void routa_config_dump(const routa_config_t *cfg) {
-    fprintf(stderr, "=== routa config ===\n");
-    fprintf(stderr, "port            = %d\n", cfg->port);
-    fprintf(stderr, "workers         = %d\n", cfg->n_workers);
-    fprintf(stderr, "tls_enabled     = %d\n", cfg->tls_enabled);
-    fprintf(stderr, "log_level       = %d\n", cfg->log_level);
-    fprintf(stderr, "keepalive_ms    = %d\n", cfg->keepalive_timeout_ms);
-    fprintf(stderr, "max_connections = %d\n", cfg->max_connections);
-    fprintf(stderr, "cache_mb        = %zu\n", (size_t)cfg->cache_memory_mb);
+    (void)fprintf(stderr, "=== routa config ===\n");
+    (void)fprintf(stderr, "port            = %d\n", cfg->port);
+    (void)fprintf(stderr, "workers         = %d\n", cfg->n_workers);
+    (void)fprintf(stderr, "tls_enabled     = %d\n", cfg->tls_enabled);
+    (void)fprintf(stderr, "log_level       = %d\n", cfg->log_level);
+    (void)fprintf(stderr, "keepalive_ms    = %d\n", cfg->keepalive_timeout_ms);
+    (void)fprintf(stderr, "max_connections = %d\n", cfg->max_connections);
+    (void)fprintf(stderr, "cache_mb        = %zu\n", (size_t)cfg->cache_memory_mb);
     for (int i = 0; i < cfg->static_count; i++) {
-        fprintf(stderr, "static_dir[%d]  = %s -> %s\n", i,
+        (void)fprintf(stderr, "static_dir[%d]  = %s -> %s\n", i,
                 cfg->static_dirs[i].url_prefix,
                 cfg->static_dirs[i].doc_root);
     }
-    fprintf(stderr, "====================\n");
+    (void)fprintf(stderr, "====================\n");
 }
 
 int routa_config_reload(const char *path,

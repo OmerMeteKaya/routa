@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/cookie.h"
 #include "http/request.h"
 #include "http/response.h"

@@ -1,3 +1,4 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -798,3 +799,4 @@ int main(void) {
     waitpid(pid, NULL, 0);
     return g_fail > 0 ? 1 : 0;
 }
+#endif

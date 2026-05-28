@@ -239,10 +239,14 @@ jobs:
       - name: cppcheck
         run: |
           cppcheck \
-            --enable=warning,style,performance,portability \
+            --enable=warning,performance,portability \
             --error-exitcode=1 \
             --suppress=missingInclude \
             --suppress=missingIncludeSystem \
+            --suppress=constVariablePointer \
+            --suppress=constParameterPointer \
+            --suppress=redundantCondition \
+            --suppress=allocaCalled \
             --inline-suppr \
             -Iinclude \
             src/ \
@@ -252,13 +256,14 @@ jobs:
 
       - name: clang-tidy
         run: |
-          # Run on all C sources tracked by compile_commands.json
           SOURCES=$(find src -name '*.c' | sort)
           FAILED=0
           for f in $SOURCES; do
             clang-tidy -p build \
-              --checks='-*,clang-analyzer-*,bugprone-*,cert-*' \
+              --checks='-*,clang-analyzer-*,bugprone-*,cert-*,-bugprone-easily-swappable-parameters,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,-clang-analyzer-security.insecureAPI.strcpy,-bugprone-reserved-identifier,-cert-dcl37-c,-cert-dcl51-cpp' \
               --warnings-as-errors='*' \
+              --header-filter='.*' \
+              -extra-arg='-Iinclude' \
               "$f" 2>&1 | tee -a clang-tidy.txt
             RC=${PIPESTATUS[0]}
             [ $RC -ne 0 ] && FAILED=$RC

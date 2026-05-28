@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "util/logger.h"
 #include <pthread.h>
 #include <string.h>
@@ -24,10 +26,10 @@ void log_msg(log_level_t level, const char *file, int line, const char *fmt, ...
     }
 
     pthread_mutex_lock(&g_log_mutex);
-    
+
     // Get timestamp
     time_t now;
-    time(&now);
+    (void)time(&now);
     char *timestamp = ctime(&now);
     timestamp[strlen(timestamp) - 1] = '\0'; // Remove newline
     
@@ -37,11 +39,11 @@ void log_msg(log_level_t level, const char *file, int line, const char *fmt, ...
     // Print message
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    (void)vfprintf(stderr, fmt, args);
     va_end(args);
-    
+
     //fprintf(stderr, "\n");
-    fflush(stderr);
+    (void)fflush(stderr);
     
     pthread_mutex_unlock(&g_log_mutex);
 }

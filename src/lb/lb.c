@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "lb/lb.h"
 #include "lb/upstream.h"
 #include "util/logger.h"
@@ -174,8 +176,7 @@ static upstream_node_t *pick_p2c(lb_t *lb) {
     if (pool->node_count == 1) return pick_up_node(pool);
 
     /* Collect UP nodes */
-    upstream_node_t **up = alloca((size_t)pool->node_count *
-                                   sizeof(upstream_node_t *));
+    upstream_node_t *up[pool->node_count]; /* NOLINT(cppcheck-allocaCalled) */
     int up_cnt = 0;
     for (int i = 0; i < pool->node_count; i++) {
         upstream_node_t *n = pool->nodes[i];
@@ -188,9 +189,9 @@ static upstream_node_t *pick_p2c(lb_t *lb) {
     if (up_cnt == 1) return up[0];
 
     /* Pick two distinct random candidates */
-    int a = (int)((uint32_t)rand() % (uint32_t)up_cnt);
+    int a = (int)((uint32_t)rand() % (uint32_t)up_cnt);  // NOLINT
     int b;
-    do { b = (int)((uint32_t)rand() % (uint32_t)up_cnt); } while (b == a);
+    do { b = (int)((uint32_t)rand() % (uint32_t)up_cnt); } while (b == a);  // NOLINT
 
     uint32_t inf_a = __atomic_load_n(&up[a]->inflight, __ATOMIC_RELAXED);
     uint32_t inf_b = __atomic_load_n(&up[b]->inflight, __ATOMIC_RELAXED);
@@ -249,7 +250,7 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
         /* Fisher-Yates sample */
         int n = pool->node_count;
         if (n == 0) return NULL;
-        int start = (int)((uint32_t)rand() % (uint32_t)n);
+        int start = (int)((uint32_t)rand() % (uint32_t)n);  // NOLINT
         for (int i = 0; i < n; i++) {
             upstream_node_t *node = pool->nodes[(start + i) % n];
             pthread_spin_lock(&node->state_lock);
@@ -293,7 +294,7 @@ static int build_forward_request(const http_request_t *req,
         "GET","POST","PUT","DELETE","HEAD",
         "PATCH","OPTIONS","TRACE","CONNECT","UNKNOWN"
     };
-    int m = (req->method >= 0 && req->method < 10) ? req->method : 9;
+    int m = ((int)req->method >= 0 && (int)req->method < 10) ? (int)req->method : 9;
 
     int n = snprintf(buf, bufsz, "%s %s HTTP/1.1\r\n",
                      method_str[m], req->path);
@@ -344,7 +345,9 @@ static int read_upstream_response(int fd, http_response_t *resp) {
     if (strncmp(raw, "HTTP/1.", 7) != 0) return -1;
     int status = 0;
     char reason[64] = {0};
-    sscanf(raw + 9, "%d %63[^\r]", &status, reason);
+    char *end_ptr; status = (int)strtol(raw + 9, &end_ptr, 10);
+    if (end_ptr == raw + 9) return -1;
+    if (*end_ptr == ' ') { strncpy(reason, end_ptr + 1, 63); reason[63] = '\0'; char *cr = strchr(reason, '\r'); if (cr) *cr = '\0'; }
     http_response_set_status(resp, status, reason);
 
     /* Parse headers */
@@ -374,7 +377,7 @@ static int read_upstream_response(int fd, http_response_t *resp) {
 
             /* Content-Length → read body */
             if (strcasecmp(line, "content-length") == 0) {
-                size_t clen = (size_t)atoll(val);
+                size_t clen = (size_t)strtoll(val, NULL, 10);
                 char  *body = malloc(clen + 1);
                 if (body) {
                     if (body_so_far > 0)
@@ -502,7 +505,7 @@ lb_t *lb_new(const lb_config_t *cfg) {
     lb->pool->passive_recover_threshold = cfg->passive_recover_threshold;
 
     pthread_mutex_init(&lb->wrr_lock, NULL);
-    srand((unsigned)time(NULL));
+    srand((unsigned)time(NULL));  /* NOLINT */
     return lb;
 }
 
@@ -668,7 +671,9 @@ int lb_finish_forward(lb_t            *lb,
         if (strncmp(raw, "HTTP/1.", 7) != 0) { free(raw); ret = -1; goto done; }
 
         int status = 0; char reason[64] = {0};
-        sscanf(raw + 9, "%d %63[^\r]", &status, reason);
+        char *end_ptr; status = (int)strtol(raw + 9, &end_ptr, 10);
+        if (end_ptr == raw + 9) { free(raw); ret = -1; goto done; }
+        if (*end_ptr == ' ') { strncpy(reason, end_ptr + 1, 63); reason[63] = '\0'; char *cr = strchr(reason, '\r'); if (cr) *cr = '\0'; }
         http_response_set_status(resp, status, reason);
 
         char *body_start = strstr(raw, "\r\n\r\n");
@@ -688,7 +693,7 @@ int lb_finish_forward(lb_t            *lb,
                     while (*val == ' ') val++;
                     http_response_set_header(resp, line, val);
                     if (strcasecmp(line, "content-length") == 0) {
-                        size_t clen = (size_t)atoll(val);
+                        size_t clen = (size_t)strtoll(val, NULL, 10);
                         size_t blen = resp_buf->len - (size_t)(body_start - raw);
                         size_t use  = clen < blen ? clen : blen;
                         if (use > 0)

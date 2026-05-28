@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/router.h"
 #include "util/logger.h"
 #include <stdlib.h>
@@ -197,3 +199,5 @@ route_t *router_match(router_t *r, const http_request_t *req, int *allowed_metho
 
     return NULL; /* method not allowed */
 }
+
+

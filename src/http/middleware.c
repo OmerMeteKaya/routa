@@ -2,7 +2,9 @@
 // Created by mete on 4.05.2026.
 //
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/middleware.h"
 #include "util/logger.h"
 #include <stdlib.h>

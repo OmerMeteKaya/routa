@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "http/mw_auth.h"
 #include "http/cookie.h"
 #include "util/logger.h"
@@ -71,7 +73,7 @@ static uint8_t *b64_decode(const char *src, size_t *out_len) {
 
 static void send_401_basic(http_response_t *resp, const char *realm) {
     char www_auth[512];
-    snprintf(www_auth, sizeof(www_auth),
+    (void)snprintf(www_auth, sizeof(www_auth),
              "Basic realm=\"%s\", charset=\"UTF-8\"", realm);
     http_response_set_status(resp, 401, "Unauthorized");
     http_response_set_header(resp, "www-authenticate", www_auth);
@@ -159,8 +161,8 @@ void jwt_claims_free(jwt_claims_t *claims) {
         free(claims->keys[i]);
         free(claims->values[i]);
     }
-    free(claims->keys);
-    free(claims->values);
+    free((void *)claims->keys);
+    free((void *)claims->values);
     free(claims);
 }
 
@@ -211,8 +213,8 @@ static jwt_claims_t *parse_claims(const char *json, size_t len) {
 
     /* Count quote pairs to pre-allocate */
     int cap = 8;
-    claims->keys   = calloc((size_t)cap, sizeof(char *));
-    claims->values = calloc((size_t)cap, sizeof(char *));
+    claims->keys   = (char **)calloc((size_t)cap, sizeof(char *));
+    claims->values = (char **)calloc((size_t)cap, sizeof(char *));
     if (!claims->keys || !claims->values) {
         jwt_claims_free(claims); return NULL;
     }
@@ -262,8 +264,8 @@ static jwt_claims_t *parse_claims(const char *json, size_t len) {
         /* Grow if needed */
         if (claims->count >= cap) {
             cap *= 2;
-            char **tk = realloc(claims->keys,   (size_t)cap * sizeof(char *));
-            char **tv = realloc(claims->values, (size_t)cap * sizeof(char *));
+            char **tk = (char **)realloc((void *)claims->keys,   (size_t)cap * sizeof(char *));
+            char **tv = (char **)realloc((void *)claims->values, (size_t)cap * sizeof(char *));
             if (!tk || !tv) { free(key); free(value); break; }
             claims->keys   = tk;
             claims->values = tv;
@@ -337,7 +339,6 @@ jwt_claims_t *jwt_verify(const jwt_config_t *cfg, const char *token) {
     const char *dot2 = strchr(dot1 + 1, '.');
     if (!dot2) return NULL;
 
-    size_t hdr_len = (size_t)(dot1 - token);
     size_t pay_len = (size_t)(dot2 - dot1 - 1);
     const char *sig_b64 = dot2 + 1;
     size_t sig_b64_len  = strlen(sig_b64);
@@ -375,7 +376,7 @@ jwt_claims_t *jwt_verify(const jwt_config_t *cfg, const char *token) {
     if (cfg->verify_exp) {
         const char *exp_str = jwt_claims_get(claims, "exp");
         if (exp_str) {
-            long long exp = atoll(exp_str);
+            long long exp = strtoll(exp_str, NULL, 10);
             if (exp > 0 && (long long)time(NULL) > exp) {
                 jwt_claims_free(claims);
                 return NULL;   /* token expired */

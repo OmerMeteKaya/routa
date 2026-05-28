@@ -22,7 +22,7 @@ int main(int argc, char *argv[]) {
     routa_config_dump(&cfg);
 
     /* Create server from config */
-    server_t *s = server_from_config(&cfg);
+    server_t *s = server_from_config_file(config_path);
     if (!s) return 1;
 
     /* Add programmatic routes on top */

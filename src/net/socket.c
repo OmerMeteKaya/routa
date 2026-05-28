@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "net/socket.h"
 #include "util/logger.h"
 #include <sys/socket.h>
@@ -40,8 +42,6 @@ int net_server_socket(int port, int backlog) {
         close(sockfd);
         return -1;
     }
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); //debug
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)); //debug
     // Bind
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
