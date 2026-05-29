@@ -5,6 +5,14 @@
 #include <stddef.h>
 #include <time.h>
 #include <pthread.h>
+/* pthread_spinlock_t is Linux-only; fall back to mutex on other platforms */
+#if !defined(__linux__)
+#  define pthread_spinlock_t        pthread_mutex_t
+#  define pthread_spin_init(l,s)    pthread_mutex_init((l), NULL)
+#  define pthread_spin_destroy(l)   pthread_mutex_destroy(l)
+#  define pthread_spin_lock(l)      pthread_mutex_lock(l)
+#  define pthread_spin_unlock(l)    pthread_mutex_unlock(l)
+#endif
 #include <netinet/in.h>
 
 /* ── Forward declarations ──────────────────────────────────────────────────*/

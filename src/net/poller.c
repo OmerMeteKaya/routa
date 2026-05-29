@@ -127,10 +127,13 @@ int poller_add(poller_t *p, int fd, uint32_t events, void *ptr) {
 int poller_mod(poller_t *p, int fd, uint32_t events, void *ptr) {
     struct kevent changes[4];
     int n = 0;
-    /* Delete both filters first, ignore errors (filter may not exist) */
-    EV_SET(&changes[n++], (uintptr_t)fd, EVFILT_READ,  EV_DELETE, 0, 0, NULL);
-    EV_SET(&changes[n++], (uintptr_t)fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
     unsigned short flags = EV_ADD | ((events & POLLER_ET) ? EV_CLEAR : 0);
+    /* Delete filters not in new event set */
+    if (!(events & POLLER_READ))
+        EV_SET(&changes[n++], (uintptr_t)fd, EVFILT_READ,  EV_DELETE, 0, 0, NULL);
+    if (!(events & POLLER_WRITE))
+        EV_SET(&changes[n++], (uintptr_t)fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    /* Add requested filters */
     if (events & POLLER_READ)
         EV_SET(&changes[n++], (uintptr_t)fd, EVFILT_READ,  flags, 0, 0, ptr);
     if (events & POLLER_WRITE)

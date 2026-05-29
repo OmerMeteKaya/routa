@@ -439,7 +439,7 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
     /* Initialize timeout tracking */
     struct timespec _ts;
     clock_gettime(CLOCK_MONOTONIC, &_ts);
-    uint64_t _now = (uint64_t)_ts.tv_sec * 1000 + _ts.tv_nsec / 1000000;
+    uint64_t _now = (uint64_t)_ts.tv_sec * 1000ULL + (uint64_t)_ts.tv_nsec / 1000000ULL;
     hc->last_recv_ts   = _now;
     hc->last_stream_ts = _now;
     return hc;
@@ -527,7 +527,7 @@ static int handle_settings(h2_conn_t *hc,
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
 
     for (uint32_t i = 0; i < length; i += 6) {
-        uint16_t id  = ((uint16_t)payload[i] << 8) | payload[i+1];
+        uint16_t id = (uint16_t)(((uint16_t)payload[i] << 8) | (uint16_t)payload[i+1]);
         uint32_t val = ((uint32_t)payload[i+2] << 24) |
                        ((uint32_t)payload[i+3] << 16) |
                        ((uint32_t)payload[i+4] <<  8) |
@@ -1533,8 +1533,7 @@ int h2_conn_flush(h2_conn_t *hc) {
 
 int h2_conn_check_timeouts(h2_conn_t *hc, uint64_t now_ms) {
     if (!hc || hc->error || hc->goaway_sent) return 0;
-
-    const routa_h2_config_t *cfg = NULL;
+    
     /* Timeouts come from config stored at conn_new time.
      * We use hardcoded defaults here; event_loop passes now_ms.
      * stream_timeout_ms default: 30000, keepalive_timeout_ms default: 120000 */

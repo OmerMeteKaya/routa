@@ -10,7 +10,10 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <fcntl.h>
+#if defined(__linux__)
 #include <sys/eventfd.h>
+#endif
 #include <errno.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -203,18 +206,40 @@ void ws_registry_ping_sweep(ws_registry_t *r, const ws_config_t *cfg,
 
 /* Create an eventfd for this worker's broadcast notification.
  * Returns fd on success, -1 on error.                                     */
-int ws_notify_fd_create(void) {
+int ws_notify_fd_create(int *write_fd_out) {
+#if defined(__linux__)
     int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (fd < 0)
+    if (fd < 0) {
         LOG_ERROR("ws: eventfd creation failed: %s", strerror(errno));
+        return -1;
+    }
+    *write_fd_out = fd;  /* eventfd is both read and write */
     return fd;
+#else
+    /* macOS/BSD: use a self-pipe as wakeup mechanism */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        LOG_ERROR("ws: pipe creation failed: %s", strerror(errno));
+        return -1;
+    }
+    /* Set both ends non-blocking */
+    fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+    fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+    *write_fd_out = pipefd[1];
+    return pipefd[0]; /* return read end for polling */
+#endif
 }
 
-/* Read and discard the eventfd counter.
- * Must be called before ws_registry_dispatch_broadcast to re-arm epoll.  */
 void ws_notify_fd_drain(int fd) {
     if (fd < 0) return;
+#if defined(__linux__)
     uint64_t val;
     if (read(fd, &val, sizeof(val)) < 0 && errno != EAGAIN)
         LOG_WARN("ws: eventfd drain failed: %s", strerror(errno));
+#else
+    char buf[64];
+    while (read(fd, buf, sizeof(buf)) > 0) {}  /* drain pipe */
+#endif
 }

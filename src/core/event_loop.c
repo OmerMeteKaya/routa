@@ -9,13 +9,17 @@
 #include "http/request.h"
 #include "http/response.h"
 #include "util/logger.h"
+#if defined(__linux__)
 #include <sys/sendfile.h>
+#endif
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#if defined(__linux__)
 #include <sys/epoll.h>
+#endif
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -24,7 +28,9 @@
 #include "net/uring.h"
 #include "http/ws.h"
 #include "http/ws_registry.h"
+#if defined(__linux__)
 #include <sys/eventfd.h>
+#endif
 #include "core/config.h"
 #include "http/h2.h"
 
@@ -928,8 +934,20 @@ static void handle_events_worker(worker_t *w) {
 
                 /* sendfile body */
                 if (conn->state == CONN_SENDFILE) {
+#if defined(__linux__)
                     ssize_t n = sendfile(conn->fd, conn->sendfile_fd,
                                          &conn->sendfile_off, conn->sendfile_rem);
+#else
+                    /* macOS/BSD: fall back to read+write */
+                    char _sf_buf[65536];
+                    lseek(conn->sendfile_fd, conn->sendfile_off, SEEK_SET);
+                    ssize_t _sf_r = read(conn->sendfile_fd, _sf_buf,
+                        conn->sendfile_rem < sizeof(_sf_buf)
+                        ? conn->sendfile_rem : sizeof(_sf_buf));
+                    ssize_t n = (_sf_r > 0)
+                        ? write(conn->fd, _sf_buf, (size_t)_sf_r) : _sf_r;
+                    if (n > 0) conn->sendfile_off += n;
+#endif
                     if (n > 0) {
                         conn->sendfile_rem -= (size_t)n;
                         if (conn->sendfile_rem == 0) {
@@ -1117,7 +1135,7 @@ static void *worker_run(void *arg) {
 
     ws_registry_init(&w->ws_registry);
     ws_msg_queue_init(&w->ws_broadcast_queue);
-    w->ws_notify_fd = ws_notify_fd_create();
+    w->ws_notify_fd = ws_notify_fd_create(&w->ws_notify_write_fd);
     if (w->ws_notify_fd >= 0) {
         poller_add(w->poller, w->ws_notify_fd, POLLER_READ,
                    (void *)(uintptr_t)w->ws_notify_fd);
@@ -1460,8 +1478,10 @@ event_loop_t *event_loop_new(int port, int n_threads) {
     loop->shutdown_timeout_ms = 30000;
     loop->workers             = calloc((size_t)n_threads, sizeof(worker_t));
     if (!loop->workers)       { free(loop); return NULL; }
-    for (int i = 0; i < n_threads; i++)
+    for (int i = 0; i < n_threads; i++) {
         loop->workers[i].ws_notify_fd = -1;
+        loop->workers[i].ws_notify_write_fd = -1;
+    }
     pthread_rwlock_init(&loop->tls_reload_lock, NULL);
     return loop;
 }

@@ -234,13 +234,27 @@ ssize_t io_writev_response(int fd, tls_conn_t *tls,
     return 0;
 }
 
-/* ── TCP_CORK ───────────────────────────────────────────────────────────────*/
+/* ── TCP_CORK / TCP_NOPUSH ──────────────────────────────────────────────────*/
 int io_cork(int fd) {
     int v = 1;
+#if defined(__linux__)
     return setsockopt(fd, IPPROTO_TCP, TCP_CORK, &v, sizeof(v));
+#elif defined(__APPLE__) || defined(__FreeBSD__) || \
+defined(__OpenBSD__) || defined(__NetBSD__)
+    return setsockopt(fd, IPPROTO_TCP, TCP_NOPUSH, &v, sizeof(v));
+#else
+    (void)fd; (void)v; return 0;
+#endif
 }
 
 int io_uncork(int fd) {
     int v = 0;
+#if defined(__linux__)
     return setsockopt(fd, IPPROTO_TCP, TCP_CORK, &v, sizeof(v));
+#elif defined(__APPLE__) || defined(__FreeBSD__) || \
+defined(__OpenBSD__) || defined(__NetBSD__)
+    return setsockopt(fd, IPPROTO_TCP, TCP_NOPUSH, &v, sizeof(v));
+#else
+    (void)fd; (void)v; return 0;
+#endif
 }

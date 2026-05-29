@@ -11,7 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <fcntl.h>
+#if defined(__linux__)
 #include <sys/eventfd.h>
+#endif
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 #include <errno.h>
@@ -308,7 +311,7 @@ int ws_handshake(conn_t *conn, const http_request_t *req,
 static int build_frame_header(uint8_t *hdr, ws_opcode_t opcode,
                                int fin, uint64_t payload_len) {
     int idx = 0;
-    hdr[idx++] = (uint8_t)(((fin ? 1 : 0) << 7) | (opcode & 0x0F));
+    hdr[idx++] = (uint8_t)(((unsigned)(fin ? 1 : 0) << 7) | ((uint8_t)opcode & 0x0Fu));
 
     if (payload_len < 126) {
         hdr[idx++] = (uint8_t)payload_len;
@@ -687,10 +690,14 @@ int ws_broadcast(worker_t **workers, int worker_count,
         w->ws_broadcast_queue.count++;
         pthread_mutex_unlock(&w->ws_broadcast_queue.lock);
 
-        /* Wake up the worker via eventfd */
+        /* Wake up the worker via eventfd (Linux) or pipe (macOS/BSD) */
+#if defined(__linux__)
         uint64_t val = 1;
-        if (write(w->ws_notify_fd, &val, sizeof(val)) < 0 && errno != EAGAIN)
-            LOG_WARN("ws: eventfd write failed for worker %d: %s",
+        if (write(w->ws_notify_write_fd, &val, sizeof(val)) < 0 && errno != EAGAIN)
+#else
+        if (write(w->ws_notify_write_fd, "x", 1) < 0 && errno != EAGAIN)
+#endif
+            LOG_WARN("ws: write notify failed for worker %d: %s",
                      i, strerror(errno));
     }
 

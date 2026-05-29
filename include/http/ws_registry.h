@@ -27,7 +27,7 @@ void ws_registry_ping_sweep(ws_registry_t *r, const ws_config_t *cfg,
                              uint64_t now_ms);
 
 /* ── eventfd helpers ────────────────────────────────────────────────────── */
-int  ws_notify_fd_create(void);
+int  ws_notify_fd_create(int *write_fd_out);
 void ws_notify_fd_drain(int fd);
 
 #endif /* ROUTA_HTTP_WS_REGISTRY_H */

@@ -113,6 +113,7 @@ static int parse_log_level(const char *val) {
 }
 
 int routa_config_load(routa_config_t *cfg, const char *path) {
+    if (!path) return -1;
     FILE *f = fopen(path, "r");
     if (!f) {
         LOG_ERROR("Cannot open config file: %s", path);

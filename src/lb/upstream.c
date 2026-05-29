@@ -15,6 +15,8 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 
+#include "net/socket.h"
+
 /* ── Internal: open a new TCP connection to node ───────────────────────────*/
 static int node_connect(upstream_node_t *node, int timeout_ms) {
     /* Resolve once, cache result */
@@ -29,7 +31,11 @@ static int node_connect(upstream_node_t *node, int timeout_ms) {
         node->addr_resolved = 1;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        net_set_nonblocking(fd);
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
     if (fd < 0) return -1;
 
     int one = 1;
@@ -178,7 +184,11 @@ int upstream_conn_connect_async(upstream_node_t *node) {
         node->addr_resolved = 1;
     }
 
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        net_set_nonblocking(fd);
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
     if (fd < 0) return -1;
 
     int one = 1;

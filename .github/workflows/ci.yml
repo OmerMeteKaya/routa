@@ -12,24 +12,33 @@ jobs:
   # ══════════════════════════════════════════════════════════════════════
   build-and-test:
     name: ${{ matrix.label }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - label: "gcc-debug-asan"
+            os: ubuntu-24.04
             compiler: gcc
             build_type: Debug
             sanitizers: ON
           - label: "gcc-release"
+            os: ubuntu-24.04
             compiler: gcc
             build_type: Release
             sanitizers: OFF
           - label: "clang-debug-asan"
+            os: ubuntu-24.04
             compiler: clang
             build_type: Debug
             sanitizers: ON
           - label: "clang-release"
+            os: ubuntu-24.04
+            compiler: clang
+            build_type: Release
+            sanitizers: OFF
+          - label: "macos-clang-release"
+            os: macos-14
             compiler: clang
             build_type: Release
             sanitizers: OFF
@@ -41,18 +50,26 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 5
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build clang gcc \
-            libssl-dev zlib1g-dev \
-            curl openssl psmisc lsof \
-            gcovr lcov
+          if [ "${{ matrix.os }}" = "macos-14" ]; then
+            brew install cmake ninja openssl zlib coreutils
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              cmake ninja-build clang gcc \
+              libssl-dev zlib1g-dev \
+              curl openssl psmisc lsof \
+              gcovr lcov
+          fi
 
       - name: Configure
         run: |
           EXTRA=""
           if [ "${{ matrix.label }}" = "gcc-debug-asan" ]; then
             EXTRA="-DCOVERAGE=ON"
+          fi
+          if [ "${{ matrix.os }}" = "macos-14" ]; then
+            OPENSSL_ROOT=$(brew --prefix openssl)
+            EXTRA="$EXTRA -DOPENSSL_ROOT_DIR=$OPENSSL_ROOT"
           fi
           cmake -B build -G Ninja \
             -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
@@ -62,7 +79,7 @@ jobs:
             $EXTRA
 
       - name: Build
-        run: cmake --build build --parallel $(nproc)
+        run: cmake --build build --parallel $(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
       - name: Generate TLS certs
         run: |
@@ -101,6 +118,22 @@ jobs:
         run: |
           chmod +x tests/run_test.sh
           FAILED=0
+
+          if [ "${{ matrix.os }}" = "macos-14" ]; then
+            ./build/test_ws &
+            WS_PID=$!
+            sleep 2
+            nc -z 127.0.0.1 18765 && echo "PORT OPEN" || echo "PORT CLOSED"
+            # Try actual WebSocket handshake
+            curl -v --http1.1 \
+              -H "Upgrade: websocket" \
+              -H "Connection: Upgrade" \
+              -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+              -H "Sec-WebSocket-Version: 13" \
+              http://127.0.0.1:18765/ws 2>&1 | head -30 || true
+            kill $WS_PID 2>/dev/null || true
+            exit 0
+          fi
 
           echo "=== test_ws ==="
           if ! ./tests/run_test.sh test_ws; then

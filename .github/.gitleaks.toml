@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "WebSocket test key is a standard RFC 6455 example, not a secret"
+regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']

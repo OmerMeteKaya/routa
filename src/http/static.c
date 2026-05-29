@@ -151,8 +151,13 @@ int static_serve(const http_request_t *req, http_response_t *resp,
 
             int fd = open(resolved, O_RDONLY);
             if (fd >= 0) {
+#if defined(__linux__)
                 void *ptr = mmap(NULL, (size_t)st.st_size,
                                  PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+#else
+                void *ptr = mmap(NULL, (size_t)st.st_size,
+                                 PROT_READ, MAP_PRIVATE, fd, 0);
+#endif
                 close(fd);   /* fd no longer needed after mmap */
                 if (ptr != MAP_FAILED) {
                     mmap_ptr = ptr;

@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "core/server.h"
 #include "core/event_loop.h"
 #include "util/logger.h"
@@ -59,11 +61,13 @@ int server_static(server_t *s, const char *url_prefix,
     if (s->static_config_count < 16)
         s->static_configs[s->static_config_count++] = cfg;
 
-    char resolved_root[1024];
-    if (!realpath(doc_root, resolved_root))
-        strncpy(cfg->doc_root, doc_root, sizeof(cfg->doc_root) - 1);
-    else
+    char *resolved_root = realpath(doc_root, NULL);
+    if (resolved_root) {
         strncpy(cfg->doc_root, resolved_root, sizeof(cfg->doc_root) - 1);
+        free(resolved_root);
+    }  else {
+        strncpy(cfg->doc_root, doc_root, sizeof(cfg->doc_root) - 1);
+    }
     cfg->doc_root[sizeof(cfg->doc_root) - 1] = '\0';
 
     strncpy(cfg->url_prefix, url_prefix, sizeof(cfg->url_prefix) - 1);
@@ -72,7 +76,7 @@ int server_static(server_t *s, const char *url_prefix,
 
     char pattern[258];
     if (strcmp(url_prefix, "/") == 0) strcpy(pattern, "/*");
-    else snprintf(pattern, sizeof(pattern), "%s/*", url_prefix);
+    else (void)snprintf(pattern, sizeof(pattern), "%s/*", url_prefix);
 
     event_loop_add_route((event_loop_t *)s->loop, pattern,
                          HTTP_GET_M | HTTP_HEAD_M, static_route_handler, cfg);
@@ -149,7 +153,7 @@ int server_lb_add_upstream(server_t *s,
 
 /* Register a route that proxies to the LB.
  * Call after all upstreams are added.
- * path: e.g. "/api/*"  methods: HTTP_GET_M|HTTP_POST_M|...             */
+ * path: e.g. "/api/"  methods: HTTP_GET_M|HTTP_POST_M|...             */
 int server_lb_route(server_t *s, const char *path, int methods) {
     if (!s || !s->lb || !s->loop) return -1;
 

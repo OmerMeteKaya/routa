@@ -58,7 +58,8 @@ struct worker {
      *                 ws_broadcast, consumer is this worker thread.
      * ----------------------------------------------------------------- */
     ws_registry_t    ws_registry;
-    int              ws_notify_fd;       /* eventfd fd, -1 if disabled     */
+    int              ws_notify_fd;       /* read end (eventfd on Linux, pipe on macOS) */
+    int              ws_notify_write_fd; /* write end (same as notify_fd on Linux, pipe write on macOS) */
     ws_msg_queue_t   ws_broadcast_queue;
 
     /* Per-route WebSocket handler table (mirrors router, WS paths only) */
