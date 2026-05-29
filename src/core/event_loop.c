@@ -136,6 +136,7 @@ int event_loop_broadcast(event_loop_t *loop,
 
 /* ── Helpers ────────────────────────────────────────────────────────────────*/
 
+
 static void conn_remove(worker_t *w, conn_t *conn) {
     for (int j = 0; j < w->active_conn_count; j++) {
         if (w->active_conns[j] == conn) {
@@ -196,6 +197,19 @@ static int send_file_tls(worker_t *w, conn_t *conn,
     }
     close(fd);
     return 0;
+}
+static void conn_close_and_free(worker_t *w, conn_t *conn) {
+    poller_del(w->poller, conn->fd);
+    conn_remove(w, conn);
+    if (conn->tls) tls_shutdown(conn->tls);
+    if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
+    if (conn->upstream_fd >= 0) { close(conn->upstream_fd); conn->upstream_fd = -1; }
+    if (conn->h2 && conn->h2->write_buf.len > 0)
+        h2_conn_flush(conn->h2);
+    shutdown(conn->fd, SHUT_WR);
+    net_close(conn->fd);
+    conn_reset_write_state(conn);
+    conn_free(conn);
 }
 
 /* ── Build and stash response on conn for writev path ───────────────────────
@@ -263,52 +277,49 @@ static void handle_events_worker(worker_t *w) {
 
         /* ── Accept ── */
         if (events[i].ptr == NULL) {
-            /* Refuse new connections during graceful drain */
             if (w->draining) continue;
+            for (;;) {
+                struct sockaddr_in client_addr = {0};
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(w->server_fd,
+                                       (struct sockaddr *)&client_addr, &client_len);
+                if (client_fd < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                        LOG_ERROR("Accept failed: %s", strerror(errno));
+                    break;
+                }
+                if (net_set_nonblocking(client_fd) < 0) { net_close(client_fd); continue; }
 
-            struct sockaddr_in client_addr = {0};
-            socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(w->server_fd,
-                                   (struct sockaddr *)&client_addr, &client_len);
-            if (client_fd < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK)
-                    LOG_ERROR("Accept failed: %s", strerror(errno));
-                continue;
-            }
+                char client_ip[INET_ADDRSTRLEN] = {0};
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
-            if (net_set_nonblocking(client_fd) < 0) { net_close(client_fd); continue; }
+                conn_t *conn = conn_new(client_fd, client_ip, ntohs(client_addr.sin_port));
+                if (!conn) { net_close(client_fd); continue; }
 
-            char client_ip[INET_ADDRSTRLEN] = {0};
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+                if (w->active_conn_count < w->max_connections) {
+                    w->active_conns[w->active_conn_count++] = conn;
+                } else {
+                    LOG_WARN("Max connections reached, dropping");
+                    conn_free(conn); net_close(client_fd); continue;
+                }
 
-            conn_t *conn = conn_new(client_fd, client_ip, ntohs(client_addr.sin_port));
-            if (!conn) { net_close(client_fd); continue; }
+                pthread_rwlock_rdlock(&w->loop->tls_reload_lock);
+                tls_context_t *cur_tls = w->loop->tls_ctx;
+                if (cur_tls) {
+                    conn->tls = tls_conn_new(cur_tls, client_fd);
+                }
+                pthread_rwlock_unlock(&w->loop->tls_reload_lock);
 
-            if (w->active_conn_count < w->max_connections) {
-                w->active_conns[w->active_conn_count++] = conn;
-            } else {
-                LOG_WARN("Max connections reached, dropping");
-                conn_free(conn); net_close(client_fd); continue;
-            }
+                if (cur_tls && !conn->tls) {
+                    LOG_ERROR("Failed to create TLS connection");
+                    conn_remove(w, conn); conn_free(conn); net_close(client_fd); continue;
+                }
+                if (conn->tls) conn->state = CONN_TLS_HANDSHAKE;
 
-            /* Use loop->tls_ctx under read-lock so hot-reload can safely
-             * swap the SSL_CTX pointer while workers are accepting.         */
-            pthread_rwlock_rdlock(&w->loop->tls_reload_lock);
-            tls_context_t *cur_tls = w->loop->tls_ctx;
-            if (cur_tls) {
-                conn->tls = tls_conn_new(cur_tls, client_fd);
-            }
-            pthread_rwlock_unlock(&w->loop->tls_reload_lock);
-
-            if (cur_tls && !conn->tls) {
-                LOG_ERROR("Failed to create TLS connection");
-                conn_remove(w, conn); conn_free(conn); net_close(client_fd); continue;
-            }
-            if (conn->tls) conn->state = CONN_TLS_HANDSHAKE;
-
-            if (poller_add(w->poller, client_fd, POLLER_READ | POLLER_ET, conn) < 0) {
-                LOG_ERROR("Failed to add client to poller");
-                conn_remove(w, conn); conn_free(conn); net_close(client_fd); continue;
+                if (poller_add(w->poller, client_fd, POLLER_READ | POLLER_ET, conn) < 0) {
+                    LOG_ERROR("Failed to add client to poller");
+                    conn_remove(w, conn); conn_free(conn); net_close(client_fd); continue;
+                }
             }
             continue;
         }
@@ -807,7 +818,7 @@ static void handle_events_worker(worker_t *w) {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
                             }
-                            break;
+                            goto h2_write_done;
                         }
                     }
                     if (conn->h2->write_buf.len > 0) {
@@ -817,7 +828,10 @@ static void handle_events_worker(worker_t *w) {
                         poller_mod(w->poller, conn->fd,
                                    POLLER_READ | POLLER_ET, conn);
                     }
+                    h2_write_done:
+                    continue;
                 }
+
                 continue;
             }
                 // WebSocket outbound flush
@@ -1066,13 +1080,7 @@ static void handle_events_worker(worker_t *w) {
                         poller_mod(w->poller, conn->fd, POLLER_WRITE | POLLER_ET, conn);
                         break;
             case CONN_CLOSING:
-                        poller_del(w->poller, conn->fd);
-                        conn_remove(w, conn);
-                        if (conn->tls) tls_shutdown(conn->tls);
-                        shutdown(conn->fd, SHUT_WR);
-                        net_close(conn->fd);
-                        conn_reset_write_state(conn);
-                        conn_free(conn);
+                        conn_close_and_free(w, conn);
                         break;
             default:
                         break;
@@ -1215,13 +1223,15 @@ static void *worker_run(void *arg) {
             ws_config_t default_cfg;
             ws_config_init(&default_cfg);
             ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
-            for (int _i = 0; _i < w->active_conn_count; _i++) {
+            for (int _i = 0; _i < w->active_conn_count; ) {
                 conn_t *_c = w->active_conns[_i];
-                if (_c->state != CONN_H2 || !_c->h2) continue;
-                if (h2_conn_check_timeouts(_c->h2, now_ms) < 0) {
+                if (_c->state == CONN_H2 && _c->h2 &&
+                    h2_conn_check_timeouts(_c->h2, now_ms) < 0) {
                     h2_conn_flush(_c->h2);
-                    _c->state = CONN_CLOSING;
-                }
+                    conn_close_and_free(w, _c);
+                    continue;
+                    }
+                _i++;
             }
             last_ping_sweep_ms = now_ms;
         }
@@ -1231,10 +1241,13 @@ static void *worker_run(void *arg) {
     for (int i = 0; i < w->active_conn_count; i++) {
         conn_t *c = w->active_conns[i];
         poller_del(w->poller, c->fd);
-        if (c->sendfile_fd >= 0) close(c->sendfile_fd);
+        if (c->sendfile_fd >= 0) { close(c->sendfile_fd); c->sendfile_fd = -1; }
+        if (c->upstream_fd >= 0) { close(c->upstream_fd); c->upstream_fd = -1; }
         if (c->tls) tls_shutdown(c->tls);
-        conn_reset_write_state(c);
+        if (c->h2 && c->h2->write_buf.len > 0) h2_conn_flush(c->h2);
+        shutdown(c->fd, SHUT_WR);
         net_close(c->fd);
+        conn_reset_write_state(c);
         conn_free(c);
     }
     if (w->server_fd >= 0) net_close(w->server_fd);

@@ -15,7 +15,15 @@ fi
 # Kill leftover processes on test ports (fuser is Linux-only)
 kill_port() {
     local port=$1
-    lsof -ti "tcp:${port}" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    # Linux
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -ti "tcp:${port}" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    # BSD (FreeBSD/OpenBSD/NetBSD)
+    elif command -v sockstat >/dev/null 2>&1; then
+        sockstat -4 -l -p "${port}" 2>/dev/null \
+            | awk 'NR>1 {print $3}' \
+            | xargs kill -9 2>/dev/null || true
+    fi
 }
 kill_port 18080
 kill_port 18081

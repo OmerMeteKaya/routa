@@ -177,7 +177,141 @@ jobs:
           path: |
             tests/certs/
             build/*.log
+        # ══════════════════════════════════════════════════════════════════════
+        # BSD platform tests — FreeBSD, OpenBSD, NetBSD
+        # ══════════════════════════════════════════════════════════════════════
+  bsd-platforms:
+          name: "${{ matrix.name }}"
+          runs-on: ubuntu-latest
+          needs: build-and-test
+          continue-on-error: true
+          strategy:
+            fail-fast: false
+            matrix:
+              include:
+                - name: "freebsd-15-clang"
+                  os: freebsd
+                  os_version: "15.0"
+                  compiler: clang
+                - name: "freebsd-15-gcc"
+                  os: freebsd
+                  os_version: "15.0"
+                  compiler: gcc
+                - name: "openbsd-78-clang"
+                  os: openbsd
+                  os_version: "7.8"
+                  compiler: clang
+                - name: "netbsd-101-gcc"
+                  os: netbsd
+                  os_version: "10.1"
+                  compiler: gcc
 
+          steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Run on ${{ matrix.os }}
+              uses: cross-platform-actions/action@v0.32.0
+              env:
+                ASAN_OPTIONS: detect_leaks=0
+                CI: "true"
+              with:
+                operating_system: ${{ matrix.os }}
+                version: ${{ matrix.os_version }}
+                shell: bash
+                run: |
+                  set -e
+
+                  # ── Package install ──────────────────────────────────────
+                  case "${{ matrix.os }}" in
+                    freebsd)
+                      sudo pkg install -y cmake ninja openssl
+                      NCPU=$(/sbin/sysctl -n hw.ncpu)
+                      OPENSSL_DIR="/usr/local"
+                      ;;
+                    openbsd)
+                      sudo pkg_add cmake ninja openssl zlib
+                      NCPU=$(/sbin/sysctl -n hw.ncpu)
+                      OPENSSL_DIR="/usr/local"
+                      ;;
+                    netbsd)
+                      sudo pkgin -y install cmake ninja-build openssl zlib
+                      NCPU=$(/sbin/sysctl -n hw.ncpu)
+                      OPENSSL_DIR="/usr/pkg"
+                      ;;
+                  esac
+
+                  # ── Compiler check ───────────────────────────────────────
+                  # FreeBSD/OpenBSD: gcc is actually a clang wrapper or absent;
+                  # fall back to clang if gcc not found
+                  CC="${{ matrix.compiler }}"
+                  if ! command -v "$CC" > /dev/null 2>&1; then
+                    echo "WARNING: $CC not found, falling back to cc"
+                    CC=cc
+                  fi
+
+                  # ── Configure ────────────────────────────────────────────
+                  cmake -B build -G Ninja \
+                    -DCMAKE_C_COMPILER="$CC" \
+                    -DCMAKE_BUILD_TYPE=Release \
+                    -DSANITIZERS=OFF \
+                    -DFUZZ=OFF \
+                    -DOPENSSL_ROOT_DIR="$OPENSSL_DIR"
+
+                  # ── Build ────────────────────────────────────────────────
+                  cmake --build build --parallel "$NCPU"
+
+                  # ── TLS certs ────────────────────────────────────────────
+                  mkdir -p tests/certs
+                  case "${{ matrix.os }}" in
+                    netbsd)
+                     OPENSSL_CONF=/usr/pkg/etc/openssl/openssl.cnf \
+                     openssl req -x509 -newkey rsa:2048 \ 
+                      -keyout tests/certs/test.key \
+                      -out tests/certs/test.crt \
+                      -days 1 -nodes \
+                      -subj "/CN=localhost"
+                    ;;
+                  *)
+                    openssl req -x509 -newkey rsa:2048 \
+                      -keyout tests/certs/test.key \
+                      -out tests/certs/test.crt \
+                      -days 1 -nodes \
+                      -subj "/CN=localhost"
+                    ;;
+                  esac
+
+                  # ── Unit tests ───────────────────────────────────────────
+                  FAILED=0
+                  for t in test_buf test_request test_middleware test_chunked \
+                           test_file_cache test_h2_hpack test_auth; do
+                    echo "=== $t ==="
+                    if ! ./build/$t; then
+                      echo "FAILED: $t"
+                      FAILED=1
+                    fi
+                  done
+
+                  # ── Integration tests ────────────────────────────────────
+                  export ROUTA_TEST_CERT="$PWD/tests/certs/test.crt"
+                  export ROUTA_TEST_KEY="$PWD/tests/certs/test.key"
+                  chmod +x tests/run_test.sh
+                  for t in test_ws test_h2; do
+                    echo "=== $t ==="
+                    if ! ./tests/run_test.sh "$t"; then
+                      echo "FAILED: $t"
+                      FAILED=1
+                    fi
+                  done
+
+                  exit $FAILED
+
+            - name: Upload artifacts on failure
+              if: failure()
+              uses: actions/upload-artifact@v4
+              with:
+                name: "failure-${{ matrix.name }}"
+                path: tests/certs/
   # ══════════════════════════════════════════════════════════════════════
   # Fuzz smoke — 30s per target, every push
   # ══════════════════════════════════════════════════════════════════════

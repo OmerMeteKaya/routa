@@ -26,9 +26,8 @@ int net_server_socket(int port, int backlog) {
     }
     
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
-        LOG_ERROR("Failed to set SO_REUSEPORT: %s", strerror(errno));
-        close(sockfd);
-        return -1;
+        LOG_WARN("SO_REUSEPORT unavailable: %s (continuing)", strerror(errno));
+        /* Non-fatal — single-process tests work fine without it */
     }
     
     // Set non-blocking

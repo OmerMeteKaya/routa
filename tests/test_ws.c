@@ -1,5 +1,6 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,7 +57,7 @@ static int tcp_connect_port(int port) {
 }
 
 static int wait_for_server(int port, int timeout_ms) {
-    struct sockaddr_in addr = {0};
+    struct sockaddr_in addr;
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons((uint16_t)port);
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -67,7 +68,8 @@ static int wait_for_server(int port, int timeout_ms) {
         int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
         close(fd);
         if (rc == 0) return 0;
-        usleep(50000);
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000L };
+        nanosleep(&ts, NULL);
         waited += 50;
     }
     return -1;
@@ -525,6 +527,8 @@ static void test_unmasked_frame_rejected(void) {
 
     uint8_t buf[BUF_SZ];
     ssize_t n = recv_timeout(fd, buf, sizeof(buf));
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000000L };
+    nanosleep(&ts, NULL);
     close(fd);
 
     if (n <= 0) {
@@ -554,6 +558,8 @@ static void test_invalid_opcode(void) {
 
     uint8_t buf[BUF_SZ];
     ssize_t n = recv_timeout(fd, buf, sizeof(buf));
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000000L };
+    nanosleep(&ts, NULL);
     close(fd);
 
     if (n <= 0) {
@@ -569,31 +575,32 @@ static void test_invalid_opcode(void) {
 }
 
 static void test_oversized_frame(void) {
-    /* Build a frame claiming a very large payload (126+ requires extended length).
-     * We manually craft a 2-byte extended length frame with 65535 byte claim
-     * but send only a few bytes — server should handle incomplete frame. */
     int fd = tcp_connect_port(WS_PORT);
     if (fd < 0) { FAIL("oversized frame", "connect"); return; }
     if (do_do_ws_handshake(fd, "/ws", TEST_KEY) < 0) {
         FAIL("oversized frame", "handshake"); close(fd); return;
     }
 
-    /* Frame header: FIN+TEXT, MASK+126, 2-byte length=1024, mask, partial payload */
     uint8_t frame[12] = {
-        0x81,           /* FIN + TEXT */
-        0xFE,           /* MASK=1, len=126 → 2-byte extended */
-        0x04, 0x00,     /* extended length = 1024 */
-        0x37, 0xfa, 0x21, 0x3d,  /* mask */
-        'A'^0x37, 'B'^0xfa, 'C'^0x21, 'D'^0x3d  /* only 4 bytes payload */
+        0x81, 0xFE, 0x04, 0x00,
+        0x37, 0xfa, 0x21, 0x3d,
+        'A'^0x37, 'B'^0xfa, 'C'^0x21, 'D'^0x3d
     };
     send_all(fd, frame, sizeof(frame));
 
-    /* Server should either wait (no response yet) or close */
     uint8_t buf[BUF_SZ];
     ssize_t n = recv_timeout(fd, buf, sizeof(buf));
+
+    uint8_t close_frame[8];
+    uint8_t close_payload[2] = { 0x03, 0xE8 };
+    int clen = build_frame(close_frame, sizeof(close_frame),
+                           close_payload, 2, 0x8, 1);
+    send_all(fd, close_frame, (size_t)clen);
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000000L }; /* 20ms */
+    nanosleep(&ts, NULL);
+
     close(fd);
 
-    /* Any response (close frame or timeout) is acceptable — must not crash */
     if (n <= 0)
         OK("oversized frame — server waited/closed (no crash)");
     else {
@@ -621,6 +628,8 @@ static void test_continuation_without_start(void) {
 
     uint8_t buf[BUF_SZ];
     ssize_t n = recv_timeout(fd, buf, sizeof(buf));
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000000L };
+    nanosleep(&ts, NULL);
     close(fd);
 
     if (n <= 0) {
@@ -799,4 +808,3 @@ int main(void) {
     waitpid(pid, NULL, 0);
     return g_fail > 0 ? 1 : 0;
 }
-#endif

@@ -1,5 +1,6 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -320,12 +321,12 @@ static int wait_for_server(int port, int timeout_ms) {
         int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
         close(fd);
         if (rc == 0) return 0;
-        //usleep(50000);
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000L };
+        nanosleep(&ts, NULL);
         waited += 50;
     }
     return -1;
 }
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * TLS-based tests (curl)
  * ═══════════════════════════════════════════════════════════════════════════*/
@@ -1193,9 +1194,15 @@ static pid_t g_pid_upgrade = -1;
 
 static void cleanup_handler(int sig) {
     (void)sig;
-    if (g_pid_tls     > 0) kill(g_pid_tls,     SIGKILL);
-    if (g_pid_h2c     > 0) kill(g_pid_h2c,     SIGKILL);
-    if (g_pid_upgrade > 0) kill(g_pid_upgrade,  SIGKILL);
+    pid_t tls     = g_pid_tls;
+    pid_t h2c     = g_pid_h2c;
+    pid_t upgrade = g_pid_upgrade;
+    g_pid_tls     = -1;
+    g_pid_h2c     = -1;
+    g_pid_upgrade = -1;
+    if (tls     > 0) kill(tls,     SIGKILL);
+    if (h2c     > 0) kill(h2c,     SIGKILL);
+    if (upgrade > 0) kill(upgrade,  SIGKILL);
     _exit(1);
 }
 
@@ -1305,10 +1312,14 @@ done:
     printf("─────────────────────────────────────\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
 
-    if (g_pid_tls     > 0) { kill(g_pid_tls,     SIGTERM); waitpid(g_pid_tls,     NULL, 0); }
-    if (g_pid_h2c     > 0) { kill(g_pid_h2c,     SIGTERM); waitpid(g_pid_h2c,     NULL, 0); }
-    if (g_pid_upgrade > 0) { kill(g_pid_upgrade,  SIGTERM); waitpid(g_pid_upgrade, NULL, 0); }
+    pid_t tls     = g_pid_tls;     g_pid_tls     = -1;
+    pid_t h2c     = g_pid_h2c;     g_pid_h2c     = -1;
+    pid_t upgrade = g_pid_upgrade; g_pid_upgrade = -1;
+
+    if (tls     > 0) { kill(tls,     SIGTERM); waitpid(tls,     NULL, 0); }
+    if (h2c     > 0) { kill(h2c,     SIGTERM); waitpid(h2c,     NULL, 0); }
+    if (upgrade > 0) { kill(upgrade,  SIGTERM); waitpid(upgrade, NULL, 0); }
 
     return g_fail > 0 ? 1 : 0;
 }
-#endif
+
