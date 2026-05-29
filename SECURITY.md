@@ -7,7 +7,7 @@ routa is currently in active development. Security fixes are applied to the
 
 | Branch | Supported |
 |--------|-----------|
-| main   | Yes       |
+| main   |  Yes      |
 
 ## Reporting a Vulnerability
 
@@ -42,12 +42,15 @@ Please include:
 - TLS/cryptography misconfigurations
 - Authentication bypass (JWT, Basic Auth middleware)
 - Denial-of-service via resource exhaustion
+- Race conditions in multi-worker event loop
+- Path traversal in static file serving
 
 **Out of scope:**
 
 - Vulnerabilities in dependencies (OpenSSL, zlib) — report those upstream
 - Issues in example code (`examples/`)
 - Theoretical weaknesses without a practical exploit path
+- Performance issues that do not lead to a security impact
 
 ## CVE Tracking
 
@@ -60,3 +63,6 @@ GitHub Advisory Database once a fix is confirmed.
 - CI runs `gitleaks` on every push to prevent secret leakage
 - Dependencies are scanned nightly with `trivy` for known CVEs
 - Static analysis runs `cppcheck` and `clang-tidy` on every push
+- Fuzzing targets (libFuzzer): HTTP/1.1 parser, HPACK decoder, WebSocket framing, HTTP/2 frame parser
+- ASAN + UBSAN on every CI push; MSAN + TSAN in nightly pipeline
+- Graceful shutdown prevents mid-request data corruption on SIGTERM
