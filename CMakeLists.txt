@@ -8,6 +8,10 @@ include(cmake/CompileFlags.cmake)
 
 # ── Options ──────────────────────────────────────────────────────────────────
 option(ROUTA_IO_URING "Use io_uring I/O backend (Linux only)" OFF)
+option(ACCESS_LOG "Enable JSON access logging" OFF)
+if(ACCESS_LOG)
+    target_compile_definitions(routa_core PRIVATE ROUTA_ACCESS_LOG)
+endif()
 
 # ── Dependency search paths (macOS Homebrew) ─────────────────────────────────
 if(APPLE)
@@ -45,7 +49,11 @@ add_library(routa_core STATIC ${ROUTA_SOURCES}
         include/http/cookie.h
         src/http/cookie.c
         include/http/mw_auth.h
-        src/http/mw_auth.c)
+        src/http/mw_auth.c
+        src/util/metrics.c
+        src/http/mw_metrics.c
+        include/util/metrics.h
+        include/http/mw_metrics.h)
 
 target_include_directories(routa_core PUBLIC include)
 
@@ -80,7 +88,7 @@ foreach(example hello_world config_example chunked_example ws_echo_server h2_tes
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_h2_hpack test_h2 test_auth)
+foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_h2_hpack test_h2 test_auth test_metrics)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
         add_executable(${test} tests/${test}.c)
         target_link_libraries(${test} PRIVATE routa_core)
@@ -103,6 +111,7 @@ add_test(NAME test_ws    COMMAND test_ws)
 add_test(NAME test_h2_hpack    COMMAND test_h2_hpack)
 add_test(NAME test_h2    COMMAND test_h2)
 add_test(NAME test_auth    COMMAND test_auth)
+add_test(NAME test_metrics   COMMAND test_metrics)
 
 
 add_subdirectory(fuzz)

@@ -41,36 +41,6 @@ void conn_init(conn_t *c, int fd, const char *ip, int port) {
     buf_init(&c->upstream_resp_buf);
 }
 
-/* ── conn_reset: prepare conn for keep-alive reuse ──────────────────────── */
-void conn_reset(conn_t *c) {
-    /* Keep fd, tls, recv_buf, send_buf, remote_ip, remote_port, id */
-    c->state             = CONN_READING;
-    c->keep_alive        = 1;
-    c->sendfile_fd       = -1;
-    c->sendfile_off      = 0;
-    c->sendfile_rem      = 0;
-    c->consumed          = 0;
-    c->closing           = 0;
-    c->pending_io        = 0;
-    c->recv_pending      = 0;
-    c->last_active_ms    = 0;
-    c->writev_written    = 0;
-    c->resp_body_ptr     = NULL;
-    c->resp_body_len     = 0;
-    c->send_buf_len      = 0;
-    c->upstream_fd       = -1;
-    c->upstream_node     = NULL;
-    c->upstream_conn     = NULL;
-    c->upstream_req_sent = 0;
-    c->keepalive_deadline = time(NULL) + 30;
-
-    buf_reset(&c->read_buf);
-    buf_reset(&c->write_buf);
-    buf_reset(&c->hdr_buf);
-    buf_reset(&c->upstream_req_buf);
-    buf_reset(&c->upstream_resp_buf);
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Slab allocator
  * ═══════════════════════════════════════════════════════════════════════════
@@ -213,16 +183,15 @@ void conn_free(conn_t *c) {
     if (!c) return;
     if (c->tls) tls_conn_free(c->tls);
     if (c->upstream_fd >= 0) close(c->upstream_fd);
-    if (c->h2) {
-        h2_conn_free(c->h2);
-        c->h2 = NULL;
-    }
+    if (c->h2) { h2_conn_free(c->h2); c->h2 = NULL; }
     buf_free(&c->read_buf);
     buf_free(&c->write_buf);
     buf_free(&c->hdr_buf);
     buf_free(&c->upstream_req_buf);
     buf_free(&c->upstream_resp_buf);
-    free(c->recv_buf);
-    free(c->send_buf);
-    free(c);
+    if (!c->from_slab) {
+        free(c->recv_buf);
+        free(c->send_buf);
+        free(c);
+    }
 }

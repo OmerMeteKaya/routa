@@ -62,23 +62,33 @@ ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
 ssize_t io_write_from_buf(int fd, buf_t *b, tls_conn_t *tls) {
     if (!b || b->len == 0) return 0;
 
-    ssize_t n;
+    ssize_t total = 0;
+
     if (tls) {
-        n = tls_write(tls, b->data, b->len);
-        if (n == -1) return 0;
-    } else {
-        n = write(fd, b->data, b->len);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            LOG_ERROR("io_write: %s", strerror(errno));
-            return -1;
+        while (b->len > 0) {
+            ssize_t n = tls_write(tls, b->data, b->len);
+            if (n < 0) return total > 0 ? total : 0;
+            if (n == 0) break;
+            buf_consume(b, (size_t)n);
+            total += n;
         }
+        return total;
+    } else {
+        while (b->len > 0) {
+            ssize_t n = write(fd, b->data, b->len);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    return total > 0 ? total : 0;
+                LOG_ERROR("io_write: %s", strerror(errno));
+                return -1;
+            }
+            if (n == 0) break;
+            buf_consume(b, (size_t)n);
+            total += n;
+        }
+        return total;
     }
-
-    if (n > 0) buf_consume(b, (size_t)n);
-    return n;
 }
-
 /* ── Header serialization (headers only, no body) ───────────────────────────
  * Writes status line + headers + "\r\n" into hdr_buf.
  * Does NOT include body — caller appends body via iovec or sendfile.       */
@@ -95,6 +105,7 @@ static int serialize_headers_only(const http_response_t *r, buf_t *hdr_buf) {
     int has_transfer_encoding = 0;
     for (int i = 0; i < r->header_count; i++) {
         const char *k = r->headers[i][0];
+        if (!k) continue;
         if (strcasecmp(k, "Date") == 0)              has_date = 1;
         else if (strcasecmp(k, "Server") == 0)       has_server = 1;
         else if (strcasecmp(k, "Connection") == 0)   has_connection = 1;
@@ -122,10 +133,9 @@ static int serialize_headers_only(const http_response_t *r, buf_t *hdr_buf) {
 
     /* Caller-set headers */
     for (int i = 0; i < r->header_count; i++) {
-        /* Skip Content-Length for chunked */
+        if (!r->headers[i][0] || !r->headers[i][1]) continue;
         if (r->chunked &&
             strcasecmp(r->headers[i][0], "Content-Length") == 0) continue;
-
         char hl[512];
         int hl_len = snprintf(hl, sizeof(hl), "%s: %s\r\n",
                               r->headers[i][0], r->headers[i][1]);

@@ -73,7 +73,24 @@ static const hpack_header_t hpack_static_table[] = {
     /* 61 */ {"www-authenticate",            ""},
 };
 #define HPACK_STATIC_COUNT 61
+static int static_name_idx[256];   /* hash → static table index */
+static int static_hash_ready = 0;
 
+static uint8_t header_hash(const char *s) {
+    uint8_t h = 0;
+    while (*s) h = (uint8_t)(h * 31 + (uint8_t)*s++);
+    return h;
+}
+
+static void build_static_hash(void) {
+    if (static_hash_ready) return;
+    memset(static_name_idx, 0, sizeof(static_name_idx));
+    for (int i = 1; i <= HPACK_STATIC_COUNT; i++) {
+        uint8_t h = header_hash(hpack_static_table[i].name);
+        if (!static_name_idx[h]) static_name_idx[h] = i;
+    }
+    static_hash_ready = 1;
+}
 /* ═══════════════════════════════════════════════════════════════════════════
  * RFC 7541 Appendix B — Huffman Code Table
  * Each entry: { code (MSB-aligned uint32), bit_length }
@@ -394,20 +411,61 @@ static int hpack_encode_int(uint8_t *dst, size_t dst_len,
     dst[i++] = (uint8_t)val;
     return (int)i;
 }
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Huffman decode
  * Simple bit-by-bit FSM — good enough for header sizes we deal with.
  * High-perf servers use a 256-entry lookup table; we can upgrade later.
  * ═══════════════════════════════════════════════════════════════════════════*/
 
+/* Huffman decode lookup table — build once at startup */
+typedef struct {
+    uint8_t  sym;
+    uint8_t  bits;   /* how many bits consumed */
+    uint8_t  valid;
+} huff_lut_entry_t;
+
+/* 256-entry table indexed by next 8 bits */
+static huff_lut_entry_t huff_lut[256];
+static int huff_lut_ready = 0;
+
+static void build_huff_lut(void) {
+    if (huff_lut_ready) return;
+    memset(huff_lut, 0, sizeof(huff_lut));
+    for (int sym = 0; sym < 256; sym++) {
+        int      bl   = hpack_huffman_table[sym].bits;
+        uint32_t code = hpack_huffman_table[sym].code;
+        if (bl > 8) continue;   /* only short codes fit in 8-bit LUT */
+        /* All 8-bit patterns that start with this code */
+        int pad = 8 - bl;
+        uint32_t base = code << pad;
+        uint32_t count = 1u << pad;
+        for (uint32_t i = 0; i < count; i++) {
+            uint8_t idx = (uint8_t)(base | i);
+            if (!huff_lut[idx].valid) {
+                huff_lut[idx].sym   = (uint8_t)sym;
+                huff_lut[idx].bits  = (uint8_t)bl;
+                huff_lut[idx].valid = 1;
+            }
+        }
+    }
+    huff_lut_ready = 1;
+}
 /* Build a simple decode table on first use (lazy, done once per process).
  * Maps (state, bit) → (next_state, symbol, is_terminal).
  * For now we use a straightforward approach: walk the Huffman tree.        */
 
 /* Decode Huffman-encoded src into dst (plain string, no NUL).
- * Returns decoded byte count, -1 on error.                                  */
+ * Returns decoded byte count, -1 on error.
+ *
+ * Fast path: 8-bit LUT (huff_lut) resolves codes ≤ 8 bits in O(1).
+ * All printable ASCII used in HTTP headers falls in this range (5–8 bits),
+ * so the slow 256-symbol scan is hit only for rare >8-bit codepoints.
+ * Combined complexity: O(n) for typical header content.                      */
 static int huffman_decode(const uint8_t *src, size_t src_len,
                            char *dst, size_t dst_len) {
+    if (!huff_lut_ready) build_huff_lut();
+
     uint64_t bits   = 0;
     int      n_bits = 0;
     size_t   out    = 0;
@@ -416,32 +474,49 @@ static int huffman_decode(const uint8_t *src, size_t src_len,
         bits   = (bits << 8) | src[i];
         n_bits += 8;
 
-        /* Try to match as many symbols as possible from current bits */
         int progress = 1;
         while (progress && n_bits > 0) {
             progress = 0;
+
+            /* Fast path: O(1) lookup for codes ≤ 8 bits */
+            if (n_bits >= 8) {
+                uint8_t top8 = (uint8_t)((bits >> (n_bits - 8)) & 0xffu);
+                const huff_lut_entry_t *e = &huff_lut[top8];
+                if (e->valid) {
+                    if (out >= dst_len) return -1;
+                    dst[out++] = (char)e->sym;
+                    n_bits    -= e->bits;
+                    bits      &= n_bits ? ((uint64_t)1 << n_bits) - 1 : 0;
+                    progress   = 1;
+                    continue;
+                }
+            }
+
+            /*
+             * Slow path: linear scan for codes that need more than a byte.
+             * When n_bits >= 8 the LUT already tried all codes ≤ 8 bits,
+             * so only scan long codes here.  When n_bits < 8 there are not
+             * enough bits for the LUT, so scan every code that fits.
+             */
             for (int sym = 0; sym < 256; sym++) {
                 int      bl   = hpack_huffman_table[sym].bits;
                 uint32_t code = hpack_huffman_table[sym].code;
                 if (bl > n_bits) continue;
-
-                /* Extract top bl bits from accumulator */
+                if (n_bits >= 8 && bl <= 8) continue;  /* LUT handled these */
                 uint32_t top = (uint32_t)(bits >> (n_bits - bl));
                 top &= (bl == 32) ? 0xffffffffu : ((1u << bl) - 1);
-
                 if (top == code) {
                     if (out >= dst_len) return -1;
                     dst[out++] = (char)sym;
-                    n_bits -= bl;
-                    bits   &= ((uint64_t)1 << n_bits) - 1;
-                    progress = 1;
+                    n_bits    -= bl;
+                    bits      &= n_bits ? ((uint64_t)1 << n_bits) - 1 : 0;
+                    progress   = 1;
                     break;
                 }
             }
         }
     }
 
-    /* Remaining bits must be EOS padding (all 1s), max 7 bits */
     if (n_bits > 7) return -1;
     if (n_bits > 0) {
         uint32_t pad = (uint32_t)(bits & ((1u << n_bits) - 1));
@@ -450,7 +525,6 @@ static int huffman_decode(const uint8_t *src, size_t src_len,
     }
     return (int)out;
 }
-
 /* Encode plain string src into Huffman-coded dst.
  * Returns encoded byte count, -1 if dst too small.                          */
 static int huffman_encode(const char *src, size_t src_len,
@@ -804,16 +878,19 @@ int hpack_encode(hpack_ctx_t *ctx,
         if (!name || !value) continue;   /* skip null headers */
 
         /* Static table full match? */
+        uint8_t h          = header_hash(name);
         int full_match = 0;
         int name_match = 0;
         int match_idx  = 0;
 
-        for (int s = 1; s <= HPACK_STATIC_COUNT; s++) {
-            if (strcmp(hpack_static_table[s].name, name) == 0) {
+        int start_idx = static_name_idx[h];
+        if (start_idx > 0) {
+            for (int s = start_idx; s <= HPACK_STATIC_COUNT; s++) {
+                if (strcmp(hpack_static_table[s].name, name) != 0) continue;
                 if (strcmp(hpack_static_table[s].value, value) == 0) {
                     full_match = s; break;
                 }
-                if (!name_match) { name_match = s; match_idx = s; }
+                if (!name_match) { name_match = 1; match_idx = s; }
             }
         }
 

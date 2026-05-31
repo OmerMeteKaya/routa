@@ -13,7 +13,20 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include "util/metrics.h"
 
+static const char *req_method_str(http_method_t m) {
+    switch (m) {
+        case HTTP_GET:     return "GET";
+        case HTTP_POST:    return "POST";
+        case HTTP_PUT:     return "PUT";
+        case HTTP_DELETE:  return "DELETE";
+        case HTTP_HEAD:    return "HEAD";
+        case HTTP_PATCH:   return "PATCH";
+        case HTTP_OPTIONS: return "OPTIONS";
+        default:           return "UNKNOWN";
+    }
+}
 /* ── Client connection preface (RFC 7540 §3.5) ───────────────────────────── */
 static const uint8_t H2_CLIENT_PREFACE[] =
     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -348,31 +361,7 @@ static int write_push_promise(buf_t *buf, uint32_t stream_id,
 /* Write a 103 Early Hints response as an HTTP/2 HEADERS frame.
  * hints: array of Link header values (e.g. "</style.css>; rel=preload")
  * n:     number of hints                                                    */
-static int write_early_hints(h2_conn_t *hc, uint32_t stream_id,
-                              const char **hints, int n) {
-    hpack_header_t enc_hdrs[64];
-    int nhdr = 0;
-    enc_hdrs[nhdr].name  = ":status";
-    enc_hdrs[nhdr].value = "103";
-    nhdr++;
-    for (int i = 0; i < n && nhdr < 64; i++) {
-        enc_hdrs[nhdr].name  = "link";
-        enc_hdrs[nhdr].value = (char *)hints[i];
-        nhdr++;
-    }
-    uint8_t hdr_block[4096];
-    int hdr_len = hpack_encode(&hc->hpack_tx, enc_hdrs, nhdr,
-                               hdr_block, sizeof(hdr_block));
-    if (hdr_len < 0) return -1;
-    /* Intermediate response — no END_STREAM */
-    return write_frame_hdr(&hc->write_buf, (uint32_t)hdr_len,
-                           H2_FRAME_HEADERS,
-                           H2_FLAG_END_HEADERS,
-                           stream_id);
-    /* header block follows immediately */
-    (void)buf_append(&hc->write_buf, hdr_block, (size_t)hdr_len);
-    return 0;
-}
+
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * h2_conn_new
@@ -499,6 +488,10 @@ static uint32_t frame_stream(const uint8_t *hdr) {
 
 static int conn_error(h2_conn_t *hc, h2_error_code_t code) {
     if (!hc->goaway_sent) {
+        /* Rate-limited log */
+        LOG_WARN("h2: connection error code=%u stream=%u",
+                 (unsigned)code, hc->last_stream_id);
+        ROUTA_METRIC_INC(h2_goaway_sent_total);
         write_goaway(&hc->write_buf, hc->last_stream_id, code);
         hc->goaway_sent = 1;
     }
@@ -694,6 +687,7 @@ static int handle_rst_stream(h2_conn_t *hc, const uint8_t *payload,
 
     h2_stream_t *s = stream_find(hc, stream_id);
     if (s) {
+        ROUTA_METRIC_INC(h2_rst_streams_total);
         buf_reset(&s->pending_data);
         s->pending_offset = 0;
         s->state = H2_STREAM_CLOSED;
@@ -716,10 +710,12 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
     req->version_major = 2;
     req->version_minor = 0;
     req->keep_alive    = 1;
-
+    req->headers_owned = 1;
     for (int i = 0; i < s->header_count; i++) {
         const char *name  = s->headers[i].name;
         const char *value = s->headers[i].value;
+        if (!name || !value) continue;
+
         if (strcmp(name, ":method") == 0) {
             if      (strcmp(value, "GET")     == 0) req->method = HTTP_GET;
             else if (strcmp(value, "POST")    == 0) req->method = HTTP_POST;
@@ -728,60 +724,46 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
             else if (strcmp(value, "HEAD")    == 0) req->method = HTTP_HEAD;
             else if (strcmp(value, "PATCH")   == 0) req->method = HTTP_PATCH;
             else if (strcmp(value, "OPTIONS") == 0) req->method = HTTP_OPTIONS;
-            else req->method = HTTP_METHOD_UNKNOWN;
         } else if (strcmp(name, ":path") == 0) {
             const char *q = strchr(value, '?');
-            free(req->path);
-            free(req->query);
             if (q) {
                 req->path  = strndup(value, (size_t)(q - value));
                 req->query = strdup(q + 1);
             } else {
                 req->path  = strdup(value);
-                req->query = NULL;
             }
-        } else if (strcmp(name, ":authority") == 0) {  // NOLINT(bugprone-branch-clone)
-            /* handled elsewhere */
-        } else if (strcmp(name, "content-length") == 0) {
-            /* handled elsewhere */
         }
 
         if (req->header_count < 64) {
-            req->headers[req->header_count].key   = strdup(name);
-            req->headers[req->header_count].value = strdup(value);
-            if (req->headers[req->header_count].key &&
-                req->headers[req->header_count].value) {
-                req->header_count++;
-                } else {
-                    free(req->headers[req->header_count].key);
-                    free(req->headers[req->header_count].value);
-                    req->headers[req->header_count].key   = NULL;
-                    req->headers[req->header_count].value = NULL;
-                }
+            /* STEAL pointer — no strdup, no copy */
+            req->headers[req->header_count].key   = s->headers[i].name;
+            req->headers[req->header_count].value = s->headers[i].value;
+            req->header_count++;
+            /* Mark as stolen so stream cleanup doesn't double-free */
+            s->headers[i].name  = NULL;
+            s->headers[i].value = NULL;
         }
     }
     if (!req->path) req->path = strdup("/");
 
     if (s->body.len > 0) {
-        req->body = malloc(s->body.len);
-        if (req->body) {
-            memcpy(req->body, s->body.data, s->body.len);
-            req->body_len = s->body.len;
-        }
+        req->body     = s->body.data;
+        req->body_len = s->body.len;
+        /* Steal body buffer */
+        s->body.data = NULL;
+        s->body.len  = 0;
+        s->body.cap  = 0;
     }
     return 0;
 }
-
 /* ── Write HTTP response as H2 HEADERS + DATA frames ────────────────────── */
 static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                           http_response_t *resp) {
     char status_str[4];
     (void)snprintf(status_str, sizeof(status_str), "%d", resp->status);
 
-    int max_h = resp->header_count + 3;
-    hpack_header_t *enc_headers = calloc((size_t)max_h,
-                                          sizeof(hpack_header_t));
-    if (!enc_headers) return -1;
+    hpack_header_t enc_headers[35];
+    memset(enc_headers, 0, sizeof(enc_headers));
 
     int nhdr = 0;
     enc_headers[nhdr].name  = ":status";
@@ -798,23 +780,19 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
 
     for (int i = 0; i < resp->header_count; i++) {
         const char *hname = resp->headers[i][0];
+        const char *hval  = resp->headers[i][1];
         if (!hname || hname[0] == '\0') continue;
-        if (strcasecmp(hname, "connection")        == 0 ||
-            strcasecmp(hname, "keep-alive")        == 0 ||
-            strcasecmp(hname, "transfer-encoding") == 0 ||
-            strcasecmp(hname, "upgrade")           == 0 ||
-            strcasecmp(hname, "content-length")    == 0) continue;
-        const char *hval = resp->headers[i][1];
         if (!hval) continue;
+        /* content-length is emitted above; skip duplicates from set_body */
+        if (strcasecmp(hname, "content-length") == 0) continue;
         enc_headers[nhdr].name  = (char *)hname;
         enc_headers[nhdr].value = (char *)hval;
         nhdr++;
     }
 
-    uint8_t hdr_block[16384];
+    uint8_t hdr_block[4096];
     int hdr_len = hpack_encode(&hc->hpack_tx, enc_headers, nhdr,
                                 hdr_block, sizeof(hdr_block));
-    free(enc_headers);
     if (hdr_len < 0) return -1;
 
     /* FIX: correctly detect body presence including fd path              */
@@ -832,20 +810,20 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
 
     /* ── body_fd path (read into buffer, then flow-control-aware send) ── */
     if (resp->body_fd >= 0 && resp->body_len > 0) {
-        /* Read file into a temporary buffer.
-         * For large files this is not ideal but correct; zero-copy
-         * sendfile for H2 requires deeper integration and comes with
-         * the io_uring milestone.                                         */
+        #define FBUF_SZ 65536
+        uint8_t *fbuf = malloc(FBUF_SZ);
+        if (!fbuf) return -1;
+
         size_t total  = resp->body_len;
-        size_t offset = 0;
-        uint8_t fbuf[65536];
+        size_t offset = 0;  /* bytes sent to write_buf so far */
+        int    rc     = 0;
 
         while (offset < total) {
             size_t want = total - offset;
-            if (want > sizeof(fbuf)) want = sizeof(fbuf);
+            if (want > FBUF_SZ) want = FBUF_SZ;
 
             ssize_t nr = read(resp->body_fd, fbuf, want);
-            if (nr <= 0) break;   /* EOF or error — send what we have     */
+            if (nr <= 0) break;
 
             size_t rem = (size_t)nr;
             const uint8_t *ptr = fbuf;
@@ -856,19 +834,35 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                 int32_t win = conn_win < stream_win ? conn_win : stream_win;
 
                 if (win <= 0) {
-                    /* Buffer remainder in pending_data                   */
-                    if (buf_append(&s->pending_data, ptr, rem) < 0)
-                        return -1;
-                    /* Also buffer remaining file data we haven't read    */
-                    size_t file_rem = total - offset - (size_t)nr + rem;
-                    if (file_rem > 0) {
-                        /* We'll re-read on flush — pending_data carries
-                         * a "needs_fd" marker; for now buffer what we
-                         * have and note offset.  Full zero-copy deferred
-                         * to io_uring milestone.                          */
+                    /*
+                     * Window exhausted. Save the unprocessed bytes from the
+                     * current read (ptr..ptr+rem) plus ALL remaining file
+                     * content into pending_data. Without draining the fd here,
+                     * http_response_destroy() would close body_fd and those
+                     * bytes would be silently lost, producing a truncated
+                     * response followed by a broken-pipe or RST_STREAM.
+                     *
+                     * fd_rem = total - offset - rem:
+                     *   offset = bytes already sent
+                     *   rem    = bytes read into fbuf but not yet sent
+                     *   fd_rem = bytes still unread in the file
+                     */
+                    if (buf_append(&s->pending_data, ptr, rem) < 0) {
+                        rc = -1; goto fd_done;
+                    }
+                    size_t fd_rem = total - offset - rem;
+                    while (fd_rem > 0) {
+                        size_t want2 = fd_rem < FBUF_SZ ? fd_rem : FBUF_SZ;
+                        ssize_t nr2 = read(resp->body_fd, fbuf, want2);
+                        if (nr2 <= 0) break;
+                        if (buf_append(&s->pending_data, fbuf,
+                                       (size_t)nr2) < 0) {
+                            rc = -1; goto fd_done;
+                        }
+                        fd_rem -= (size_t)nr2;
                     }
                     s->pending_offset = 0;
-                    return 0;
+                    goto fd_done;
                 }
 
                 size_t can_send = (size_t)win < rem ? (size_t)win : rem;
@@ -880,8 +874,12 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                 if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
                                     H2_FRAME_DATA,
                                     end ? H2_FLAG_END_STREAM : 0,
-                                    stream_id) < 0) return -1;
-                if (buf_append(&hc->write_buf, ptr, chunk) < 0) return -1;
+                                    stream_id) < 0) {
+                    rc = -1; goto fd_done;
+                }
+                if (buf_append(&hc->write_buf, ptr, chunk) < 0) {
+                    rc = -1; goto fd_done;
+                }
 
                 hc->send_window -= (int32_t)chunk;
                 s->send_window  -= (int32_t)chunk;
@@ -889,7 +887,10 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                 rem -= chunk;
             }
         }
-        return 0;
+
+        fd_done:
+            free(fbuf);
+        return rc;
     }
 
     /* ── in-memory body path ─────────────────────────────────────────── */
@@ -902,6 +903,7 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
             int32_t stream_win = s->send_window;
             int32_t win        = conn_win < stream_win ? conn_win : stream_win;
             if (win <= 0) {
+                ROUTA_METRIC_INC(h2_flow_control_stalls_total);
                 if (buf_append(&s->pending_data, ptr, rem) < 0) return -1;
                 s->pending_offset = 0;
                 return 0;
@@ -1047,9 +1049,6 @@ int h2_early_hints(h2_conn_t *hc, uint32_t stream_id,
                         stream_id) < 0) return -1;
     if (buf_append(&hc->write_buf, hdr_block, (size_t)hdr_len) < 0)
         return -1;
-
-    /* Suppress unused function warning for the static helper             */
-    (void)write_early_hints;
     return 0;
 }
 
@@ -1057,9 +1056,11 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
                             uint32_t stream_id,
                             struct router *router,
                             struct middleware_chain *chain) {
+    uint64_t dispatch_start = routa_now_us();
     http_request_t  req;
     http_response_t resp;
     stream_to_request(s, &req);
+    req.start_us = dispatch_start;
     http_response_init(&resp);
 
     int allowed = 0;
@@ -1080,6 +1081,19 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
     }
     http_response_set_header(&resp, "server", "routa");
     int rc = send_response(hc, stream_id, s, &resp);
+
+    const char *mstr = req_method_str(req.method);
+    uint64_t latency = routa_now_us() - dispatch_start;
+    routa_metrics_record(mstr, resp.status, dispatch_start, resp.body_len);
+    log_access_json(req.trace_id[0] ? req.trace_id : "0000000000000000",
+                    mstr,
+                    req.path ? req.path : "/",
+                    resp.status,
+                    latency,
+                    hc->conn->remote_ip,
+                    0,
+                    resp.body_len);
+
     http_response_destroy(&resp);
     http_request_free(&req);
     return rc;
@@ -1133,6 +1147,8 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
             return 0;
         }
         hc->last_stream_id = stream_id;
+        ROUTA_METRIC_INC(h2_streams_opened_total);
+        ROUTA_METRIC_INC(h2_active_streams);
     }
 
     if (buf_append(&s->header_block, hdr_data, hdr_len) < 0)
@@ -1171,9 +1187,10 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
         buf_reset(&s->body);
-        write_window_update(&hc->write_buf, 0, (uint32_t)length);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
+            ROUTA_METRIC_INC(h2_streams_closed_total);
+            ROUTA_METRIC_DEC(h2_active_streams);
             stream_remove(hc, stream_id);
         } else {
             s->state = H2_STREAM_HALF_CLOSED_REMOTE;
@@ -1280,8 +1297,12 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
 
     if (dlen > 0) {
         hc->recv_window += (int32_t)dlen;
+        hc->recv_pending_update += dlen;
+        if (hc->recv_pending_update >= (uint32_t)(hc->recv_window / 2)) {
+            write_window_update(&hc->write_buf, 0, hc->recv_pending_update);
+            hc->recv_pending_update = 0;
+        }
         write_window_update(&hc->write_buf, stream_id, dlen);
-        write_window_update(&hc->write_buf, 0, dlen);
     }
 
     if (flags & H2_FLAG_END_STREAM) {
@@ -1290,6 +1311,8 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
         buf_reset(&s->body);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
+            ROUTA_METRIC_INC(h2_streams_closed_total);
+            ROUTA_METRIC_DEC(h2_active_streams);
             stream_remove(hc, stream_id);
         } else {
             s->state = H2_STREAM_HALF_CLOSED_REMOTE;
@@ -1440,76 +1463,107 @@ int h2_conn_recv(h2_conn_t *hc,
         hc->preface_done = 1;
     }
 
-    while (rb->len >= H2_FRAME_HDR_SZ) {
-        const uint8_t *hdr     = (const uint8_t *)rb->data;
-        uint32_t       pay_len = frame_length(hdr);
-        uint8_t        type    = frame_type(hdr);
-        uint8_t        flags   = frame_flags(hdr);
-        uint32_t       sid     = frame_stream(hdr);
-
-        if (rb->len < H2_FRAME_HDR_SZ + pay_len) break;
-
-        /* FIX: max_frame_size — reject oversized frames at the top level
-         * before dispatching to per-type handlers.                        */
-        if (pay_len > hc->peer_max_frame_size &&
-            type != H2_FRAME_SETTINGS) {   /* SETTINGS has its own check  */
-            return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
-        }
-
-        const uint8_t *payload = (const uint8_t *)rb->data + H2_FRAME_HDR_SZ;
-
-        if (hc->continuation_stream_id != 0 &&
-            type != H2_FRAME_CONTINUATION)
-            return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
-
-        int rc = 0;
-        switch (type) {
-        case H2_FRAME_SETTINGS:
-            rc = handle_settings(hc, payload, pay_len, flags);
-            break;
-        case H2_FRAME_PING:
-            rc = handle_ping(hc, payload, pay_len, flags, sid);
-            break;
-        case H2_FRAME_WINDOW_UPDATE:
-            rc = handle_window_update(hc, payload, pay_len, sid);
-            break;
-        case H2_FRAME_RST_STREAM:
-            rc = handle_rst_stream(hc, payload, pay_len, sid);
-            break;
-        case H2_FRAME_GOAWAY:
-            rc = handle_goaway(hc, payload, pay_len);
-            break;
-        case H2_FRAME_HEADERS:
-            rc = handle_headers(hc, sid, payload, pay_len, flags,
-                                router, chain);
-            break;
-        case H2_FRAME_CONTINUATION:
-            rc = handle_continuation(hc, sid, payload, pay_len, flags,
-                                     router, chain);
-            break;
-        case H2_FRAME_DATA:
-            rc = handle_data(hc, sid, payload, pay_len, flags,
-                             router, chain);
-            break;
-        case H2_FRAME_PRIORITY:
-            /* Deprecated in RFC 9113 — silently ignore                   */
-            break;
-        case H2_FRAME_PUSH_PROMISE:
-            /* Clients MUST NOT send PUSH_PROMISE (RFC 7540 §8.2)         */
-            return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
-        default:
-            /* Unknown frame types MUST be ignored (RFC 7540 §4.1)        */
-            break;
-        }
-        {
-            struct timespec _rts;
-            clock_gettime(CLOCK_MONOTONIC, &_rts);
-            hc->last_recv_ts = (uint64_t)_rts.tv_sec * 1000 +
-                               (uint64_t)_rts.tv_nsec / 1000000;
-        }
-        buf_consume(rb, H2_FRAME_HDR_SZ + pay_len);
-        if (rc < 0) return -1;
+    size_t offset = 0;
+    if (hc->write_buf.len > 4 * 1024 * 1024) {
+        LOG_WARN("h2: write buffer exceeded 4MB, closing connection");
+        return conn_error(hc, H2_ERR_ENHANCE_YOUR_CALM);
     }
+while (rb->len - offset >= H2_FRAME_HDR_SZ) {
+    const uint8_t *hdr     = (const uint8_t *)rb->data + offset;
+    uint32_t       pay_len = frame_length(hdr);
+    uint8_t        type    = frame_type(hdr);
+    uint8_t        flags   = frame_flags(hdr);
+    uint32_t       sid     = frame_stream(hdr);
+
+    if (rb->len - offset < H2_FRAME_HDR_SZ + pay_len) break;
+
+    if (pay_len > hc->peer_max_frame_size &&
+        type != H2_FRAME_SETTINGS) {
+        buf_consume(rb, offset);
+        return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
+    }
+
+    const uint8_t *payload = hdr + H2_FRAME_HDR_SZ;
+
+    if (hc->continuation_stream_id != 0 &&
+        type != H2_FRAME_CONTINUATION) {
+        buf_consume(rb, offset);
+        return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
+    }
+
+    int rc = 0;
+    switch (type) {
+    case H2_FRAME_SETTINGS:
+        rc = handle_settings(hc, payload, pay_len, flags);
+        break;
+    case H2_FRAME_PING:
+        rc = handle_ping(hc, payload, pay_len, flags, sid);
+        break;
+    case H2_FRAME_WINDOW_UPDATE:
+        rc = handle_window_update(hc, payload, pay_len, sid);
+        break;
+    case H2_FRAME_RST_STREAM:
+        rc = handle_rst_stream(hc, payload, pay_len, sid);
+        break;
+    case H2_FRAME_GOAWAY:
+        rc = handle_goaway(hc, payload, pay_len);
+        break;
+    case H2_FRAME_HEADERS:
+        rc = handle_headers(hc, sid, payload, pay_len, flags,
+                            router, chain);
+        break;
+    case H2_FRAME_CONTINUATION:
+        rc = handle_continuation(hc, sid, payload, pay_len, flags,
+                                 router, chain);
+        break;
+    case H2_FRAME_DATA:
+        rc = handle_data(hc, sid, payload, pay_len, flags,
+                         router, chain);
+        break;
+    case H2_FRAME_PRIORITY:
+        break;
+    case H2_FRAME_PUSH_PROMISE:
+        buf_consume(rb, offset);
+        return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
+    default:
+        break;
+    }
+
+    if (hc->send_window > 0) {
+        if (hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR) {
+            for (int _i = 0; _i < hc->streams.pool.count; _i++) {
+                h2_stream_t *_s = &hc->streams.pool.slots[_i];
+                if (_s->pending_data.len > _s->pending_offset)
+                    flush_pending(hc, _s);
+            }
+        } else {
+            for (int _i = 0; _i < hc->streams.map.capacity; _i++) {
+                if (!hc->streams.map.keys[_i]) continue;
+                h2_stream_t *_s = hc->streams.map.buckets[_i];
+                if (_s->pending_data.len > _s->pending_offset)
+                    flush_pending(hc, _s);
+            }
+        }
+    }
+
+    hc->frame_count++;
+    if ((hc->frame_count & 15) == 0) {
+        struct timespec _rts;
+        clock_gettime(CLOCK_MONOTONIC, &_rts);
+        hc->last_recv_ts = (uint64_t)_rts.tv_sec * 1000 +
+                           (uint64_t)_rts.tv_nsec / 1000000;
+    }
+
+    offset += H2_FRAME_HDR_SZ + pay_len;
+
+    if (rc < 0) {
+        buf_consume(rb, offset);
+        return -1;
+    }
+}
+
+if (offset > 0)
+    buf_consume(rb, offset);
     return 0;
 }
 

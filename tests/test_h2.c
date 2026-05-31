@@ -248,6 +248,10 @@ static void register_routes(event_loop_t *loop) {
 }
 
 static void run_server_upgrade(void) {
+    int maxfd = (int)sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
+
     event_loop_t *loop = event_loop_new(TEST_PORT_UPGRADE, 1);
     if (!loop) exit(1);
     routa_config_t cfg;
@@ -261,6 +265,10 @@ static void run_server_upgrade(void) {
 
 /* TLS server (ALPN h2) */
 static void run_server_tls(void) {
+    int maxfd = (int)sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
+
     const char *cert = getenv("ROUTA_TEST_CERT");
     const char *key  = getenv("ROUTA_TEST_KEY");
     if (!cert) cert = TEST_CERT;
@@ -277,6 +285,10 @@ static void run_server_tls(void) {
 
 /* Cleartext h2c server (no TLS) */
 static void run_server_h2c(void) {
+    int maxfd = (int)sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
+
     event_loop_t *loop = event_loop_new(TEST_PORT_H2C, 1);
     if (!loop) exit(1);
     routa_config_t cfg;
@@ -324,6 +336,28 @@ static int wait_for_server(int port, int timeout_ms) {
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000L };
         nanosleep(&ts, NULL);
         waited += 50;
+    }
+    return -1;
+}
+static int wait_for_tls_server(int port, int timeout_ms) {
+    int waited = 0;
+    while (waited < timeout_ms) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd),
+            "curl -sk --max-time 2 --http2 "
+            "https://127.0.0.1:%d/hello "
+            "-o /dev/null -w '%%{http_code}' 2>/dev/null",
+            port);
+        FILE *f = popen(cmd, "r");
+        if (f) {
+            char out[8] = {0};
+            fread(out, 1, sizeof(out)-1, f);
+            pclose(f);
+            if (atoi(out) == 200) return 0;
+        }
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000L };
+        nanosleep(&ts, NULL);
+        waited += 100;
     }
     return -1;
 }
@@ -1257,7 +1291,9 @@ int main(void) {
     int startup_ok = 1;
 
     if (!skip_tls) {
-        if (wait_for_server(TEST_PORT, 10000) < 0) {
+        g_pid_tls = fork();
+        if (g_pid_tls == 0) run_server_tls();
+        if (wait_for_tls_server(TEST_PORT, 10000) < 0) {
             FAIL("server startup", "TLS server timeout");
             startup_ok = 0;
         }
@@ -1266,6 +1302,9 @@ int main(void) {
     if (wait_for_server(TEST_PORT_H2C, 5000) < 0) {
         FAIL("server startup", "h2c server timeout");
         startup_ok = 0;
+    } else {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000000L };
+        nanosleep(&ts, NULL);
     }
 
     if (wait_for_server(TEST_PORT_UPGRADE, 5000) < 0) {

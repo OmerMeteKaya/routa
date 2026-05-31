@@ -15,7 +15,7 @@ static int chunked_handler(const http_request_t *req,
 }
 
 int main(void) {
-    server_t *s = server_new(8080, 4);
+    server_t *s = server_new(8080, 6);
     server_route(s, "/chunked", HTTP_GET_M, chunked_handler, NULL);
     server_run(s);
     server_free(s);

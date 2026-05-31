@@ -7,15 +7,21 @@
 
 typedef struct {
     int    status;
-    char  *reason;      // heap or literal — use flag
-    char   headers[32][2][256]; // [i][0]=key [i][1]=value
+    char  *reason;      /* heap or literal */
+    /*
+     * Headers stored as pointer pairs: [i][0]=key (literal, not owned),
+     * [i][1]=value (heap copy via strdup, freed in http_response_destroy).
+     * Size: 32 × 2 × 8 = 512 B, down from char[32][2][256] = 16 KB.
+     * Access syntax (headers[i][0], headers[i][1]) is unchanged.
+     */
+    const char *headers[32][2];
     int    header_count;
-    char  *body;        // heap allocated or NULL
+    char  *body;        /* heap allocated or NULL */
     size_t body_len;
-    int    body_fd;      /* -1 = no fd body, >= 0 = use sendfile() */
-    off_t  body_fd_off;  /* offset to start from */
-    size_t body_fd_len; /* number of bytes to send */
-    int    chunked;      /* 1 = use Transfer-Encoding: chunked, no Content-Length */
+    int    body_fd;     /* -1 = no fd body, >= 0 = use sendfile() */
+    off_t  body_fd_off;
+    size_t body_fd_len;
+    int    chunked;     /* 1 = Transfer-Encoding: chunked, no Content-Length */
 } http_response_t;
 
 void http_response_init(http_response_t *r);

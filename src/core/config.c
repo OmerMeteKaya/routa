@@ -10,7 +10,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <pthread.h>
-
+#define H2_INITIAL_WINDOW_SIZE   (1 * 1024 * 1024)
+#define H2_CONNECTION_WINDOW_SIZE (4 * 1024 * 1024)
 
 /* Get CPU count for default n_workers */
 #ifdef __linux__
@@ -50,7 +51,7 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->h2.huffman_encoding       = 1;
     cfg->h2.dynamic_table_update   = 1;
     cfg->h2.initial_window_size    = 1048576;
-    cfg->h2.max_frame_size         = 16384;
+    cfg->h2.max_frame_size         = 65536;
     cfg->h2.max_header_list_size   = 0;
     cfg->h2.max_concurrent_streams = 128;
     cfg->h2.stream_timeout_ms      = 30000;

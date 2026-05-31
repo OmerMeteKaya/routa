@@ -3,6 +3,7 @@
 #endif
 #include "core/event_loop.h"
 #include "core/conn.h"
+#include "util/metrics.h"
 #include "net/poller.h"
 #include "net/socket.h"
 #include "net/io.h"
@@ -31,6 +32,8 @@
 #if defined(__linux__)
 #include <sys/eventfd.h>
 #endif
+#include <netinet/tcp.h>
+
 #include "core/config.h"
 #include "http/h2.h"
 
@@ -73,6 +76,11 @@ struct event_loop {
      * hold rdlock; reloader (worker 0) holds wrlock while swapping.        */
     pthread_rwlock_t tls_reload_lock;
 };
+static inline void conn_poller_mod(worker_t *w, conn_t *conn, uint32_t mask) {
+    if ((uint32_t)conn->poller_mask == mask) return;
+    conn->poller_mask = (uint8_t)mask;
+    poller_mod(w->poller, conn->fd, mask, conn);
+}
 static int ws_route_placeholder(const http_request_t *req,
                                  http_response_t *resp, void *ctx) {
     (void)req; (void)ctx;
@@ -163,6 +171,7 @@ static int handle_ws_read(worker_t *w, conn_t *conn) {
     int rc = ws_recv(conn, handler, cfg);
     if (rc < 0) {
         ws_registry_remove(&w->ws_registry, conn);
+        ROUTA_METRIC_INC(ws_disconnects_total);
         return -1;
     }
     return 0;
@@ -201,17 +210,22 @@ static int send_file_tls(worker_t *w, conn_t *conn,
 static void conn_close_and_free(worker_t *w, conn_t *conn) {
     poller_del(w->poller, conn->fd);
     conn_remove(w, conn);
+    if (conn->h2 && conn->h2->write_buf.len > 0)
+        h2_conn_flush(conn->h2);
     if (conn->tls) tls_shutdown(conn->tls);
     if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
     if (conn->upstream_fd >= 0) { close(conn->upstream_fd); conn->upstream_fd = -1; }
-    if (conn->h2 && conn->h2->write_buf.len > 0)
-        h2_conn_flush(conn->h2);
     shutdown(conn->fd, SHUT_WR);
     net_close(conn->fd);
     conn_reset_write_state(conn);
-    conn_free(conn);
+    conn_free(conn);   /* h2_conn_free + NULL inside */
+    if (w->slab && conn->from_slab) {
+        buf_reset(&conn->read_buf);
+        buf_reset(&conn->write_buf);
+        buf_reset(&conn->hdr_buf);
+        conn_slab_release(w->slab, conn);
+    }
 }
-
 /* ── Build and stash response on conn for writev path ───────────────────────
  *
  * Serializes headers into conn->hdr_buf immediately (not lazily) so that
@@ -246,7 +260,18 @@ static void conn_prepare_writev(conn_t *conn, http_response_t *resp) {
         resp->body_len      = 0;
     }
 }
-
+static const char *req_method_str(http_method_t m) {
+    switch (m) {
+        case HTTP_GET:     return "GET";
+        case HTTP_POST:    return "POST";
+        case HTTP_PUT:     return "PUT";
+        case HTTP_DELETE:  return "DELETE";
+        case HTTP_HEAD:    return "HEAD";
+        case HTTP_PATCH:   return "PATCH";
+        case HTTP_OPTIONS: return "OPTIONS";
+        default:           return "UNKNOWN";
+    }
+}
 /* ── 400/404/405 fast-path: serialize into write_buf (no body steal) ────────
  * These simple error responses go through the legacy write_buf path because
  * http_response_simple() writes into a buf_t directly.
@@ -290,11 +315,28 @@ static void handle_events_worker(worker_t *w) {
                 }
                 if (net_set_nonblocking(client_fd) < 0) { net_close(client_fd); continue; }
 
+                /* TCP_NODELAY */
+                int flag = 1;
+                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+#ifdef TCP_QUICKACK
+                int qa = 1;
+                setsockopt(client_fd, IPPROTO_TCP, TCP_QUICKACK, &qa, sizeof(qa));
+#endif
                 char client_ip[INET_ADDRSTRLEN] = {0};
                 inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
-                conn_t *conn = conn_new(client_fd, client_ip, ntohs(client_addr.sin_port));
+                conn_t *conn;
+                if (w->slab) {
+                    conn = conn_slab_acquire(w->slab);
+                    if (conn) {
+                        conn_init(conn, client_fd, client_ip, ntohs(client_addr.sin_port));
+                        conn->from_slab = 1;
+                    }
+                } else {
+                    conn = conn_new(client_fd, client_ip, ntohs(client_addr.sin_port));
+                }
                 if (!conn) { net_close(client_fd); continue; }
+                routa_metrics_conn_open();
 
                 if (w->active_conn_count < w->max_connections) {
                     w->active_conns[w->active_conn_count++] = conn;
@@ -358,11 +400,20 @@ static void handle_events_worker(worker_t *w) {
                         goto handle_state;
                     }
                     int rrc = h2_conn_recv(conn->h2, w->router, w->chain);
+                    if (conn->h2->write_buf.len > 0) {
+                        h2_conn_flush(conn->h2);
+                    }
+                    if (conn->h2->write_buf.len > 0) {
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET);
+                    } else {
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_ET);
+                    }
                     if (rrc < 0) {
                         if (conn->h2->write_buf.len > 0) {
-                            poller_mod(w->poller, conn->fd,
-                                       POLLER_READ | POLLER_WRITE | POLLER_ET,
-                                       conn);
+                            conn_poller_mod(w, conn,
+                                       POLLER_READ | POLLER_WRITE | POLLER_ET);
                         } else {
                             conn->state = CONN_CLOSING;
                             goto handle_state;
@@ -372,11 +423,11 @@ static void handle_events_worker(worker_t *w) {
                 }
 
                 if (conn->h2->write_buf.len > 0) {
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET);
                 } else {
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_ET, conn);
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_ET);
                 }
                 continue;
             }
@@ -385,6 +436,7 @@ static void handle_events_worker(worker_t *w) {
                 ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf, conn->tls);
                 if (n == 0) {
                     ws_registry_remove(&w->ws_registry, conn);
+                    ROUTA_METRIC_INC(ws_disconnects_total);
                     ws_frame_state_free(&conn->ws_fs);
                     conn->state = CONN_CLOSING;
                     goto handle_state;
@@ -394,8 +446,8 @@ static void handle_events_worker(worker_t *w) {
                     if (conn->write_buf.len > 0) {
                         conn->keep_alive = 0;
                         conn->state = CONN_WEBSOCKET;
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET);
                     } else {
                         conn->state = CONN_CLOSING;
                         goto handle_state;
@@ -404,8 +456,8 @@ static void handle_events_worker(worker_t *w) {
                 }
                 // Flush any responses (pong, close echo) that ws_recv wrote
                 if (conn->write_buf.len > 0) {
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET);
                 }
                 continue;
             }
@@ -483,6 +535,9 @@ static void handle_events_worker(worker_t *w) {
             if (conn->state == CONN_TLS_HANDSHAKE) {
                 int hs = tls_handshake(conn->tls);
                 if (hs == 0) {
+                    ROUTA_METRIC_INC(tls_handshakes_total);
+                    if (tls_session_resumed(conn->tls))
+                        ROUTA_METRIC_INC(tls_resumptions_total);
                     const char *proto = tls_negotiated_protocol(conn->tls);
                     if (proto && strcmp(proto, "h2") == 0) {
                         conn->h2 = h2_conn_new(conn, &w->h2_cfg);
@@ -492,20 +547,21 @@ static void handle_events_worker(worker_t *w) {
                         }
                         conn->state = CONN_H2;
                         h2_conn_flush(conn->h2);
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET);
                     } else {
                         conn->state = CONN_READING;
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_ET);
                     }
                 } else if (hs == 1 || hs == -1) {
                     /* Always watch both during handshake — TLS 1.3 needs it         */
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET);
                 } else {
                     poller_del(w->poller, conn->fd);
                     conn_remove(w, conn);
+                    ROUTA_METRIC_INC(tls_errors_total);
                     if (conn->tls) tls_shutdown(conn->tls);
                     net_close(conn->fd); conn_free(conn); continue;
                 }
@@ -537,8 +593,8 @@ static void handle_events_worker(worker_t *w) {
                     }
                     conn->state = CONN_H2;
                     h2_conn_flush(conn->h2);
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET);
                     continue;
                     }
             }
@@ -548,6 +604,7 @@ static void handle_events_worker(worker_t *w) {
                 buf_reset(&conn->write_buf);
                 http_response_simple(&conn->write_buf, 400, "Bad Request",
                                      "text/plain", "Bad Request\n");
+                ROUTA_METRIC_INC(parse_errors_total);
                 conn->keep_alive = 0;
                 conn_reset_write_state(conn);   /* ensure writev state clear */
                 conn->state = CONN_WRITING;
@@ -596,8 +653,8 @@ static void handle_events_worker(worker_t *w) {
                     conn->state    = CONN_H2;
                     http_request_free(&req);
                     h2_conn_flush(conn->h2);
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET);
                     continue;
                 }
             }
@@ -659,6 +716,23 @@ static void handle_events_worker(worker_t *w) {
                 http_response_set_header(&resp, "Allow", allow_hdr);
                 http_response_set_body(&resp, "Method Not Allowed\n", 20);
                 conn_prepare_writev(conn, &resp);
+                /* ── Observability stash ── */
+                strncpy(conn->last_trace_id,
+                        req.trace_id[0] ? req.trace_id : "0000000000000000",
+                        sizeof(conn->last_trace_id) - 1);
+                strncpy(conn->last_method_str,
+                        req_method_str(req.method),
+                        sizeof(conn->last_method_str) - 1);
+                strncpy(conn->last_path,
+                        req.path ? req.path : "/",
+                        sizeof(conn->last_path) - 1);
+                conn->last_status   = resp.status;
+                conn->last_start_us = req.start_us;
+
+                http_response_destroy(&resp);
+                http_request_free(&req);
+                conn->state = CONN_WRITING;
+                goto handle_state;
                 http_response_destroy(&resp);
                 http_request_free(&req);
                 conn->state = CONN_WRITING;
@@ -790,8 +864,8 @@ static void handle_events_worker(worker_t *w) {
                 }
                 if (conn->h2->write_buf.len > 0) {
                     /* Partial flush — keep watching for write             */
-                    poller_mod(w->poller, conn->fd,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_WRITE | POLLER_ET);
                 } else {
                     /* All flushed */
                     if (conn->h2->error) {
@@ -811,9 +885,8 @@ static void handle_events_worker(worker_t *w) {
                         int rrc = h2_conn_recv(conn->h2, w->router, w->chain);
                         if (rrc < 0) {
                             if (conn->h2->write_buf.len > 0) {
-                                poller_mod(w->poller, conn->fd,
-                                           POLLER_READ | POLLER_WRITE | POLLER_ET,
-                                           conn);
+                                conn_poller_mod(w, conn,
+                                           POLLER_READ | POLLER_WRITE | POLLER_ET);
                             } else {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
@@ -822,11 +895,11 @@ static void handle_events_worker(worker_t *w) {
                         }
                     }
                     if (conn->h2->write_buf.len > 0) {
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET);
                     } else {
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_ET);
                     }
                     h2_write_done:
                     continue;
@@ -839,6 +912,7 @@ static void handle_events_worker(worker_t *w) {
                     ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
                     if (n < 0) {
                         ws_registry_remove(&w->ws_registry, conn);
+                        ROUTA_METRIC_INC(ws_disconnects_total);
                         ws_frame_state_free(&conn->ws_fs);
                         conn->state = CONN_CLOSING;
                         goto handle_state;
@@ -847,12 +921,13 @@ static void handle_events_worker(worker_t *w) {
                         // All flushed — back to read-only watch
                         if (conn->ws_state == WS_STATE_CLOSED) {
                             ws_registry_remove(&w->ws_registry, conn);
+                            ROUTA_METRIC_INC(ws_disconnects_total);
                             ws_frame_state_free(&conn->ws_fs);
                             conn->state = CONN_CLOSING;
                             goto handle_state;
                         }
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_ET);
                     }
                     continue;
                 }
@@ -907,8 +982,8 @@ static void handle_events_worker(worker_t *w) {
                         conn->upstream_req_sent = 0;
                         buf_reset(&conn->upstream_req_buf);
                         conn->state = CONN_UPSTREAM_READING;
-                        poller_mod(w->poller, conn->upstream_fd,
-                                   POLLER_READ | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_ET);
                     }
                     continue;
                 }
@@ -917,6 +992,9 @@ static void handle_events_worker(worker_t *w) {
                 if (conn->state == CONN_TLS_HANDSHAKE) {
                     int hs = tls_handshake(conn->tls);
                     if (hs == 0) {
+                        ROUTA_METRIC_INC(tls_handshakes_total);
+                        if (tls_session_resumed(conn->tls))
+                            ROUTA_METRIC_INC(tls_resumptions_total);
                         const char *proto = tls_negotiated_protocol(conn->tls);
                         if (proto && strcmp(proto, "h2") == 0) {
                             conn->h2 = h2_conn_new(conn, &w->h2_cfg);
@@ -926,20 +1004,21 @@ static void handle_events_worker(worker_t *w) {
                             }
                             conn->state = CONN_H2;
                             h2_conn_flush(conn->h2);
-                            poller_mod(w->poller, conn->fd,
-                                       POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                            conn_poller_mod(w, conn,
+                                       POLLER_READ | POLLER_WRITE | POLLER_ET);
                         } else {
                             conn->state = CONN_READING;
-                            poller_mod(w->poller, conn->fd,
-                                       POLLER_READ | POLLER_ET, conn);
+                            conn_poller_mod(w, conn,
+                                       POLLER_READ | POLLER_ET);
                         }
                     } else if (hs == 1 || hs == -1) {
                         /* Always watch both during handshake — TLS 1.3 needs it         */
-                        poller_mod(w->poller, conn->fd,
-                                   POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                        conn_poller_mod(w, conn,
+                                   POLLER_READ | POLLER_WRITE | POLLER_ET);
                     } else {
                         poller_del(w->poller, conn->fd);
                         conn_remove(w, conn);
+                        ROUTA_METRIC_INC(tls_errors_total);
                         if (conn->tls) tls_shutdown(conn->tls);
                         net_close(conn->fd); conn_free(conn); continue;
                     }
@@ -974,7 +1053,7 @@ static void handle_events_worker(worker_t *w) {
                                 conn_reset_write_state(conn);
                                 conn->state = CONN_READING;
                                 conn->keepalive_deadline = time(NULL) + 30;
-                                poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
+                                conn_poller_mod(w, conn, POLLER_READ|POLLER_ET);
                             } else {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
@@ -1038,22 +1117,40 @@ static void handle_events_worker(worker_t *w) {
                         if (conn->ws_handler && conn->ws_handler->on_open)
                             conn->ws_handler->on_open(conn, conn->ws_handler->ctx);
 
-                        poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
+                        conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
                         if (conn->read_buf.len > 0) {
                             if (handle_ws_read(w, conn) < 0) {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
                             }
                             if (conn->write_buf.len > 0) {
-                                poller_mod(w->poller, conn->fd,
-                                           POLLER_READ | POLLER_WRITE | POLLER_ET, conn);
+                                conn_poller_mod(w, conn,
+                                           POLLER_READ | POLLER_WRITE | POLLER_ET);
                             }
                         }
                         continue;
                     }
+                    /* ── Access log + metrics ── */
+                    if (conn->last_status > 0) {
+                        log_access_json(
+                            conn->last_trace_id,
+                            conn->last_method_str,
+                            conn->last_path,
+                            conn->last_status,
+                            routa_now_us() - conn->last_start_us,
+                            conn->remote_ip,
+                            w->worker_id,
+                            conn->resp_body_len);
+                        routa_metrics_record(
+                            conn->last_method_str,
+                            conn->last_status,
+                            conn->last_start_us,
+                            conn->resp_body_len);
+                        conn->last_status = 0;
+                    }
                     if (conn->sendfile_fd >= 0) {
                         conn->state = CONN_SENDFILE;
-                        poller_mod(w->poller, conn->fd, POLLER_WRITE|POLLER_ET, conn);
+                        conn_poller_mod(w, conn, POLLER_WRITE|POLLER_ET);
                     } else if (conn->keep_alive) {
                         buf_consume(&conn->read_buf, conn->consumed);
                         conn->consumed = 0;
@@ -1061,7 +1158,7 @@ static void handle_events_worker(worker_t *w) {
                         buf_reset(&conn->write_buf);
                         conn->state = CONN_READING;
                         conn->keepalive_deadline = time(NULL) + 30;
-                        poller_mod(w->poller, conn->fd, POLLER_READ|POLLER_ET, conn);
+                        conn_poller_mod(w, conn, POLLER_READ|POLLER_ET);
                     } else {
                         conn->state = CONN_CLOSING;
                         goto handle_state;
@@ -1073,13 +1170,14 @@ static void handle_events_worker(worker_t *w) {
                 switch (conn->state) {
             case CONN_H2:
             case CONN_WEBSOCKET:
-                        poller_mod(w->poller, conn->fd, POLLER_READ | POLLER_ET, conn);
+                        conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
                         break;
             case CONN_WRITING:
             case CONN_SENDFILE:
-                        poller_mod(w->poller, conn->fd, POLLER_WRITE | POLLER_ET, conn);
+                        conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
                         break;
             case CONN_CLOSING:
+                        routa_metrics_conn_close();
                         conn_close_and_free(w, conn);
                         break;
             default:
@@ -1127,10 +1225,13 @@ static void worker_apply_reload(worker_t *w) {
 /* ── epoll worker thread ────────────────────────────────────────────────────*/
 static void *worker_run(void *arg) {
     worker_t *w = (worker_t *)arg;
-
-    w->server_fd = net_server_socket(w->port, 128);
+    w->server_fd = net_server_socket(w->port, 4096);
     if (w->server_fd < 0) { LOG_ERROR("Worker: server socket failed"); return NULL; }
-
+    w->slab = conn_slab_new(w->max_connections);
+    if (!w->slab) {
+        LOG_WARN("Worker %d: conn slab alloc failed, falling back to heap",
+                 w->worker_id);
+    }
     w->active_conns = (conn_t **)calloc((size_t)w->max_connections, sizeof(conn_t *));
     if (!w->active_conns) { net_close(w->server_fd); return NULL; }
 
@@ -1253,6 +1354,7 @@ static void *worker_run(void *arg) {
     if (w->server_fd >= 0) net_close(w->server_fd);
     poller_free(w->poller);
     free((void *)w->active_conns);
+    if (w->slab) { conn_slab_free(w->slab); w->slab = NULL; }
     return NULL;
 }
 

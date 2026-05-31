@@ -174,6 +174,10 @@ static void on_message(conn_t *conn, const uint8_t *data, size_t len,
 }
 
 static void run_server(void) {
+    int maxfd = (int)sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
+
     event_loop_t *loop = event_loop_new(WS_PORT, 1);
     if (!loop) exit(1);
 

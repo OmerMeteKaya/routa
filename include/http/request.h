@@ -32,6 +32,10 @@ typedef struct {
     size_t         body_len;
     int            keep_alive; // 1 if connection should persist
     char remote_ip[46];
+    /* ── Observability ─────────────────────────────────────── */
+    char     trace_id[17];   /* 16 hex chars + NUL, set at parse time */
+    uint64_t start_us;       /* routa_now_us() at parse completion    */
+    int headers_owned; /* 0 = borrowed/stolen, 1 = malloc'd (default) */
 } http_request_t;
 
 // Parse from buf_t. Returns 0 on success, -1 on error, 1 if incomplete

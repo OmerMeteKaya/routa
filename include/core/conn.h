@@ -100,6 +100,16 @@ typedef struct conn {
     char         remote_ip[46];
     char         _pad4[2];
     struct h2_conn *h2;   /* NULL if HTTP/1.1                         */
+
+    /* Observability — stash for access log at write completion */
+    char     last_trace_id[17];
+    char     last_method_str[16];
+    char     last_path[256];
+    int      last_status;
+    uint64_t last_start_us;
+
+    uint8_t poller_mask;
+    uint8_t from_slab; /* 1 = slab allocated, don't heap-free */
 } conn_t;
 
 /* ── Slab pool ──────────────────────────────────────────────────────────────
@@ -129,7 +139,6 @@ int conn_slab_available(const conn_slab_t *slab);
 
 /* Per-connection init/reset (used by both heap and slab paths) */
 void conn_init(conn_t *c, int fd, const char *ip, int port);
-void conn_reset(conn_t *c);   /* reset for keep-alive reuse               */
 
 /* Legacy heap API */
 conn_t *conn_new(int fd, const char *ip, int port);

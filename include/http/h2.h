@@ -96,6 +96,7 @@ typedef struct h2_stream {
     /* Outbound data buffered while send window is exhausted              */
     buf_t             pending_data;
     size_t            pending_offset;
+    uint64_t start_us;
 } h2_stream_t;
 
 /* ── Stream storage backends ─────────────────────────────────────────────── */
@@ -171,6 +172,9 @@ typedef struct h2_conn {
     uint64_t          last_recv_ts;      /* monotonic ms, last frame received  */
     uint32_t          cfg_stream_timeout_ms;
     uint32_t          cfg_keepalive_timeout_ms;
+
+    uint32_t          frame_count;
+    uint32_t recv_pending_update;
 } h2_conn_t;
 
 /* Forward declarations */

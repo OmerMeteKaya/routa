@@ -44,11 +44,11 @@ void log_msg(log_level_t level, const char *file, int line, const char *fmt, ...
     (void)vfprintf(stderr, fmt, args);
     va_end(args);
 
-    //fprintf(stderr, "\n");
     (void)fflush(stderr);
     
     pthread_mutex_unlock(&g_log_mutex);
 }
+
 void log_access_json(const char *trace_id,
                      const char *method_str,
                      const char *path,
@@ -77,7 +77,7 @@ void log_access_json(const char *trace_id,
             safe_path[pi++] = c;
     }
     safe_path[pi] = '\0';
-
+#ifdef ROUTA_ACCESS_LOG
     fprintf(stderr,
         "{\"ts\":%.3f,\"level\":\"ACCESS\","
         "\"trace_id\":\"%s\","
@@ -98,4 +98,6 @@ void log_access_json(const char *trace_id,
         worker_id,
         bytes_sent
     );
+#endif
+
 }

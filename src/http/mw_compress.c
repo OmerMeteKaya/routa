@@ -114,6 +114,7 @@ void mw_compress(middleware_chain_t *chain,
 
     /* Already encoded or chunked — skip */
     for (int i = 0; i < resp->header_count; i++) {
+        if (!resp->headers[i][0]) continue;
         if (strcasecmp(resp->headers[i][0], "Content-Encoding") == 0)
             return;
         if (strcasecmp(resp->headers[i][0], "Transfer-Encoding") == 0)
@@ -137,7 +138,8 @@ void mw_compress(middleware_chain_t *chain,
     /* Non-compressible MIME type — find Content-Type header */
     const char *mime = NULL;
     for (int i = 0; i < resp->header_count; i++)
-        if (strcasecmp(resp->headers[i][0], "Content-Type") == 0) {
+        if (resp->headers[i][0] &&
+            strcasecmp(resp->headers[i][0], "Content-Type") == 0) {
             mime = resp->headers[i][1];
             break;
         }

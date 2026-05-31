@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include "util/metrics.h"
 
 static http_method_t parse_method(const char *s, size_t len) {
     if (len == 3 && memcmp(s, "GET",     3) == 0) return HTTP_GET;
@@ -106,7 +107,7 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
     if (!req || !buf || !consumed) return -1;
 
     memset(req, 0, sizeof(*req));
-
+    req->headers_owned = 1;
     if (buf->len == 0) return 1;
 
     /* Single null-terminated working copy — ALL pointer arithmetic uses this. */
@@ -276,8 +277,18 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
         memcpy(req->body, buf->data + body_start, content_length);
         req->body_len = content_length;
     }
-
+    req->headers_owned = 1;
     *consumed = body_start + content_length;
+
+    /* ── Observability: trace ID + request start timestamp ── */
+    {
+        static uint64_t s_trace_ctr = 0;
+        const uint64_t tid = ++s_trace_ctr;
+        snprintf(req->trace_id, sizeof(req->trace_id),
+                 "%016llx", (unsigned long long)tid);
+        req->start_us = routa_now_us();
+    }
+
     ret = 0;
 
 done:
@@ -295,9 +306,11 @@ void http_request_free(http_request_t *req) {
         free(req->query_params[i].value);
     }
     free(req->body);
-    for (int i = 0; i < req->header_count; i++) {
-        free(req->headers[i].key);
-        free(req->headers[i].value);
+    if (req->headers_owned) {
+        for (int i = 0; i < req->header_count; i++) {
+            free(req->headers[i].key);
+            free(req->headers[i].value);
+        }
     }
     memset(req, 0, sizeof(*req));
 }

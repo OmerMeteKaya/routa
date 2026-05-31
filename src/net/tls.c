@@ -40,18 +40,19 @@ static int alpn_select_cb(SSL *ssl,
                            const unsigned char *in,  unsigned int inlen,
                            void *arg) {
     (void)ssl; (void)arg;
-    *out    = in + 1;
-    *outlen = in[0];
-    return SSL_TLSEXT_ERR_OK;   /* bu 0 mu 1 mi? */
+
+    /* Preferred: h2, fallback: http/1.1 */
+    static const unsigned char protos[] =
+        "\x02h2\x08http/1.1";   /* length-prefixed wire format */
+
+    if (SSL_select_next_proto(
+            (unsigned char **)out, outlen,
+            protos, sizeof(protos) - 1,
+            in, inlen) == OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_OK;
+            }
+    return SSL_TLSEXT_ERR_NOACK;
 }
-/* ── STEK ticket-key callback ──────────────────────────────────────────────
- *
- * OpenSSL calls this for every TLS 1.3 ticket encrypt/decrypt.
- * enc == 1 → encrypt (new ticket)   enc == 0 → decrypt (resumption attempt)
- *
- * We store a pointer to tls_context_t in the SSL_CTX app-data slot so the
- * callback can reach the current STEK without a global variable.
- */
 
 /* ── OCSP stapling callback ────────────────────────────────────────────────*/
 
@@ -111,9 +112,14 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
 
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
                           SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_session_cache_mode(ctx,
+    SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
+    SSL_CTX_sess_set_cache_size(ctx, 10000);
 
-    /* One ticket per handshake is enough */
-    SSL_CTX_set_num_tickets(ctx, 1);
+    SSL_CTX_set_num_tickets(ctx, 0);
+    SSL_CTX_set_post_handshake_auth(ctx, 0);
+    SSL_CTX_set_timeout(ctx, 14400);
+
 
     /* ── Load cert + key ── */
     if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {

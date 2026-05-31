@@ -68,6 +68,8 @@ struct worker {
 
     /* h2 */
     routa_h2_config_t h2_cfg;
+
+    conn_slab_t    *slab;
 };
 
 event_loop_t *event_loop_new(int port, int n_threads);

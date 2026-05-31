@@ -184,7 +184,7 @@ jobs:
           name: "${{ matrix.name }}"
           runs-on: ubuntu-latest
           needs: build-and-test
-          continue-on-error: true
+          continue-on-error: ${{ matrix.allow_failure }}
           strategy:
             fail-fast: false
             matrix:
@@ -193,18 +193,22 @@ jobs:
                   os: freebsd
                   os_version: "15.0"
                   compiler: clang
+                  allow_failure: false
                 - name: "freebsd-15-gcc"
                   os: freebsd
                   os_version: "15.0"
                   compiler: gcc
+                  allow_failure: false
                 - name: "openbsd-78-clang"
                   os: openbsd
                   os_version: "7.8"
                   compiler: clang
+                  allow_failure: true
                 - name: "netbsd-101-gcc"
                   os: netbsd
                   os_version: "10.1"
                   compiler: gcc
+                  allow_failure: true
 
           steps:
             - name: Checkout

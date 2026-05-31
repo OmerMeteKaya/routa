@@ -37,13 +37,11 @@ void http_response_set_status(http_response_t *r, int status, const char *reason
 void http_response_set_header(http_response_t *r, const char *key, const char *val) {
     if (!r || !key || !val) return;
     if (r->header_count >= 32) return;
-
-    strncpy(r->headers[r->header_count][0], key, sizeof(r->headers[0][0]) - 1);
-    r->headers[r->header_count][0][sizeof(r->headers[0][0]) - 1] = '\0';
-
-    strncpy(r->headers[r->header_count][1], val, sizeof(r->headers[0][1]) - 1);
-    r->headers[r->header_count][1][sizeof(r->headers[0][1]) - 1] = '\0';  // NOLINT(clang-analyzer-unix.Malloc)
-
+    int i = r->header_count;
+    free((char *)r->headers[i][1]);  /* release previous value if slot reused */
+    r->headers[i][0] = key;          /* literal pointer — caller guarantees lifetime */
+    r->headers[i][1] = strdup(val);  /* heap copy — freed in http_response_destroy */
+    if (!r->headers[i][1]) return;
     r->header_count++;
 }
 
@@ -105,6 +103,7 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
     int has_date = 0, has_server = 0, has_connection = 0;
     int has_transfer_encoding = 0;
     for (int i = 0; i < r->header_count; i++) {
+        if (!r->headers[i][0]) continue;
         if (strcasecmp(r->headers[i][0], "Date") == 0)              has_date = 1;
         if (strcasecmp(r->headers[i][0], "Server") == 0)            has_server = 1;
         if (strcasecmp(r->headers[i][0], "Connection") == 0)        has_connection = 1;
@@ -140,11 +139,9 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
 
     /* All headers set by caller */
     for (int i = 0; i < r->header_count; i++) {
-        // Skip Content-Length header when using chunked encoding
-        if (r->chunked && strcasecmp(r->headers[i][0], "Content-Length") == 0) {
+        if (!r->headers[i][0] || !r->headers[i][1]) continue;
+        if (r->chunked && strcasecmp(r->headers[i][0], "Content-Length") == 0)
             continue;
-        }
-        
         char hl[512];
         int hl_len = snprintf(hl, sizeof(hl), "%s: %s\r\n",
                               r->headers[i][0], r->headers[i][1]);
@@ -175,6 +172,8 @@ int http_response_serialize(const http_response_t *r, buf_t *out) {
 
 void http_response_destroy(http_response_t *r) {
     if (!r) return;
+    for (int i = 0; i < r->header_count; i++)
+        free((char *)r->headers[i][1]);  /* values are strdup'd in set_header */
     free(r->body);
     if (r->body_fd >= 0) {
         close(r->body_fd);

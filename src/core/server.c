@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include "util/metrics.h"
+#include "http/mw_metrics.h"
 
 static struct event_loop  *g_loop        = NULL;
 static volatile sig_atomic_t g_reload_flag = 0;
@@ -203,6 +205,11 @@ void server_run(server_t *s) {
     };
     file_cache_init(&fc_cfg);
 
+    /* ── Observability ── */
+    routa_metrics_init();
+    event_loop_add_route((event_loop_t *)s->loop, "/metrics",
+                         1 << HTTP_GET, routa_metrics_handler, NULL);
+    
     event_loop_run((event_loop_t *)s->loop);
 }
 
