@@ -113,7 +113,7 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
     /* Single null-terminated working copy — ALL pointer arithmetic uses this. */
     char *data = malloc(buf->len + 1);
     if (!data) return -1;
-    memcpy(data, buf->data, buf->len);
+    memcpy(data, buf_data(buf), buf->len);
     data[buf->len] = '\0';
     char *data_end = data + buf->len;
 
@@ -274,7 +274,7 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
         if (available < content_length) goto done; /* incomplete */
         req->body = malloc(content_length);
         if (!req->body) { ret = -1; goto done; }
-        memcpy(req->body, buf->data + body_start, content_length);
+        memcpy(req->body, buf_data(buf) + body_start, content_length);
         req->body_len = content_length;
     }
     req->headers_owned = 1;

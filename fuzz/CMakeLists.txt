@@ -1,26 +1,77 @@
 cmake_minimum_required(VERSION 3.20)
 
-# Fuzzing targets — built separately from main build.
-# Usage:
-#   mkdir build_fuzz && cd build_fuzz
-#   cmake .. -DFUZZ=ON -DCMAKE_C_COMPILER=clang
-#   make fuzz_request fuzz_hpack fuzz_ws fuzz_h2_frame
-
-option(FUZZ "Build libFuzzer targets" OFF)
+option(FUZZ "Build fuzzers" OFF)
+option(AFL "Build AFL++ fuzzers" OFF)
 
 if(FUZZ)
-    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
-        message(FATAL_ERROR "Fuzzing requires clang")
+
+    set(FUZZ_TARGETS
+            fuzz_request
+            fuzz_hpack
+            fuzz_ws
+            fuzz_h2_frame
+    )
+
+    if(AFL)
+
+        message(STATUS "Building AFL++ fuzzers")
+
+        foreach(TARGET ${FUZZ_TARGETS})
+            add_executable(${TARGET} ${TARGET}.c)
+
+            target_link_libraries(${TARGET}
+                    PRIVATE
+                    routa_core
+                    ssl
+                    crypto
+                    z
+            )
+
+            target_compile_options(${TARGET}
+                    PRIVATE
+                    -O1
+                    -g
+                    -fsanitize=address
+                    -fsanitize=undefined
+                    -fno-omit-frame-pointer
+            )
+
+            target_link_options(${TARGET}
+                    PRIVATE
+                    -fsanitize=address
+                    -fsanitize=undefined
+            )
+        endforeach()
+
+    else()
+
+        message(STATUS "Building libFuzzer fuzzers")
+
+        foreach(TARGET ${FUZZ_TARGETS})
+            add_executable(${TARGET} ${TARGET}.c)
+
+            target_link_libraries(${TARGET}
+                    PRIVATE
+                    routa_core
+                    ssl
+                    crypto
+                    z
+            )
+
+            target_compile_options(${TARGET}
+                    PRIVATE
+                    -fsanitize=fuzzer,address,undefined
+                    -fno-omit-frame-pointer
+                    -g
+                    -O1
+            )
+
+            target_link_options(${TARGET}
+                    PRIVATE
+                    -fsanitize=fuzzer,address,undefined
+            )
+        endforeach()
+
     endif()
 
-    set(FUZZ_FLAGS -fsanitize=fuzzer,address,undefined
-            -fno-omit-frame-pointer
-            -g -O1)
-
-    foreach(TARGET fuzz_request fuzz_hpack fuzz_ws fuzz_h2_frame)
-        add_executable(${TARGET} ${TARGET}.c)
-        target_link_libraries(${TARGET} PRIVATE routa_core ssl crypto z)
-        target_compile_options(${TARGET} PRIVATE ${FUZZ_FLAGS})
-        target_link_options(${TARGET} PRIVATE ${FUZZ_FLAGS})
-    endforeach()
 endif()

@@ -212,18 +212,25 @@ static void conn_close_and_free(worker_t *w, conn_t *conn) {
     conn_remove(w, conn);
     if (conn->h2 && conn->h2->write_buf.len > 0)
         h2_conn_flush(conn->h2);
-    if (conn->tls) tls_shutdown(conn->tls);
+    if (conn->tls) { tls_shutdown(conn->tls); tls_conn_free(conn->tls); conn->tls = NULL; }
+    if (conn->h2)  { h2_conn_free(conn->h2);  conn->h2  = NULL; }
     if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
     if (conn->upstream_fd >= 0) { close(conn->upstream_fd); conn->upstream_fd = -1; }
     shutdown(conn->fd, SHUT_WR);
     net_close(conn->fd);
     conn_reset_write_state(conn);
-    conn_free(conn);   /* h2_conn_free + NULL inside */
-    if (w->slab && conn->from_slab) {
-        buf_reset(&conn->read_buf);
-        buf_reset(&conn->write_buf);
-        buf_reset(&conn->hdr_buf);
+    buf_free(&conn->read_buf);
+    buf_free(&conn->write_buf);
+    buf_free(&conn->hdr_buf);
+    buf_free(&conn->upstream_req_buf);
+    buf_free(&conn->upstream_resp_buf);
+
+    if (conn->from_slab && w->slab) {
         conn_slab_release(w->slab, conn);
+    } else {
+        free(conn->recv_buf);
+        free(conn->send_buf);
+        free(conn);
     }
 }
 /* ── Build and stash response on conn for writev path ───────────────────────
@@ -1227,7 +1234,9 @@ static void *worker_run(void *arg) {
     worker_t *w = (worker_t *)arg;
     w->server_fd = net_server_socket(w->port, 4096);
     if (w->server_fd < 0) { LOG_ERROR("Worker: server socket failed"); return NULL; }
-    w->slab = conn_slab_new(w->max_connections);
+    int slab_sz = w->max_connections / w->loop->n_workers;
+    if (slab_sz < 100) slab_sz = 100;
+    w->slab = conn_slab_new(slab_sz);
     if (!w->slab) {
         LOG_WARN("Worker %d: conn slab alloc failed, falling back to heap",
                  w->worker_id);
@@ -1334,6 +1343,23 @@ static void *worker_run(void *arg) {
                     }
                 _i++;
             }
+
+            /* H1 keepalive idle sweep */
+            time_t now_sec = (time_t)(now_ms / 1000);
+            int ci = 0;
+            while (ci < w->active_conn_count) {
+                conn_t *_c = w->active_conns[ci];
+                if ((_c->state == CONN_READING ||
+                     _c->state == CONN_KEEPALIVE) &&
+                    _c->keepalive_deadline > 0 &&
+                    now_sec > _c->keepalive_deadline) {
+                    LOG_DEBUG("h1: keepalive timeout fd=%d", _c->fd);
+                    conn_close_and_free(w, _c);
+                    continue;
+                }
+                ci++;
+            }
+
             last_ping_sweep_ms = now_ms;
         }
     }

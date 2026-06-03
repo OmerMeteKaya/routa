@@ -23,37 +23,67 @@
 ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
     if (!b) return -1;
 
-    uint8_t tmp[IO_READ_BUF_SZ];
-    ssize_t total = 0;
-
     if (tls) {
-        /* Drain all pending TLS records in one call                       */
+        ssize_t total = 0;
         while (1) {
-            ssize_t n = tls_read(tls, tmp, sizeof(tmp));
-            if (n < 0) {
-                /* WANT_READ/WANT_WRITE — no more data right now           */
-                return total > 0 ? total : -1;
+            /* Ensure space — at least 8KB available */
+            size_t avail = b->cap - b->off - b->len;
+            if (avail < 8192) {
+                /* Compact first */
+                if (b->off > 0) {
+                    memmove(b->data, b->data + b->off, b->len);
+                    b->off = 0;
+                    avail = b->cap - b->len;
+                }
+                if (avail < 8192) {
+                    size_t new_cap = b->cap == 0 ? 16384 : b->cap * 2;
+                    while (new_cap < b->off + b->len + 8192) new_cap *= 2;
+                    uint8_t *nd = realloc(b->data, new_cap);
+                    if (!nd) return total > 0 ? total : -1;
+                    b->data = nd;
+                    b->cap  = new_cap;
+                    avail   = b->cap - b->off - b->len;
+                }
             }
-            if (n == 0) {
-                /* Connection closed                                        */
-                return total > 0 ? total : 0;
-            }
-            if (buf_append(b, tmp, (size_t)n) < 0) return -1;
-            total += n;
 
-            /* Check if more TLS records are buffered in OpenSSL           */
+            /* Read directly into buf — zero extra copy */
+            ssize_t n = tls_read(tls,
+                                 b->data + b->off + b->len,
+                                 avail);
+            if (n < 0) return total > 0 ? total : -1;
+            if (n == 0) return total > 0 ? total : 0;
+            b->len += (size_t)n;
+            total  += n;
             if (SSL_pending(tls->ssl) == 0) break;
         }
         return total;
     } else {
-        ssize_t n = read(fd, tmp, sizeof(tmp));
+        /* Plain fd — same approach */
+        size_t avail = b->cap - b->off - b->len;
+        if (avail < 8192) {
+            if (b->off > 0) {
+                memmove(b->data, b->data + b->off, b->len);
+                b->off = 0;
+                avail  = b->cap - b->len;
+            }
+            if (avail < 8192) {
+                size_t new_cap = b->cap == 0 ? 16384 : b->cap * 2;
+                while (new_cap < b->off + b->len + 8192) new_cap *= 2;
+                uint8_t *nd = realloc(b->data, new_cap);
+                if (!nd) return -1;
+                b->data = nd;
+                b->cap  = new_cap;
+            }
+        }
+        ssize_t n = read(fd,
+                         b->data + b->off + b->len,
+                         b->cap - b->off - b->len);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
-            LOG_ERROR("io_read: %s", strerror(errno));
             return -1;
         }
         if (n == 0) return 0;
-        if (buf_append(b, tmp, (size_t)n) < 0) return -1;
+        b->len += (size_t)n;
         return n;
     }
 }

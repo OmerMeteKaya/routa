@@ -16,6 +16,7 @@ typedef struct {
     unsigned char  *ocsp_response;
     long            ocsp_response_len;
     pthread_rwlock_t ocsp_lock;
+    unsigned char   ticket_key[80];
 } tls_context_t;
 
 typedef struct {

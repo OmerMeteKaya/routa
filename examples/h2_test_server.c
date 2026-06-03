@@ -11,7 +11,48 @@
 #include "util/metrics.h"
 #include "http/mw_metrics.h"
 
+static char small_buf[4096];
+static char medium_buf[65536];
+static char larger_buf[1048576];
+static int  bench_bufs_init = 0;
 
+static void init_bench_bufs(void) {
+    if (bench_bufs_init) return;
+    memset(small_buf,  'S', sizeof(small_buf));
+    memset(medium_buf, 'M', sizeof(medium_buf));
+    memset(larger_buf, 'L', sizeof(larger_buf));
+    bench_bufs_init = 1;
+}
+
+static int handle_small(const http_request_t *req,
+                         http_response_t *resp, void *ctx) {
+    (void)req; (void)ctx;
+    init_bench_bufs();
+    http_response_set_status(resp, 200, "OK");
+    http_response_set_header(resp, "content-type", "application/octet-stream");
+    http_response_set_body(resp, small_buf, sizeof(small_buf));
+    return 0;
+}
+
+static int handle_medium(const http_request_t *req,
+                          http_response_t *resp, void *ctx) {
+    (void)req; (void)ctx;
+    init_bench_bufs();
+    http_response_set_status(resp, 200, "OK");
+    http_response_set_header(resp, "content-type", "application/octet-stream");
+    http_response_set_body(resp, medium_buf, sizeof(medium_buf));
+    return 0;
+}
+
+static int handle_larger(const http_request_t *req,
+                          http_response_t *resp, void *ctx) {
+    (void)req; (void)ctx;
+    init_bench_bufs();
+    http_response_set_status(resp, 200, "OK");
+    http_response_set_header(resp, "content-type", "application/octet-stream");
+    http_response_set_body(resp, larger_buf, sizeof(larger_buf));
+    return 0;
+}
 static int handle_echo(const http_request_t *req,
                         http_response_t *resp, void *ctx) {
     (void)ctx;
@@ -57,7 +98,7 @@ int main(void) {
            "-out /tmp/routa_certs/test.crt "
            "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null");
 
-    event_loop_t *loop = event_loop_new(18443, 6);
+    event_loop_t *loop = event_loop_new(18443, 12);
     if (!loop) { fprintf(stderr, "loop failed\n"); return 1; }
 
     event_loop_set_tls(loop, "/tmp/routa_certs/test.crt",
@@ -75,7 +116,9 @@ int main(void) {
                      1 << HTTP_POST, handle_echo, NULL);
     event_loop_add_route(loop, "/large",
                          1 << HTTP_GET, handle_large, NULL);
-
+    event_loop_add_route(loop, "/small",  1 << HTTP_GET, handle_small,  NULL);
+    event_loop_add_route(loop, "/medium", 1 << HTTP_GET, handle_medium, NULL);
+    event_loop_add_route(loop, "/larger", 1 << HTTP_GET, handle_larger, NULL);
     printf("\nListening on 18443...\n");
 
     routa_metrics_init();

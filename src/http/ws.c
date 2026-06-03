@@ -433,8 +433,8 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
             /* Need at least 2 bytes to determine extended length size */
             if (rb->len < 2) return 0;
 
-            uint8_t b0 = ((uint8_t *)rb->data)[0];
-            uint8_t b1 = ((uint8_t *)rb->data)[1];
+            uint8_t b0 = ((uint8_t *)buf_data(rb))[0];
+            uint8_t b1 = ((uint8_t *)buf_data(rb))[1];
 
             fs->fin    = (b0 >> 7) & 1;
             fs->rsv1   = (b0 >> 6) & 1;
@@ -457,7 +457,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
             if (rb->len < (size_t)2 + (size_t)extra) return 0; /* wait for more  */
 
             /* Read extended length */
-            const uint8_t *p = (uint8_t *)rb->data + 2;
+            const uint8_t *p = (uint8_t *)buf_data(rb) + 2;
             if (raw_len < 126) {
                 fs->payload_len = raw_len;
             } else if (raw_len == 126) {
@@ -485,7 +485,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
             }
 
             /* Consume header bytes */
-            size_t hdr_consumed = (size_t)(p - (uint8_t *)rb->data);
+            size_t hdr_consumed = (size_t)(p - (uint8_t *)buf_data(rb));
             buf_consume(rb, hdr_consumed);
 
             fs->payload_read = 0;
@@ -525,7 +525,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
 
             if (to_read == 0 && remaining > 0) return 0;   /* wait for more data           */
 
-            uint8_t *payload_ptr = (uint8_t *)rb->data;
+            uint8_t *payload_ptr = (uint8_t *)buf_data(rb);
 
             /* Unmask in-place before processing */
             if (fs->masked)

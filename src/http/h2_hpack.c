@@ -569,8 +569,7 @@ static void dyntab_evict_to_fit(hpack_dynamic_table_t *t, size_t needed) {
     while (t->count > 0 && t->size + needed > t->max_size) {
         hpack_entry_t *oldest = &t->entries[t->head];
         t->size -= oldest->size;
-        free(oldest->name);
-        free(oldest->value);
+        free(oldest->name);   /* value = name + nl + 1, same block */
         oldest->name  = NULL;
         oldest->value = NULL;
         t->head  = (t->head + 1) % t->cap;
@@ -613,14 +612,14 @@ static int dyntab_add(hpack_dynamic_table_t *t,
     }
 
     size_t idx = (t->head + t->count) % t->cap;
-    t->entries[idx].name  = strdup(name);
-    t->entries[idx].value = strdup(value);
+    /* Single allocation: name\0value\0 — value ptr = name + nl + 1 */
+    char *buf = malloc(nl + vl + 2);
+    if (!buf) return -1;
+    memcpy(buf, name, nl + 1);
+    memcpy(buf + nl + 1, value, vl + 1);
+    t->entries[idx].name  = buf;
+    t->entries[idx].value = buf + nl + 1;
     t->entries[idx].size  = esz;
-    if (!t->entries[idx].name || !t->entries[idx].value) {
-        free(t->entries[idx].name);
-        free(t->entries[idx].value);
-        return -1;
-    }
     t->count++;
     t->size += esz;
     return 0;
@@ -731,8 +730,7 @@ void hpack_ctx_free(hpack_ctx_t *ctx) {
     hpack_dynamic_table_t *t = &ctx->table;
     for (size_t i = 0; i < t->count; i++) {
         size_t slot = (t->head + i) % t->cap;
-        free(t->entries[slot].name);
-        free(t->entries[slot].value);
+        free(t->entries[slot].name);   /* single block, value shares it */
     }
     free(t->entries);
     memset(ctx, 0, sizeof(*ctx));

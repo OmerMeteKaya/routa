@@ -778,6 +778,10 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
         nhdr++;
     }
 
+    enc_headers[nhdr].name  = "server";
+    enc_headers[nhdr].value = "routa";
+    nhdr++;
+
     for (int i = 0; i < resp->header_count; i++) {
         const char *hname = resp->headers[i][0];
         const char *hval  = resp->headers[i][1];
@@ -785,6 +789,7 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
         if (!hval) continue;
         /* content-length is emitted above; skip duplicates from set_body */
         if (strcasecmp(hname, "content-length") == 0) continue;
+        if (strcasecmp(hname, "server") == 0) continue;
         enc_headers[nhdr].name  = (char *)hname;
         enc_headers[nhdr].value = (char *)hval;
         nhdr++;
@@ -1079,7 +1084,6 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
             route->handler(&req, &resp, route->ctx);
         }
     }
-    http_response_set_header(&resp, "server", "routa");
     int rc = send_response(hc, stream_id, s, &resp);
 
     const char *mstr = req_method_str(req.method);
@@ -1447,7 +1451,7 @@ int h2_conn_recv(h2_conn_t *hc,
 
     if (!hc->preface_done) {
         if (rb->len < H2_CLIENT_PREFACE_LEN) return 0;
-        if (memcmp(rb->data, H2_CLIENT_PREFACE,
+        if (memcmp(buf_data(rb), H2_CLIENT_PREFACE,
                    H2_CLIENT_PREFACE_LEN) != 0) {
             LOG_WARN("h2: bad client preface");
             return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
@@ -1469,7 +1473,7 @@ int h2_conn_recv(h2_conn_t *hc,
         return conn_error(hc, H2_ERR_ENHANCE_YOUR_CALM);
     }
 while (rb->len - offset >= H2_FRAME_HDR_SZ) {
-    const uint8_t *hdr     = (const uint8_t *)rb->data + offset;
+    const uint8_t *hdr     = (const uint8_t *)buf_data(rb) + offset;
     uint32_t       pay_len = frame_length(hdr);
     uint8_t        type    = frame_type(hdr);
     uint8_t        flags   = frame_flags(hdr);

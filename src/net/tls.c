@@ -116,7 +116,10 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
     SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
     SSL_CTX_sess_set_cache_size(ctx, 10000);
 
-    SSL_CTX_set_num_tickets(ctx, 0);
+    SSL_CTX_set_num_tickets(ctx, 2);
+    SSL_CTX_set_session_id_context(ctx,
+        (const unsigned char *)"routa", 5);
+    SSL_CTX_set_max_early_data(ctx, 16384);
     SSL_CTX_set_post_handshake_auth(ctx, 0);
     SSL_CTX_set_timeout(ctx, 14400);
 
@@ -148,7 +151,15 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
 
     pthread_rwlock_init(&tls_ctx->ocsp_lock, NULL);
     tls_ctx->ctx = ctx;
-
+    /* Generate ticket key once — survives cert hot-reload */
+    if (RAND_bytes(tls_ctx->ticket_key, sizeof(tls_ctx->ticket_key)) != 1) {
+        log_ssl_error("RAND_bytes ticket_key");
+        SSL_CTX_free(ctx);
+        free(tls_ctx);
+        return NULL;
+    }
+    SSL_CTX_set_tlsext_ticket_keys(ctx,
+        tls_ctx->ticket_key, sizeof(tls_ctx->ticket_key));
     /* ── Store back-pointer so ticket callback can reach us ── */
     SSL_CTX_set_app_data(ctx, tls_ctx);
 
@@ -200,8 +211,16 @@ int tls_context_reload(tls_context_t *tls_ctx,
     }
 
     SSL_CTX_set_mode(new_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
-                               SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_num_tickets(new_ctx, 1);
+                           SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_session_cache_mode(new_ctx,
+        SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
+    SSL_CTX_sess_set_cache_size(new_ctx, 10000);
+    SSL_CTX_set_num_tickets(new_ctx, 2);
+    SSL_CTX_set_session_id_context(new_ctx,
+        (const unsigned char *)"routa", 5);
+    SSL_CTX_set_max_early_data(new_ctx, 16384);
+    SSL_CTX_set_post_handshake_auth(new_ctx, 0);
+    SSL_CTX_set_timeout(new_ctx, 14400);
 
     if (SSL_CTX_use_certificate_file(new_ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
         log_ssl_error("reload: load certificate");
@@ -240,6 +259,8 @@ int tls_context_reload(tls_context_t *tls_ctx,
 
     /* SSL_CTX_free decrements the refcount; existing SSL* objects each hold
      * their own reference and will keep old_ctx alive until freed.          */
+    SSL_CTX_set_tlsext_ticket_keys(new_ctx,
+    tls_ctx->ticket_key, sizeof(tls_ctx->ticket_key));
     SSL_CTX_free(old_ctx);
 
     LOG_INFO("TLS context reloaded (cert: %s)", cert_file);
@@ -349,6 +370,18 @@ int tls_handshake(tls_conn_t *tc) {
     if (ret == 1) {
         tc->handshake_done = 1;
         tc->resumed = SSL_session_reused(tc->ssl) ? 1 : 0;
+
+        const unsigned char *proto = NULL;
+        unsigned int proto_len = 0;
+        SSL_get0_alpn_selected(tc->ssl, &proto, &proto_len);
+        char proto_str[16] = "none";
+        if (proto && proto_len > 0)
+            snprintf(proto_str, sizeof(proto_str), "%.*s", (int)proto_len, proto);
+
+        LOG_INFO("TLS handshake done: resumed=%d alpn=%s tickets=%ld",
+                 tc->resumed,
+                 proto_str,
+                 SSL_CTX_sess_number(SSL_get_SSL_CTX(tc->ssl)));
         return 0;
     }
 
