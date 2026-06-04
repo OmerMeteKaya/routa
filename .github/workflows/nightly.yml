@@ -446,6 +446,73 @@ jobs:
             /tmp/${{ matrix.target }}.log
 
   # ══════════════════════════════════════════════════════════════════════
+  # AFL++ fuzzing — 5 min per target
+  # ══════════════════════════════════════════════════════════════════════
+  afl-fuzz:
+    name: "AFL++ (${{ matrix.target }})"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - request
+          - hpack
+          - ws
+          - h2_frame
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install AFL++
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build afl++ clang libssl-dev zlib1g-dev
+
+      - name: Build AFL++ target
+        run: |
+          cmake -B build_afl -G Ninja \
+            -DROUTA_AFL=ON \
+            -DCMAKE_C_COMPILER=afl-clang-fast \
+            -DCMAKE_CXX_COMPILER=afl-clang-fast++ \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build_afl \
+            --target afl_fuzz_${{ matrix.target }} --parallel $(nproc)
+
+      - name: Run AFL++ (5 minutes)
+        timeout-minutes: 10
+        env:
+          AFL_NO_UI: 1
+          AFL_SKIP_CPUFREQ: 1
+        run: |
+          mkdir -p fuzz/findings/${{ matrix.target }}
+          BINARY="build_afl/fuzz/afl_fuzz_${{ matrix.target }}"
+          CORPUS="fuzz/corpus/${{ matrix.target }}"
+          FINDINGS="fuzz/findings/${{ matrix.target }}"
+
+          echo core | sudo tee /proc/sys/kernel/core_pattern 2>/dev/null || true
+
+          timeout 300 afl-fuzz -i "$CORPUS" -o "$FINDINGS" \
+                     -m none -t 1000 -M master \
+                     -- "$BINARY" || true
+
+      - name: Check for crashes
+        run: |
+          CRASHES="fuzz/findings/${{ matrix.target }}/master/crashes"
+          if [ -d "$CRASHES" ] && ls "$CRASHES"/id:* > /dev/null 2>&1; then
+            echo "CRASH found in target: ${{ matrix.target }}"
+            ls -lh "$CRASHES"/id:*
+            exit 1
+          fi
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afl-findings-${{ matrix.target }}
+          path: fuzz/findings/${{ matrix.target }}/
+
+  # ══════════════════════════════════════════════════════════════════════
   # Performance regression baseline
   # ══════════════════════════════════════════════════════════════════════
   perf-regression:
@@ -542,6 +609,7 @@ jobs:
       - network-simulation
       - fault-injection
       - fuzz-long
+      - afl-fuzz
       - perf-regression
       - dependency-scan
     if: always()
@@ -558,5 +626,6 @@ jobs:
           echo "| Network simulation | ${{ needs.network-simulation.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Fault injection | ${{ needs.fault-injection.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Fuzz long | ${{ needs.fuzz-long.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| AFL++ fuzz | ${{ needs.afl-fuzz.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Perf regression | ${{ needs.perf-regression.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Dependency scan | ${{ needs.dependency-scan.result }} |" >> $GITHUB_STEP_SUMMARY

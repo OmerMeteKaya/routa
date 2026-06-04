@@ -1,0 +1,2 @@
+case $X in a) echo a‡; esac
+case $X in a) echo a‡; esac

@@ -1,0 +1,1 @@
+while getopts "ab:" o t; do echo $opt; done

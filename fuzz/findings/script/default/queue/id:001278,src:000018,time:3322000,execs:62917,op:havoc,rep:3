@@ -1,0 +1,1 @@
+for i in 1 2 eq 2 ]; then echo found; fi; don found; Ii done

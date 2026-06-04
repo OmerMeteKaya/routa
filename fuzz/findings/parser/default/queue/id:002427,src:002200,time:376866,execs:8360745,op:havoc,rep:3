@@ -1,0 +1,6 @@
+n a done
+for xc; do ;; done
+for xc; do;;echo $x;for xc; do;;echo $x; done
+x; done
+for xc; do;;echo $x; done
+for b@c;o $xfe

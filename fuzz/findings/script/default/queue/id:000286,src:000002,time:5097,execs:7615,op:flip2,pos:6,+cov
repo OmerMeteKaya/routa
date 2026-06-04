@@ -1,0 +1,1 @@
+if [ -b "$X" ]; then echo yes; else echo no; fi

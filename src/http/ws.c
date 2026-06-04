@@ -194,7 +194,9 @@ static int pmd_decompress(const uint8_t *src, size_t src_len,
                             uint8_t **dst_out, size_t *dst_len_out) {
     if (!src || src_len == 0) return -1;
 
-    /* Append RFC 7692 tail */
+    /* Hard limit: decompressed output cannot exceed 64MB */
+#define PMD_MAX_OUTPUT ((size_t)64 * 1024 * 1024)
+
     size_t   padded_len = src_len + 4;
     uint8_t *padded     = malloc(padded_len);
     if (!padded) return -1;
@@ -204,8 +206,8 @@ static int pmd_decompress(const uint8_t *src, size_t src_len,
     padded[src_len+2] = 0xff;
     padded[src_len+3] = 0xff;
 
-    /* Initial output buffer — grow if needed */
     size_t   cap = src_len * 4 + 256;
+    if (cap > PMD_MAX_OUTPUT) cap = PMD_MAX_OUTPUT;
     uint8_t *dst = malloc(cap);
     if (!dst) { free(padded); return -1; }
 
@@ -220,6 +222,8 @@ static int pmd_decompress(const uint8_t *src, size_t src_len,
 
     size_t out_len = 0;
     int    rc;
+    int    iterations = 0;  /* guard against infinite loop */
+
     do {
         zs.next_out  = dst + out_len;
         zs.avail_out = (uInt)(cap - out_len);
@@ -228,11 +232,29 @@ static int pmd_decompress(const uint8_t *src, size_t src_len,
         out_len = cap - zs.avail_out;
 
         if (rc == Z_BUF_ERROR || (rc == Z_OK && zs.avail_out == 0)) {
-            /* Grow buffer */
-            cap *= 2;
-            uint8_t *tmp = realloc(dst, cap);
+            /* Output buffer full — grow if within limit */
+            if (cap >= PMD_MAX_OUTPUT) {
+                /* Decompressed output exceeds limit — bomb input, reject */
+                inflateEnd(&zs);
+                free(padded);
+                free(dst);
+                return -1;
+            }
+            size_t new_cap = cap * 2;
+            if (new_cap > PMD_MAX_OUTPUT) new_cap = PMD_MAX_OUTPUT;
+            uint8_t *tmp = realloc(dst, new_cap);
             if (!tmp) { inflateEnd(&zs); free(padded); free(dst); return -1; }
             dst = tmp;
+            cap = new_cap;
+        }
+
+        iterations++;
+        if (iterations > 1024) {
+            /* Pathological input — bail out */
+            inflateEnd(&zs);
+            free(padded);
+            free(dst);
+            return -1;
         }
     } while (rc == Z_OK || rc == Z_BUF_ERROR);
 
@@ -438,6 +460,11 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
 
             fs->fin    = (b0 >> 7) & 1;
             fs->rsv1   = (b0 >> 6) & 1;
+            if (fs->rsv1 && !conn->ws_pmd_enabled) {
+                LOG_WARN("ws: RSV1 set but permessage-deflate not negotiated");
+                ws_close(conn, WS_CLOSE_PROTOCOL, "RSV1 without deflate");
+                return -1;
+            }
             fs->opcode = (ws_opcode_t)(b0 & 0x0F);
             fs->masked = (b1 >> 7) & 1;
 

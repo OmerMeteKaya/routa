@@ -1,0 +1,1 @@
+case $X in a) echo a;; b) echm b;;$*) echo other;;echo a;; b) e hm esac

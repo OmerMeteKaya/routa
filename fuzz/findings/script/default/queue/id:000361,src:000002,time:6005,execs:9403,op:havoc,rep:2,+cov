@@ -1,0 +1,1 @@
+if [ -n "$X" ]; then echo yec;if [ -n "$X" ]; then echo ye else echo no; fi

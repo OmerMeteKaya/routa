@@ -1,0 +1,7 @@
+GET TT/ HTTP/1...1
+: lo.1
+: lE.1
+: lo1
+Host:st
+Concth: 0
+

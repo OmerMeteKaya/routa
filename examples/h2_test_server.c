@@ -89,20 +89,29 @@ static int handle_hello(const http_request_t *req,
     return 0;
 }
 
-int main(void) {
-    /* Generate test cert if missing */
-    system("mkdir -p /tmp/routa_certs && "
-           "[ -f /tmp/routa_certs/test.crt ] || "
-           "openssl req -x509 -newkey rsa:2048 "
-           "-keyout /tmp/routa_certs/test.key "
-           "-out /tmp/routa_certs/test.crt "
-           "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null");
+int main(int argc, char **argv) {
+    int no_tls = 0;
+    int port   = 18443;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-tls") == 0) { no_tls = 1; port = 18080; }
+        else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
+    }
 
-    event_loop_t *loop = event_loop_new(18443, 12);
+    if (!no_tls) {
+        system("mkdir -p /tmp/routa_certs && "
+               "[ -f /tmp/routa_certs/test.crt ] || "
+               "openssl req -x509 -newkey rsa:2048 "
+               "-keyout /tmp/routa_certs/test.key "
+               "-out /tmp/routa_certs/test.crt "
+               "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null");
+    }
+
+    event_loop_t *loop = event_loop_new(port, 12);
     if (!loop) { fprintf(stderr, "loop failed\n"); return 1; }
 
-    event_loop_set_tls(loop, "/tmp/routa_certs/test.crt",
-                              "/tmp/routa_certs/test.key");
+    if (!no_tls)
+        event_loop_set_tls(loop, "/tmp/routa_certs/test.crt",
+                                  "/tmp/routa_certs/test.key");
 
     routa_config_t cfg;
     routa_config_init(&cfg);
@@ -119,7 +128,7 @@ int main(void) {
     event_loop_add_route(loop, "/small",  1 << HTTP_GET, handle_small,  NULL);
     event_loop_add_route(loop, "/medium", 1 << HTTP_GET, handle_medium, NULL);
     event_loop_add_route(loop, "/larger", 1 << HTTP_GET, handle_larger, NULL);
-    printf("\nListening on 18443...\n");
+    printf("\nListening on %d (%s)...\n", port, no_tls ? "h2c cleartext" : "TLS");
 
     routa_metrics_init();
     event_loop_add_route(loop, "/metrics", 1 << HTTP_GET,

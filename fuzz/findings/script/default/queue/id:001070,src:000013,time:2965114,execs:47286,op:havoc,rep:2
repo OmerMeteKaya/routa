@@ -1,0 +1,2 @@
+trap 'echo bye' E<EO; echo h'echo bye' E<EO; echo hi
+i

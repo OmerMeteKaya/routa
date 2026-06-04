@@ -1,0 +1,1 @@
+trap 'echnýbyM' EXI * 3 T; echo hi

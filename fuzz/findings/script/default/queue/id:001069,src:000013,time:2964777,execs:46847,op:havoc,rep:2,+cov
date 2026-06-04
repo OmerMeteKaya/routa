@@ -1,0 +1,1 @@
+trap 'echo bye' Eit 0); echo 

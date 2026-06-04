@@ -1,0 +1,1 @@
+f()nest g; |;  { g() { echo nded; }; g; |;  { g() { echo ndsted; }; g; }; f

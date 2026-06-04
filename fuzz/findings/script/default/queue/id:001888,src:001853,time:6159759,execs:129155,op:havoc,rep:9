@@ -1,0 +1,2 @@
+;n echo yes; else echo no; fi
+[ $i -ef 2 ]; then echo found;

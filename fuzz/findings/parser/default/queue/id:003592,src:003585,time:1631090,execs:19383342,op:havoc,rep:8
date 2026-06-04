@@ -1,0 +1,172 @@
+{{fdo oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||666&666|et
+  ;{ foo | for x in a b’o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< e&666|et
+  ;{ foo | for x in a b’o foo$| fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€|&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eþ€||&666&666|et
+  ;{ foo | for x in a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€||666&666|et
+  ;{ foo | for x in a b’o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{rt!|rt
+c
+!|rt
+if`
+ifecc
+!|recc x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do  b’o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for€||&666&666|et
+  ;{ foo | for x in a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<hn a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€||666&666|et
+  ;{ foo | for x in a b’o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r ’  | for xa }L|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo |||666&666|et
+  ;{ foo | for x in a b’o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for€||&666&666|et
+  ;{ foo | for x in a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<hn a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€||666&666|et
+  ;{ foo | for x in a b’o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; ; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;c a;;e 4|ž|UG>>&&<e<eho 4<do 4<no 4<e<e<dono 4 4<< a;;e 4|ž|UG>>&&&=>
+do e
+$L; L;o
+$L;e<eho 4<<<dono 4<e<eho 4<do 4<<o 4<e<eho 4< 4<ono 4<<;;]c a;;e 4|ž|UG>>&
+do eecho
+$L; L;o
+$L;<dono 4<e<eho 4<do 4<<<dono 4<e<eho 4<dono 4<ono 4<<ead L0 do eecho
+$3; @;o
+ÿÿ; done<eho 4<<<dono 4>>d L0 wh G>> L0 do  o hi; L; L;o
+$L;e;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x o | for x ix ina }6|et
+   |o 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for xor x ix ina in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cÿÿÿb c; do }’eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or  x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eþ€||&666&666|et
+  ;{ foo | for x in a b’o oo | for x ix ina }6|Tt
+  ;{r x  | for x }0<<4<<;< eÿ€||666&666|et
+  ;{ foo | for x in a b’o foo | fo | for x in a b’o foo | fo c; or x i; do }{{fdo oo | for x ix ina }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;c a;;e 4|ž|UG>>&&<e<eho 4<do 4<no 4<e<e<dono 4 4<< a;;e 4|ž|UG>>&&&=>
+do e
+$L; L;o
+$L;e<eho 4<<<dono 4<e<eho 4<do 4<<o 4<e<eho 4< 4<ono 4<<;;]c a;;e 4|ž|UG>>&
+do eecho
+$L; L;o
+$L;<dono 4<e<eho 4<do 4<<<dono 4<e<eho 4<dono 4<ono 4<<ead L0 do eecho
+$3; @;o
+ÿÿ; done<eho 4<<<dono 4>>d L0 wh G>> L0 do  o hi; L; L;o
+$L;e;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&@66<ho for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b`````````````’o foo |ÿe c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o fo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&@66<ho 4<<;< eÿ€lse;if true; tif t{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do } 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; oo | fo c;x i; do }{{fdo oo | for a }6|et
+o c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ||&666&666|et
+  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; n a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&666<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do a }6|Tt
+  ;{r x  | for x }0<<&666<ho 4<<;< v|||eho  “ae)e)<^  ;{ foo | for x in a b’o foo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&@66<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; oo | fo c;x i; do }{{fdo oo | for a }6|et
+  ;{r x  | for x }0<<&@66<ho 4<<;< eÿ€||&666&666|et
+  ;{ foo | for x in a b’o foo |ÿo c; or x i; do } cn a b c; do }’o foo | for  b c; do }’o foo | for e} cn a b c; do }’o foo | fo

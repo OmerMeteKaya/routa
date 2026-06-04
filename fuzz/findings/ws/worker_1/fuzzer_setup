@@ -1,0 +1,6 @@
+# environment variables:
+AFL_CUSTOM_INFO_PROGRAM=build_afl/fuzz/afl_fuzz_ws
+AFL_CUSTOM_INFO_PROGRAM_ARGV=
+AFL_CUSTOM_INFO_OUT=fuzz/findings/ws/worker_1
+# command line:
+'afl-fuzz' '-i' 'fuzz/corpus/ws' '-o' 'fuzz/findings/ws' '-m' 'none' '-t' '1000' '-S' 'worker_1' '--' 'build_afl/fuzz/afl_fuzz_ws'

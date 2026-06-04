@@ -1,0 +1,1 @@
+echo echo ${X} ${X:=helloX} ${X:=de0w}$${cho ${X} ${X ${X:=default}echo ${X} ${X:=he

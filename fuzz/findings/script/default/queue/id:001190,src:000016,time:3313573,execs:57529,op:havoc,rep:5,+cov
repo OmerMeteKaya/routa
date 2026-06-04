@@ -1,0 +1,2 @@
+f()llo
+f() { g() { echo nested }Ì }

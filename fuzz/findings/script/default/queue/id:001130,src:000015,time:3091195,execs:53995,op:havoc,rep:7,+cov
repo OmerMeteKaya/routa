@@ -1,0 +1,1 @@
+printf 'Lin%1unline2\n' | wHile read L; do echo "got:$L"; dné

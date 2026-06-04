@@ -1,0 +1,2 @@
+while read while read L;echo $L; do e
+L; do echo $L; done

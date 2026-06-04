@@ -1,0 +1,1 @@
+printf 'line1Znline2\n' | while read  then L; do ec—o "gQt:-L"; done

@@ -1,0 +1,1 @@
+for x in a d c; do echo $x; done

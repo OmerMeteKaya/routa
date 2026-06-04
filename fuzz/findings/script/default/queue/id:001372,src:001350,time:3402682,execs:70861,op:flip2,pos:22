@@ -1,0 +1,1 @@
+echo ${#A[echo ${X} ${[:=hello e}t {AC0]} ${#A[echo ${X} ${X:=default}

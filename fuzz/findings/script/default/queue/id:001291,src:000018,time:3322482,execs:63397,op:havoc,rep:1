@@ -1,0 +1,1 @@
+for i in [ $i -lt 3 ]; do }ceq 2 ]; then echo found; fi; done

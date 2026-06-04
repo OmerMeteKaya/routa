@@ -1,0 +1,1 @@
+case $X in a) echo a;; b)&echo RmRORRRRRRb;; *) echo o$X in a) echo a;; b)&echo Rther;; esac

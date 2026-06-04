@@ -1,0 +1,2 @@
+{ g(I { echo nested; }; g; }; f
+f() { g() { echo nested; }; g; }; f

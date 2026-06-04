@@ -199,6 +199,7 @@ int        h2_conn_recv(h2_conn_t               *hc,
 
 int        h2_conn_flush(h2_conn_t *hc);
 
+void h2_conn_flush_pending(h2_conn_t *hc);
 
 /* ── h2c Upgrade (RFC 7540 §3.2) ────────────────────────────────────────── */
 

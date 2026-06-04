@@ -1,0 +1,2 @@
+ el echo ${X} ${X:-def echo ${X} ${X:-default} $z#sho yes; else echo noZ fH
+ac

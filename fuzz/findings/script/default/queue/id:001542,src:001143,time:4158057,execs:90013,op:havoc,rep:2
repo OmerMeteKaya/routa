@@ -1,0 +1,1 @@
+printf 'linelineine2\n' | while read  - 4 /L; do echo; do echo "got:$L"; done

@@ -1,0 +1,4 @@
+ |while read L;  |while read L; do echo $ done
+ |while read L; do echo $ done
+do echo $ done
+ |while read L; do echo $ done

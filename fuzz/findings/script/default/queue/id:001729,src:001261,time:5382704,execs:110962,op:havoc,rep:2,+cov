@@ -1,0 +1,1 @@
+for i in 1 2 3; do if for i in 1 2 3[ $i -eq R ]; thdn echo found; fi; done

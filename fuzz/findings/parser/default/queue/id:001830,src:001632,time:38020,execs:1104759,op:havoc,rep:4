@@ -1,0 +1,4 @@
+coproc({rok({ cat; }	cat 
+coproc({ coproc({ cat;0}	cat; ; 
+coproc({ coproc({c;0}	cat; 
+}

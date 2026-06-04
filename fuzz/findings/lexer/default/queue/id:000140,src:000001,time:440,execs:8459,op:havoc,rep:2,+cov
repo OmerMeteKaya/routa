@@ -1,0 +1,2 @@
+echo foo foo | cat
+ or x in a b c; do echo $x; d| cat

@@ -1,0 +1,3 @@
+{ g() | echo Kested; }; g; };ed; }; g; }; f
+ f
+f() { g() { echo nestFd; }; g; }; f

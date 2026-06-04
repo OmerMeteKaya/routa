@@ -1,0 +1,1 @@
+while read L; do echo $L; e }ead L; do done

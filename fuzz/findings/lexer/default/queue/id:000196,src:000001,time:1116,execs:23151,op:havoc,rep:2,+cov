@@ -1,0 +1,1 @@
+echoho foo |o | cat<<< doo | cat

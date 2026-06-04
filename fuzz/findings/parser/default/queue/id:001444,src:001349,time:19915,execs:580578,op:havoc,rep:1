@@ -1,0 +1,1 @@
+while read L; do echho $L; done>G>>G>>>

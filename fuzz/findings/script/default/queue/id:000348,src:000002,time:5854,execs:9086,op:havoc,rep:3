@@ -1,0 +1,1 @@
+if [ -n "$X" ]; thenyes; else echo no; fi echo yeå; else echR no; fi

@@ -210,20 +210,26 @@ static int send_file_tls(worker_t *w, conn_t *conn,
 static void conn_close_and_free(worker_t *w, conn_t *conn) {
     poller_del(w->poller, conn->fd);
     conn_remove(w, conn);
+
     if (conn->h2 && conn->h2->write_buf.len > 0)
         h2_conn_flush(conn->h2);
-    if (conn->tls) { tls_shutdown(conn->tls); tls_conn_free(conn->tls); conn->tls = NULL; }
     if (conn->h2)  { h2_conn_free(conn->h2);  conn->h2  = NULL; }
+    if (conn->tls) { tls_shutdown(conn->tls); tls_conn_free(conn->tls); conn->tls = NULL; }
     if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
     if (conn->upstream_fd >= 0) { close(conn->upstream_fd); conn->upstream_fd = -1; }
+
     shutdown(conn->fd, SHUT_WR);
     net_close(conn->fd);
+    conn->fd = -1;
+
     conn_reset_write_state(conn);
     buf_free(&conn->read_buf);
     buf_free(&conn->write_buf);
     buf_free(&conn->hdr_buf);
     buf_free(&conn->upstream_req_buf);
     buf_free(&conn->upstream_resp_buf);
+
+    routa_metrics_conn_close();
 
     if (conn->from_slab && w->slab) {
         conn_slab_release(w->slab, conn);
@@ -381,9 +387,10 @@ static void handle_events_worker(worker_t *w) {
             if (conn->state == CONN_TLS_HANDSHAKE) {
                 poller_del(w->poller, conn->fd);
                 conn_remove(w, conn);
-                if (conn->tls) tls_shutdown(conn->tls);
+                if (conn->tls) { tls_shutdown(conn->tls); tls_conn_free(conn->tls); conn->tls = NULL; }
                 net_close(conn->fd);
                 conn_free(conn);
+                if (conn->from_slab && w->slab) conn_slab_release(w->slab, conn);
                 continue;
             }
             conn->state = CONN_CLOSING;
@@ -569,8 +576,11 @@ static void handle_events_worker(worker_t *w) {
                     poller_del(w->poller, conn->fd);
                     conn_remove(w, conn);
                     ROUTA_METRIC_INC(tls_errors_total);
-                    if (conn->tls) tls_shutdown(conn->tls);
-                    net_close(conn->fd); conn_free(conn); continue;
+                    if (conn->tls) { tls_shutdown(conn->tls); tls_conn_free(conn->tls); conn->tls = NULL; }
+                    net_close(conn->fd);
+                    conn_free(conn);
+                    if (conn->from_slab && w->slab) conn_slab_release(w->slab, conn);
+                    continue;
                 }
                 continue;
             }
@@ -740,10 +750,6 @@ static void handle_events_worker(worker_t *w) {
                 http_request_free(&req);
                 conn->state = CONN_WRITING;
                 goto handle_state;
-                http_response_destroy(&resp);
-                http_request_free(&req);
-                conn->state = CONN_WRITING;
-                goto handle_state;
 
             } else {        // ── WebSocket upgrade check ──────────────────────────────────────
                 if (ws_is_upgrade_request(&req)) {
@@ -878,6 +884,11 @@ static void handle_events_worker(worker_t *w) {
                     if (conn->h2->error) {
                         conn->state = CONN_CLOSING;
                         goto handle_state;
+                    }
+                    h2_conn_flush_pending(conn->h2);
+                    if (conn->h2->write_buf.len > 0) {
+                        conn_poller_mod(w, conn, POLLER_READ | POLLER_WRITE | POLLER_ET);
+                        continue;
                     }
                     /* Drain any pending input */
                     while (1) {
@@ -1026,8 +1037,11 @@ static void handle_events_worker(worker_t *w) {
                         poller_del(w->poller, conn->fd);
                         conn_remove(w, conn);
                         ROUTA_METRIC_INC(tls_errors_total);
-                        if (conn->tls) tls_shutdown(conn->tls);
-                        net_close(conn->fd); conn_free(conn); continue;
+                        if (conn->tls) { tls_shutdown(conn->tls); tls_conn_free(conn->tls); conn->tls = NULL; }
+                        net_close(conn->fd);
+                        conn_free(conn);
+                        if (conn->from_slab && w->slab) conn_slab_release(w->slab, conn);
+                        continue;
                     }
                     continue;
                 }
@@ -1184,7 +1198,6 @@ static void handle_events_worker(worker_t *w) {
                         conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
                         break;
             case CONN_CLOSING:
-                        routa_metrics_conn_close();
                         conn_close_and_free(w, conn);
                         break;
             default:
@@ -1295,10 +1308,11 @@ static void *worker_run(void *arg) {
                     /* swap-remove to avoid shifting the entire array */
                     w->active_conns[ci] =
                         w->active_conns[--w->active_conn_count];
-                    if (c->tls) tls_shutdown(c->tls);
+                    if (c->tls) { tls_shutdown(c->tls); tls_conn_free(c->tls); c->tls = NULL; }
                     net_close(c->fd);
                     conn_reset_write_state(c);
                     conn_free(c);
+                    if (c->from_slab && w->slab) conn_slab_release(w->slab, c);
                     /* do not increment ci — check swapped-in element  */
                 } else {
                     ci++;
@@ -1584,6 +1598,7 @@ static void *worker_run_uring(void *arg) {
 
 void event_loop_run(event_loop_t *loop) {
     if (!loop) return;
+    signal(SIGPIPE, SIG_IGN);
     LOG_INFO("\nEvent loop started\n");
     for (int i = 0; i < loop->n_workers; i++) {
         worker_t *w           = &loop->workers[i];

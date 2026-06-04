@@ -1,0 +1,2 @@
+{ g() { erho nested; }; g; }; f
+f() { g(n echo yesested; }; g; }; f

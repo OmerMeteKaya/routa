@@ -1,0 +1,1 @@
+ echo ${X} ${X:-default} ${#ã}X=hulpo; echo ${X} ${X<-default} ${#X}

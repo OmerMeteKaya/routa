@@ -1,0 +1,1 @@
+printf 'lin¨¨¨¨e1\nline2\n' | while rea„ L; do fcho "got:$L"; done||||| 

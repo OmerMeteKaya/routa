@@ -1,0 +1,3 @@
+{ g() { echo nested; }; g; }; f
+f() { g() } ec]g; }; f
+fo nested; }; gD }; f

@@ -423,9 +423,15 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len) {
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:  return -1;
         case SSL_ERROR_ZERO_RETURN: return  0;
-        default:
-            log_ssl_error("TLS write");
+        default: {
+            int ssl_err = ERR_peek_last_error();
+            if (ERR_GET_REASON(ssl_err) == ERR_R_SYS_LIB) {
+                ERR_clear_error();
+            } else {
+                log_ssl_error("TLS write");
+            }
             return -1;
+        }
     }
 }
 

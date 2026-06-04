@@ -1,0 +1,2 @@
+echoo foo | cat
+ foo | cat

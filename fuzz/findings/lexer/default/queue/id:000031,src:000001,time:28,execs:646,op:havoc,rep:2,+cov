@@ -1,0 +1,2 @@
+echo foor x in a b c; êo echo $x; done
+ | cat

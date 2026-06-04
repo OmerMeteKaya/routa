@@ -1,0 +1,1 @@
+printf 'o echo line2\n' | while read 1 + 2 * 3 - 4 /L; do echo "g›t:$L"; done

@@ -1,0 +1,6 @@
+# environment variables:
+AFL_CUSTOM_INFO_PROGRAM=build_afl/fuzz/afl_fuzz_h2_frame
+AFL_CUSTOM_INFO_PROGRAM_ARGV=
+AFL_CUSTOM_INFO_OUT=fuzz/findings/h2_frame/master
+# command line:
+'afl-fuzz' '-i' 'fuzz/corpus/h2_frame' '-o' 'fuzz/findings/h2_frame' '-m' 'none' '-t' '1000' '-M' 'master' '--' 'build_afl/fuzz/afl_fuzz_h2_frame'

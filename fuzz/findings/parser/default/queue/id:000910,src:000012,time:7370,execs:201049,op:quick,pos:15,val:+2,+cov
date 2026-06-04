@@ -1,0 +1,1 @@
+while read L; d_ echo $L; done

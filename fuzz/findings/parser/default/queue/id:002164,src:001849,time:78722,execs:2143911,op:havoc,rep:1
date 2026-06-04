@@ -1,0 +1,2 @@
+{ cat; { cat; coproc }co{ cat; { cat; coproc }coproc }
+proc }

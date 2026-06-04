@@ -1,0 +1,3 @@
+{ g() f
+f() { g() { echo nested; }; { echo nested; }; g; }; f
+f() { g() { echo n }ested; }; g; }; f

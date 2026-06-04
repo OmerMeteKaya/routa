@@ -1,0 +1,1 @@
+while read L; do echo $L; done>G<&6-one>G<&66>>G>>=>

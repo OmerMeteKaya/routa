@@ -1,0 +1,2 @@
+echo >>>>>ho |cat>>>3>>>ho foo | cat
+ catch| | cat

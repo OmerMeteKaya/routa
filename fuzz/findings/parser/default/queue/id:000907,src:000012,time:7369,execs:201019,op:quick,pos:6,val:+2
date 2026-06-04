@@ -1,0 +1,1 @@
+while (ead L; do echo $L; done

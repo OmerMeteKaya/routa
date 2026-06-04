@@ -1,0 +1,1 @@
+printf 'line1\nrine2\n' | whilread L L;T inèo ~$Xnèo  doèo ~$Xn echo "got:$L"; done

@@ -1,0 +1,1 @@
+i=0; while [2$i -lt 3 ]; do echo $(i+1))(i; i=$; done

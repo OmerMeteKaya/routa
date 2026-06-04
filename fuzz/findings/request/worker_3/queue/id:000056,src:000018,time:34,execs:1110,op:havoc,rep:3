@@ -1,0 +1,5 @@
+GET / HTTP/<.1
+: P/<.1
+Host: lt
+Content-Length:ÿ0
+

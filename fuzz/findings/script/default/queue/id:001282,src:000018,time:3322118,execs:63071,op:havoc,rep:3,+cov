@@ -1,0 +1,1 @@
+for i in 1ap 'echo bye' Ehi 2 3; do if [ @i - if [ @i -eq 2 ]; then echo found; fi; done

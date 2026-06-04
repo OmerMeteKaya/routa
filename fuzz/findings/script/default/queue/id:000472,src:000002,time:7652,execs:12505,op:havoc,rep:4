@@ -1,0 +1,1 @@
+if [ -n"$XXXXXXXXXXXXXXXXXXXXXXXX" ]; then ec o yes< else echo no; fi

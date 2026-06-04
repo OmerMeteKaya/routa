@@ -92,12 +92,17 @@ void http_response_set_body_fd(http_response_t *r, int fd, off_t offset, size_t 
 int http_response_serialize(const http_response_t *r, buf_t *out) {
     if (!r || !out) return -1;
 
-    /* Date header */
+    /* Date — cached at 1s resolution to avoid per-request syscall */
+    static time_t s_date_last = 0;
+    static char   s_date_str[64];
     time_t now = time(NULL);
-    struct tm tm_buf;
-    gmtime_r(&now, &tm_buf);
-    char date_str[64];
-    (void)strftime(date_str, sizeof(date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
+    if (now != s_date_last) {
+        struct tm tm_buf;
+        gmtime_r(&now, &tm_buf);
+        strftime(s_date_str, sizeof(s_date_str), "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
+        s_date_last = now;
+    }
+    const char *date_str = s_date_str;
 
     /* Check which required headers already set */
     int has_date = 0, has_server = 0, has_connection = 0;

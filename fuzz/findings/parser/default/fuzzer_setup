@@ -1,0 +1,6 @@
+# environment variables:
+AFL_CUSTOM_INFO_PROGRAM=./fuzz_parser
+AFL_CUSTOM_INFO_PROGRAM_ARGV=@@
+AFL_CUSTOM_INFO_OUT=/home/mete/routa/fuzz/findings/parser/default
+# command line:
+'afl-fuzz' '-i' 'corpus/parser' '-o' '/home/mete/routa/fuzz/findings/parser' '-t' '5000' '-m' '256' '--' './fuzz_parser' '@@'

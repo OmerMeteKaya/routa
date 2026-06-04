@@ -1,0 +1,2 @@
+true && echo yes || echo no
+™alse >&o bžd | echo ok

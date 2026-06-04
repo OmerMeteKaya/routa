@@ -1,0 +1,2 @@
+while read L; do echo -L''''¥if true; then echo hi; fi
+; done

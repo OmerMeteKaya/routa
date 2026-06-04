@@ -176,7 +176,7 @@ int server_lb_route(server_t *s, const char *path, int methods) {
 /* ── server_run ─────────────────────────────────────────────────────────────*/
 void server_run(server_t *s) {
     if (!s || !s->loop) return;
-
+    signal(SIGPIPE, SIG_IGN);
     /* SIGTERM / SIGINT → graceful drain */
     struct sigaction sa = { .sa_handler = signal_handler, .sa_flags = 0 };
     sigemptyset(&sa.sa_mask);

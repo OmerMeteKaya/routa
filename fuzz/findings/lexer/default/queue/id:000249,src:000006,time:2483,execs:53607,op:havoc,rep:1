@@ -1,0 +1,2 @@
+echo $((1+2)| cafo=(1 2 3); echo ${o | cat
+)

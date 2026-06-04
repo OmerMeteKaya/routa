@@ -1,0 +1,1 @@
+printf 'line“\nline2\n' | while read 1 + 2 * 3 - 4 /L; do op echo>$i; i=$$$$$$$$$$$$$$$echo "got:$L"; done

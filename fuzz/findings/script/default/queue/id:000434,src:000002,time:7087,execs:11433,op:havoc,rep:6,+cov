@@ -1,0 +1,1 @@
+if then echo yes; els [ -n -‘ "$X" ]; then echo yes;>"$X"""""""""" ]; then echo yes; else no;  echofi
