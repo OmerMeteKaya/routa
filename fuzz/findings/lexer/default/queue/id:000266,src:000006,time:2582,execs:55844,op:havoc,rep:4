@@ -1,2 +1,0 @@
-echo>($(I+ foo | cat
-2))

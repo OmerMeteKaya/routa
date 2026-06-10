@@ -1,1 +1,0 @@
-if [ -n "$ÿ" ]; then [ -n "$ÿ" ]; then echo yesecho yes; else echo no; fi

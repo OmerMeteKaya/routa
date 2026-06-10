@@ -1,1 +1,0 @@
-i=0; while [ $in "$X" ]; . -lt 3 ]; do echo $i; f=$((i+1)); done

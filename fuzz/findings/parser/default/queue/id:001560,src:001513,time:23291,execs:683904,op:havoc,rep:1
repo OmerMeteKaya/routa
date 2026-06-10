@@ -1,1 +1,0 @@
-while read L; do echo $L; don done>G<&6-one>G<&e>G<&6-one>G<&66>>G>>=>

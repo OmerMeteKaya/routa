@@ -1,2 +1,0 @@
-printf 'line1\nline2\n' | whileo "got:$L"; done
- read 1 + 2 * 3 - 4 /L; do echo "got:$L"; done

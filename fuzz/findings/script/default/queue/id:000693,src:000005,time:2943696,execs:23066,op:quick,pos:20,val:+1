@@ -1,1 +1,0 @@
-case $X in a) echo aﬁ; b) echo b;; *) echo other;; esac

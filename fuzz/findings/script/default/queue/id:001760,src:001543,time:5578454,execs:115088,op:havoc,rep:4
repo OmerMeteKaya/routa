@@ -1,1 +1,0 @@
-pr$i read$i -lt 3>3; do e while read$i -lt 3>3  4 0L; do echo "got:$L"; done

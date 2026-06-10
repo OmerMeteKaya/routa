@@ -1,1 +1,0 @@
-for x in a c; do echo $Óx; doneb c; do echo $x; done

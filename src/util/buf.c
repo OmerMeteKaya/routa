@@ -11,16 +11,15 @@ void buf_init(buf_t *b) {
     b->data = NULL;
     b->len  = 0;
     b->cap  = 0;
+    b->off  = 0;
 }
 
 int buf_append(buf_t *b, const void *src, size_t n) {
     if (!b || !src || n == 0) return 0;
-
     if (b->off > 0 && b->off >= b->cap / 2) {
         memmove(b->data, b->data + b->off, b->len);
         b->off = 0;
     }
-
     if (b->off + b->len + n > b->cap) {
         size_t new_cap = b->cap == 0 ? 4096 : b->cap * 2;
         while (new_cap < b->off + b->len + n) new_cap *= 2;
@@ -29,7 +28,6 @@ int buf_append(buf_t *b, const void *src, size_t n) {
         b->data = nd;
         b->cap  = new_cap;
     }
-
     memcpy(b->data + b->off + b->len, src, n);
     b->len += n;
     return 0;
@@ -53,5 +51,6 @@ void buf_free(buf_t *b) {
         b->data = NULL;
         b->len = 0;
         b->cap = 0;
+        b->off = 0;
     }
 }

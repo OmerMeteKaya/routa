@@ -12,6 +12,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * STATUS: gzip compression is fully implemented.
+ *
+ * TODO — missing features:
+ *
+ * 1. deflate support: add a `deflate_compress()` using deflateInit2 with
+ *    windowBits=-15 (raw deflate), check cfg->prefer == COMPRESS_PREFER_DEFLATE.
+ *
+ * 2. Brotli support: requires libbrotlienc (not currently linked). Add
+ *    CMakeLists.txt find_package(Brotli) and a `brotli_compress()` path.
+ *
+ * 3. Proper Accept-Encoding q-value parsing: current strstr("gzip") accepts
+ *    "gzip;q=0" (explicitly disabled). A correct RFC 7231 parser is needed if
+ *    clients that do this show up.
+ *
+ * 4. Streaming / body_fd path: large files served via sendfile are skipped.
+ *    To compress those, the file must be read into memory first, which defeats
+ *    the purpose of sendfile. Consider a pre-compress cache keyed by path+mtime.
+ *
+ * 5. ETag invalidation: if a strong ETag was set before compression, it should
+ *    be weakened (W/"...") or recomputed since the entity body changed.
+ */
+
 /* ── Defaults ───────────────────────────────────────────────────────────────*/
 #define DEFAULT_MIN_SIZE  256u
 #define DEFAULT_LEVEL     6

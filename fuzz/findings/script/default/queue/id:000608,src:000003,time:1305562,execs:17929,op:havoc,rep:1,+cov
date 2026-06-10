@@ -1,1 +1,0 @@
-i=0; while [ $i -le [ $i -lt 3t 3 ]; do echo $i; i=$((i+1)); done

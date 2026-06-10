@@ -1,2 +1,0 @@
-{ g(* { echo nested; }; g; }; f
-f() { g() { echo oested; }; g; };                                f$

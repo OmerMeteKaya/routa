@@ -1,1 +1,0 @@
-printf 'line1\nlIne2\n''''''''''''''''''''''''''''''''' | while read L; do echo "got:$L"tf 'line1\nlIne2; done

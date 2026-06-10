@@ -1,1 +1,0 @@
-printf 'line1\\\?\\\\n' | whi$X" >; then echo yes; elsele read L; ho "got:$L"; dondo echo "got:$L"; done

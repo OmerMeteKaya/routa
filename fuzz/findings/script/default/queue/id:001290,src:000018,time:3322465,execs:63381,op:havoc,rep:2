@@ -1,1 +1,0 @@
-for i in 1 2 $i -eq in 1$i -eq in 1 2 3; do if [ $i -eq2 ]; then echo found; fi; done

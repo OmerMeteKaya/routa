@@ -1,1 +1,0 @@
-for i in 1 2 3; do if i" ]; then ech  yn echo found; fi; done

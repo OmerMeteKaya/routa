@@ -1,1 +1,0 @@
-printf 'line1\nline2\n' | wthen echo [[[[ hile read 1 + 2 * 3 - 4 /L; do echo "got:$L"; doée

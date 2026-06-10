@@ -1,2 +1,0 @@
-iif true; then echo hi;!fi
-fe; then echo hi;!fi

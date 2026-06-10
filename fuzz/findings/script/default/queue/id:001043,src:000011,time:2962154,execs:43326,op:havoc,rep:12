@@ -1,7 +1,0 @@
-lo…t} ${#X}
- ${#X}
-X=hello…t
- ${#X}
-X=hello…t} ${#X}
- $} ${#X}
- ${#X~

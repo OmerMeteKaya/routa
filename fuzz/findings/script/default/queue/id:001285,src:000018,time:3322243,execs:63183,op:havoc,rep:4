@@ -1,1 +1,0 @@
-[ $i -eq 2 ]; then echo fo 2 ];und; fi; done $

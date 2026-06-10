@@ -602,7 +602,7 @@ static void handle_events_worker(worker_t *w) {
                 static const uint8_t H2_PREFACE[] =
                     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
                 if (conn->read_buf.len >= 24 &&
-                    memcmp(conn->read_buf.data, H2_PREFACE, 24) == 0) {
+                    memcmp(buf_data(&conn->read_buf), H2_PREFACE, 24) == 0) {
                     conn->h2 = h2_conn_new(conn, &w->h2_cfg);
                     if (!conn->h2) {
                         conn->state = CONN_CLOSING;
@@ -1301,8 +1301,7 @@ static void *worker_run(void *arg) {
             int ci = 0;
             while (ci < w->active_conn_count) {
                 conn_t *c = w->active_conns[ci];
-                if (c->state == CONN_READING    ||
-                    c->state == CONN_KEEPALIVE  ||
+                if (c->state == CONN_READING ||
                     c->state == CONN_TLS_HANDSHAKE) {
                     poller_del(w->poller, c->fd);
                     /* swap-remove to avoid shifting the entire array */
@@ -1335,15 +1334,15 @@ static void *worker_run(void *arg) {
             }
         }
 
-        /* ── Hot reload (worker 0 only) ── */
-        if (w->worker_id == 0 && w->loop &&
+        /* ── Hot reload (worker 0 only, skip during drain) ── */
+        if (!w->draining && w->worker_id == 0 && w->loop &&
             w->loop->reload_flag && *w->loop->reload_flag) {
             *w->loop->reload_flag = 0;
             worker_apply_reload(w);
         }
 
         /* ── Periodic ping + H2 timeout sweep (~1 s) ── */
-        if (now_ms - last_ping_sweep_ms >= 1000) {
+        if (now_ms - last_ping_sweep_ms >= 10000) {
             ws_config_t default_cfg;
             ws_config_init(&default_cfg);
             ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
@@ -1363,8 +1362,7 @@ static void *worker_run(void *arg) {
             int ci = 0;
             while (ci < w->active_conn_count) {
                 conn_t *_c = w->active_conns[ci];
-                if ((_c->state == CONN_READING ||
-                     _c->state == CONN_KEEPALIVE) &&
+                if (_c->state == CONN_READING &&
                     _c->keepalive_deadline > 0 &&
                     now_sec > _c->keepalive_deadline) {
                     LOG_DEBUG("h1: keepalive timeout fd=%d", _c->fd);
@@ -1389,7 +1387,9 @@ static void *worker_run(void *arg) {
         shutdown(c->fd, SHUT_WR);
         net_close(c->fd);
         conn_reset_write_state(c);
+        routa_metrics_conn_close();
         conn_free(c);
+        if (c->from_slab && w->slab) conn_slab_release(w->slab, c);
     }
     if (w->server_fd >= 0) net_close(w->server_fd);
     poller_free(w->poller);

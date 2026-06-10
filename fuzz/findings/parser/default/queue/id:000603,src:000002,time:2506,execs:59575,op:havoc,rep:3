@@ -1,2 +1,0 @@
-if true; then echo hi;if tru hi;if true; then echo hi; f^ then echo hi; fi
- fi

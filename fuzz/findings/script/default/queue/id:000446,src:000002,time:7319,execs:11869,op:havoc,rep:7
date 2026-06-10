@@ -1,1 +1,0 @@
-if [    { {{{c@- "$X" n "$X" ]; then echo Ûe‘; else echo nï; fi

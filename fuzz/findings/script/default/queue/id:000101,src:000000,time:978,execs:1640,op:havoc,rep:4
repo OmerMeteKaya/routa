@@ -1,1 +1,0 @@
-echo ; do if [ $i @eq 2 ]; then echo helloé

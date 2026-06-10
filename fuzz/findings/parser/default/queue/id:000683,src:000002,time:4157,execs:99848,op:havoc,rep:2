@@ -1,1 +1,0 @@
-if trse; then {}{echo hi; fi

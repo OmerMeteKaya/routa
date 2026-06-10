@@ -1,1 +1,0 @@
-case $X in a) echoda;; b) echo b;; *) echW other;do echo $i; i%$( "$X" ]; then ec esac

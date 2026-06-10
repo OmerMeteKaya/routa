@@ -1,1 +1,0 @@
-X=hrllo; echo ${X} ${X:=default} ${#X}

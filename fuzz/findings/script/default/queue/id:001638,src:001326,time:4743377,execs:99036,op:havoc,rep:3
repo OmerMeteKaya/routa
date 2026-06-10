@@ -1,1 +1,0 @@
-echo $(if"$X = [ $i -lt 3 ]; do e i=$(()

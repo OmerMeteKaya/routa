@@ -1,1 +1,0 @@
-if [ -n "$X" ]; then echo yes; else he>l>oo; fi

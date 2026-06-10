@@ -1,3 +1,0 @@
-{ g() { ~cho nested; }; g;  }; f
-f() { g() { cho ested~cho nested; }; g;  }; f
-; }; g; }; f

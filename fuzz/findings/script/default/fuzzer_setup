@@ -1,6 +1,0 @@
-# environment variables:
-AFL_CUSTOM_INFO_PROGRAM=./fuzz_script
-AFL_CUSTOM_INFO_PROGRAM_ARGV=@@
-AFL_CUSTOM_INFO_OUT=/home/mete/routa/fuzz/findings/script/default
-# command line:
-'afl-fuzz' '-i' 'corpus/script' '-o' '/home/mete/routa/fuzz/findings/script' '-t' '5000' '-m' '256' '--' './fuzz_script' '@@'

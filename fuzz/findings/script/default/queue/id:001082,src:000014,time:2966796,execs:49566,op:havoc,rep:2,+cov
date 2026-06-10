@@ -1,2 +1,0 @@
-while getopts "ab:X in A"; do echo $opt; done
- opt; do echo $opt; done

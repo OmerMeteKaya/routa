@@ -1,1 +1,0 @@
-printf 'line1\nline5\rintf 'lide1\nline2\n' | while read L; do ezho "got:$L"kkkkkkkkkkkkkkkkkkkkkk; done

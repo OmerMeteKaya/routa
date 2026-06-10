@@ -1,2 +1,0 @@
-while while read L; do echo $L; done| read L; do echo $L; done| c<(c
-(

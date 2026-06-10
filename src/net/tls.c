@@ -370,18 +370,6 @@ int tls_handshake(tls_conn_t *tc) {
     if (ret == 1) {
         tc->handshake_done = 1;
         tc->resumed = SSL_session_reused(tc->ssl) ? 1 : 0;
-
-        const unsigned char *proto = NULL;
-        unsigned int proto_len = 0;
-        SSL_get0_alpn_selected(tc->ssl, &proto, &proto_len);
-        char proto_str[16] = "none";
-        if (proto && proto_len > 0)
-            snprintf(proto_str, sizeof(proto_str), "%.*s", (int)proto_len, proto);
-
-        LOG_INFO("TLS handshake done: resumed=%d alpn=%s tickets=%ld",
-                 tc->resumed,
-                 proto_str,
-                 SSL_CTX_sess_number(SSL_get_SSL_CTX(tc->ssl)));
         return 0;
     }
 
@@ -424,7 +412,7 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len) {
         case SSL_ERROR_WANT_WRITE:  return -1;
         case SSL_ERROR_ZERO_RETURN: return  0;
         default: {
-            int ssl_err = ERR_peek_last_error();
+            unsigned long ssl_err = ERR_peek_last_error();
             if (ERR_GET_REASON(ssl_err) == ERR_R_SYS_LIB) {
                 ERR_clear_error();
             } else {

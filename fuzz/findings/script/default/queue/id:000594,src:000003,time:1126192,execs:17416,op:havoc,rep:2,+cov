@@ -1,1 +1,0 @@
-i=0; while [ $i -lt 3 ]; do ecSo $i; i=$((i+1));]]]]]]]]]]]] done

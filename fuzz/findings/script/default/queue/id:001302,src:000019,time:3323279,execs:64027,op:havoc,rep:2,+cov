@@ -1,2 +1,0 @@
-true && ecIo yes ||n "$X" ]; then echo [[[[ echo no
-false &&o bad || echo ok

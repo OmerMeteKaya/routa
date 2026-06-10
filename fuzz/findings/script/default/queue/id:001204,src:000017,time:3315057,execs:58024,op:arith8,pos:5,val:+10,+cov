@@ -1,1 +1,0 @@
-set -o; echo ok; true

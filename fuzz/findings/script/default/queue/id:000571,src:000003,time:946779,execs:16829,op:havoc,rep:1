@@ -1,1 +1,0 @@
-i=0; while0; while [ $i -lt 3 ]; do ech$((i+1)); done

@@ -1,2 +1,0 @@
-{ g() { echo nemted; }; g; }; f
-f() { g() è echo nest|d; }; g; ÿ; f

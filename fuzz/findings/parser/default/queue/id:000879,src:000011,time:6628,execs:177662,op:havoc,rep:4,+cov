@@ -1,3 +1,0 @@
-proc { cat;*}
-at;*}
-coproc { cat; }cc { cat; }

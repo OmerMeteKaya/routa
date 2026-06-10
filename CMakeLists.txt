@@ -79,7 +79,7 @@ else()
     message(STATUS "io_uring: disabled")
 endif()
 # ── Examples ─────────────────────────────────────────────────────────────────
-foreach(example hello_world config_example chunked_example ws_echo_server h2_test_server)
+foreach(example hello_world config_example chunked_example ws_echo_server h2_test_server h2c_test_server)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
         add_executable(${example} examples/${example}.c)
         target_link_libraries(${example} PRIVATE routa_core)
@@ -100,6 +100,7 @@ include(cmake/Sanitizers.cmake)
 
 target_link_libraries(test_h2 PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
 target_link_libraries(h2_test_server PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
+target_link_libraries(h2c_test_server PRIVATE routa_core pthread)
 
 enable_testing()
 add_test(NAME test_buf        COMMAND test_buf)

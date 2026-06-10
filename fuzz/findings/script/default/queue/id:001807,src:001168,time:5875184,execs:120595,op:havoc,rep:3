@@ -1,3 +1,0 @@
-{ g() zþecho nested; }; g; }; f
-f() { g() {ed! }; g; }; f
-f() { g()  echo nested; }; g; }; f

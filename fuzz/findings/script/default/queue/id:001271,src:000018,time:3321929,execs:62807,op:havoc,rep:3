@@ -1,2 +1,0 @@
-for i in 1 2; do done
- 3; do if [ $i -eq 2 ]; then echo found; fi;for if [ $i -eq 2 ]x in a b c; do echo $x; do done

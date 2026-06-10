@@ -1,1 +1,0 @@
-f() { g() { echg() { echo nested; };o nested; }; g; }; f

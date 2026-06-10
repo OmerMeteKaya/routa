@@ -1,2 +1,0 @@
-trap 'echo Cye' EXIT; echo hi''''''ye'  3EXIT> 
-o hel

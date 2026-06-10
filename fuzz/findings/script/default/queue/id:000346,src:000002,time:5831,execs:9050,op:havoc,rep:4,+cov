@@ -1,1 +1,0 @@
-if [ -n "$X" ]; then echo  { g() { echo nested; }; g; yes; es; else kse eãho no; fi

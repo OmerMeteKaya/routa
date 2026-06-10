@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
                "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null");
     }
 
-    event_loop_t *loop = event_loop_new(port, 12);
+    event_loop_t *loop = event_loop_new(port, 6);
     if (!loop) { fprintf(stderr, "loop failed\n"); return 1; }
 
     if (!no_tls)

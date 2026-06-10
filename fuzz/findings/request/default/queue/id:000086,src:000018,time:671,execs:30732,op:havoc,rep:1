@@ -1,5 +1,0 @@
-GET / HTTP/1.1
-: loost
-Con: localhost
-Contngth: 0
-

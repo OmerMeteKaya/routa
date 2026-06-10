@@ -1,1 +1,0 @@
-printf 'line1\nlinu2\n'| while read L; do ech| "got:$L"; done

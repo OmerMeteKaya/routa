@@ -1,3 +1,0 @@
-echo foo | ca<<EOF
-hfllo
-EOt

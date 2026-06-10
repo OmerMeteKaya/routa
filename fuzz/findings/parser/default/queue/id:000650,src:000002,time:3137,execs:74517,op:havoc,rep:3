@@ -1,2 +1,0 @@
-cfe() { echo hi|oo fo ÿfoo |if true;n echo hi;  then echo hi; fi
-cho fop |((((

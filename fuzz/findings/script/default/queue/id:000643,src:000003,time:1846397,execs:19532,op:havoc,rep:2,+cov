@@ -1,1 +1,0 @@
-ihile [ $i -lt 3 ]=0((1 l; while [ $i -lt 3 ]; do echo $i; i=$((i+1)); done

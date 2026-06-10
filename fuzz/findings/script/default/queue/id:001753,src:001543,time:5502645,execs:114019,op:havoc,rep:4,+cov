@@ -1,1 +1,0 @@
-pr$i -lt 3>>]; do e 7hzld rhile read 1 + 2 * 3 - 4 /L; do echo "got:$L"; done

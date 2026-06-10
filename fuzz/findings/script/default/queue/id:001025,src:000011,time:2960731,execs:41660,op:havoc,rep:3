@@ -1,1 +1,0 @@
-X=hello; echo ${X} X=hello; echono; fi echo yeå; else echR n ${X} ${X:-dR n ${X} ${X:-defau${X:-defaulefau${X:-default} ${#X}

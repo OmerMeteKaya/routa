@@ -1,3 +1,0 @@
-echo o |echo>foo 
-echo>foo | cat
-oo | cao>foo | cat

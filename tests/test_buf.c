@@ -26,10 +26,10 @@ static int g_fail = 0;
 static void test_init(void) {
     buf_t b;
     buf_init(&b);
-    if (b.len != 0 || b.data == NULL || b.cap == 0)
-        FAIL("init", "len=%zu cap=%zu data=%p", b.len, b.cap, (void*)b.data);
+    if (b.len != 0 || b.off != 0)
+        FAIL("init", "len=%zu off=%zu", b.len, b.off);
     else
-        OK("init — len=0, cap>0, data!=NULL");
+        OK("init — len=0 off=0 (lazy alloc)");
     buf_free(&b);
 }
 
@@ -61,7 +61,7 @@ static void test_consume(void) {
     buf_init(&b);
     buf_append(&b, "Hello World!", 12);
     buf_consume(&b, 6);
-    if (b.len != 6 || memcmp(b.data, "World!", 6) != 0)
+    if (b.len != 6 || memcmp(buf_data(&b), "World!", 6) != 0)
         FAIL("consume", "len=%zu content wrong", b.len);
     else
         OK("consume — 6 bytes shifted");
@@ -183,8 +183,8 @@ static void test_consume_then_append(void) {
     buf_append(&b, "AAABBB", 6);
     buf_consume(&b, 3);
     buf_append(&b, "CCC", 3);
-    if (b.len != 6 || memcmp(b.data, "BBBCCC", 6) != 0)
-        FAIL("consume then append", "len=%zu content='%.*s'", b.len, (int)b.len, (char*)b.data);
+    if (b.len != 6 || memcmp(buf_data(&b), "BBBCCC", 6) != 0)
+        FAIL("consume then append", "len=%zu content='%.*s'", b.len, (int)b.len, (char*)buf_data(&b));
     else
         OK("consume then append — correct content");
     buf_free(&b);
@@ -222,7 +222,7 @@ static void test_binary_null_mid(void) {
     buf_append(&b, frame, sizeof(frame));
     /* Consume 9-byte header, verify payload intact */
     buf_consume(&b, 9);
-    if (b.len != sizeof(frame) - 9 || b.data[0] != 0x82)
+    if (b.len != sizeof(frame) - 9 || buf_data(&b)[0] != 0x82)
         FAIL("binary null mid", "content corrupted after consume");
     else
         OK("binary null mid — H2 frame payload preserved");

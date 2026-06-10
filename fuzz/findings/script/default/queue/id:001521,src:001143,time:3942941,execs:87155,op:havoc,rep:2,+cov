@@ -1,1 +1,0 @@
-printf ' 3 - 4 /L; do ile read 1 + 2 * 3 - 4 /L; do\n' | while read 1 + 2 * 3 - 4 /L; do echo "got:$L"; done

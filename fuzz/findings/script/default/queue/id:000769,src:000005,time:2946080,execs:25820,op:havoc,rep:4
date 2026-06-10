@@ -1,1 +1,0 @@
-cvse if [[ -f "$X" ]<$X in a) echo a;; b) echy b;; *) echo<other;; esac

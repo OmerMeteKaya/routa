@@ -642,7 +642,7 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
 
             /* Full frame received */
             if (fs->fin) {
-                const uint8_t *msg_data = (const uint8_t *)fs->frag_buf.data;
+                const uint8_t *msg_data = buf_data(&fs->frag_buf);
                 size_t         msg_len  = fs->frag_buf.len;
                 uint8_t       *decomp   = NULL;
                 size_t         decomp_len = 0;

@@ -1,1 +1,0 @@
-X=hello; echo $X

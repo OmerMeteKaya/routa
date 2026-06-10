@@ -1,1 +1,0 @@
-trap 'echo becho bye'=echo  [ $$hi

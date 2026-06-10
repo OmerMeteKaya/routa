@@ -1,1 +1,0 @@
-i=d; while [ $i -lt 3 ]; do echo $i; i=$(hile [ $i -lt 3 ]; do ech(i+1)); done

@@ -1,1 +1,0 @@
-printf 'linR1\nf ne2\n' | while read 1 + 2 * 3 - 4 /L; do echo "got:$L"; done

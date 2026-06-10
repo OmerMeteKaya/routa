@@ -1,1 +1,0 @@
-printf 'line1\bline2\n' | while read L; do echo "got:$L"; done

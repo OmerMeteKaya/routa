@@ -25,29 +25,29 @@ ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
     if (tls) {
         ssize_t total = 0;
         while (1) {
-            /* Ensure space — at least 8KB available */
+            /* Ensure space — at least 8KB available after current data     */
             size_t avail = b->cap - b->off - b->len;
             if (avail < 8192) {
-                /* Compact first */
+                /* Compact: move data to front of buffer, reset offset      */
                 if (b->off > 0) {
-                    memmove(buf_data(b), buf_data(b) + b->off, b->len);
+                    memmove(b->data, b->data + b->off, b->len);
                     b->off = 0;
-                    avail = b->cap - b->len;
+                    avail  = b->cap - b->len;
                 }
                 if (avail < 8192) {
                     size_t new_cap = b->cap == 0 ? 16384 : b->cap * 2;
-                    while (new_cap < b->off + b->len + 8192) new_cap *= 2;
-                    uint8_t *nd = realloc(buf_data(b), new_cap);
+                    while (new_cap < b->len + 8192) new_cap *= 2;
+                    uint8_t *nd = realloc(b->data, new_cap);
                     if (!nd) return total > 0 ? total : -1;
                     b->data = nd;
                     b->cap  = new_cap;
-                    avail   = b->cap - b->off - b->len;
+                    avail   = b->cap - b->len;  /* b->off == 0 here         */
                 }
             }
 
-            /* Read directly into buf — zero extra copy */
+            /* Read directly into buf — zero extra copy                     */
             ssize_t n = tls_read(tls,
-                                 buf_data(b) + b->off + b->len,
+                                 b->data + b->off + b->len,
                                  avail);
             if (n < 0) return total > 0 ? total : -1;
             if (n == 0) return total > 0 ? total : 0;
@@ -57,25 +57,26 @@ ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
         }
         return total;
     } else {
-        /* Plain fd — same approach */
+        /* Plain fd — same approach                                         */
         size_t avail = b->cap - b->off - b->len;
         if (avail < 8192) {
+            /* Compact: move data to front of buffer, reset offset          */
             if (b->off > 0) {
-                memmove(buf_data(b), buf_data(b) + b->off, b->len);
+                memmove(b->data, b->data + b->off, b->len);
                 b->off = 0;
                 avail  = b->cap - b->len;
             }
             if (avail < 8192) {
                 size_t new_cap = b->cap == 0 ? 16384 : b->cap * 2;
-                while (new_cap < b->off + b->len + 8192) new_cap *= 2;
-                uint8_t *nd = realloc(buf_data(b), new_cap);
+                while (new_cap < b->len + 8192) new_cap *= 2;
+                uint8_t *nd = realloc(b->data, new_cap);
                 if (!nd) return -1;
                 b->data = nd;
                 b->cap  = new_cap;
             }
         }
         ssize_t n = read(fd,
-                         buf_data(b) + b->off + b->len,
+                         b->data + b->off + b->len,
                          b->cap - b->off - b->len);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;

@@ -1,2 +1,0 @@
-true && echo yes || echo no
-false &&o bad || echo ok

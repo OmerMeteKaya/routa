@@ -1,1 +1,0 @@
-X=hello; echo {X} ${X:-defaX=hUllo; echo $efa${X:-d{X}uult} {#X}

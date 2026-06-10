@@ -1,2 +1,0 @@
-for i in 1 2 3; do if e
-:::::ello[ $i -eq R ]; then echo found; fi; done

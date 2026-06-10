@@ -1,1 +1,0 @@
-X=hello; echo ${X}; echoX=hell'echo; 응응응응응응좇응응 ${X} ${X:-defau ${X:-default} ${#X}

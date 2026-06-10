@@ -1,1 +1,0 @@
-X=hemlo; echo ${}|=hello; ecFo ${X} ${X:-${#X ${X} ${X:-${#X}

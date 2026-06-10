@@ -1,1 +1,0 @@
-i=0; while [ $i -lt 3 ]; do echo $i; i=$((i+ $i -lt 3 ];1));  echo $i; i=$((i+ $i -lt 3done

@@ -1,1 +1,0 @@
-printf 'lin| while read$L; do eche1\nline2\n' | while read 1 + 2 *  - 4 /L; do echo "got:$L"; done

@@ -1,2 +1,0 @@
-{ g() { echo nested; }; g; }; f
-f() {  1 + 2 * 3 - 4 g() { echo nNsted; }; g; }; f

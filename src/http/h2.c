@@ -781,11 +781,6 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
 /* ── Write HTTP response as H2 HEADERS + DATA frames ────────────────────── */
 static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                           http_response_t *resp) {
-    LOG_INFO("h2: send_response stream=%u body_len=%zu send_window=%d "
-             "stream_window=%d peer_max_frame=%u",
-             stream_id, resp->body_len,
-             hc->send_window, s->send_window,
-             hc->peer_max_frame_size);
     char status_str[4];
     (void)snprintf(status_str, sizeof(status_str), "%d", resp->status);
 
@@ -890,8 +885,7 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
             }
         }
 
-        fd_done:
-            free(fbuf);
+        free(fbuf);
         return rc;
     }
 
@@ -1106,13 +1100,6 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
                            uint8_t flags,
                            struct router *router,
                            struct middleware_chain *chain) {
-    LOG_INFO("h2: HEADERS stream=%u pool.count=%d peer_max=%u last_stream=%u",
-           stream_id,
-           hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR
-               ? hc->streams.pool.count
-               : hc->streams.map.count,
-           hc->peer_max_concurrent_streams,
-           hc->last_stream_id);
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     if ((stream_id & 1) == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
@@ -1195,12 +1182,10 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
         if (hc->write_buf.len > 0) {
-            LOG_INFO("h2: pre-flush write_buf=%zu", hc->write_buf.len);
-            ssize_t n = io_write_from_buf(hc->conn->fd,
-                                           &hc->write_buf,
-                                           hc->conn->tls);
-            LOG_INFO("h2: post-flush n=%zd write_buf=%zu", n, hc->write_buf.len);
-            (void)n;
+            ssize_t wr = io_write_from_buf(hc->conn->fd,
+                                            &hc->write_buf,
+                                            hc->conn->tls);
+            (void)wr;
         }
 
         buf_reset(&s->body);
@@ -1266,10 +1251,10 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         dispatch_stream(hc, s, stream_id, router, chain);
         if (hc->write_buf.len > 0) {
-            ssize_t n = io_write_from_buf(hc->conn->fd,
-                                           &hc->write_buf,
-                                           hc->conn->tls);
-            (void)n;  /* partial flush OK — remainder handled by POLLER_WRITE */
+            ssize_t wr = io_write_from_buf(hc->conn->fd,
+                                            &hc->write_buf,
+                                            hc->conn->tls);
+            (void)wr;  /* partial flush OK — remainder handled by POLLER_WRITE */
         }
 
         buf_reset(&s->body);
@@ -1579,7 +1564,7 @@ while (rb->len - offset >= H2_FRAME_HDR_SZ) {
 
 if (offset > 0)
     buf_consume(rb, offset);
-    return 0;
+return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

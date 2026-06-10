@@ -44,7 +44,7 @@ static int handle_broadcast(const http_request_t *req,
                              http_response_t *resp, void *ctx) {
     (void)req; (void)ctx;
     const uint8_t *msg = (const uint8_t *)"hello from broadcast";
-    int r = event_loop_broadcast(g_loop_ref, msg, 20, WS_OP_TEXT);
+    (void)event_loop_broadcast(g_loop_ref, msg, 20, WS_OP_TEXT);
     http_response_set_status(resp, 200, "OK");
     http_response_set_body(resp, "broadcast sent\n", 15);
     return 0;
