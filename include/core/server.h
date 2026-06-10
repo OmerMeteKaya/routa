@@ -37,6 +37,7 @@ int  server_lb_add_upstream(server_t *s,
 /* Create server from config struct / file */
 server_t *server_from_config(const routa_config_t *cfg);
 server_t *server_from_config_file(const char *path);
+int server_lb_route(server_t *s, const char *path, int methods);
 
 #define HTTP_GET_M     (1 << HTTP_GET)
 #define HTTP_POST_M    (1 << HTTP_POST)

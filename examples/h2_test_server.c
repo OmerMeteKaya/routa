@@ -8,8 +8,11 @@
 #include "http/response.h"
 #include <stdio.h>
 #include <stdlib.h>
+
+#include "core/server.h"
 #include "util/metrics.h"
 #include "http/mw_metrics.h"
+#include "core/proxy.h"
 
 static char small_buf[4096];
 static char medium_buf[65536];
@@ -106,12 +109,12 @@ int main(int argc, char **argv) {
                "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null");
     }
 
-    event_loop_t *loop = event_loop_new(port, 6);
-    if (!loop) { fprintf(stderr, "loop failed\n"); return 1; }
-
+    server_t *s = server_new(port, 6);
+    if (!s) { fprintf(stderr, "server failed\n"); return 1; }
+    event_loop_t *loop = (event_loop_t *)s->loop;
     if (!no_tls)
-        event_loop_set_tls(loop, "/tmp/routa_certs/test.crt",
-                                  "/tmp/routa_certs/test.key");
+        server_enable_tls(s, "/tmp/routa_certs/test.crt",
+                             "/tmp/routa_certs/test.key");
 
     routa_config_t cfg;
     routa_config_init(&cfg);
@@ -133,7 +136,19 @@ int main(int argc, char **argv) {
     routa_metrics_init();
     event_loop_add_route(loop, "/metrics", 1 << HTTP_GET,
                          routa_metrics_handler, NULL);
-    event_loop_run(loop);
-    event_loop_free(loop);
+    server_enable_lb(s, &(lb_config_t){
+        .algo = LB_ROUND_ROBIN,
+        .pool_max_per_node = 16,
+        .pool_connect_timeout_ms = 2000,
+        .pool_idle_timeout_s = 60,
+        .passive_fail_threshold = 3,
+        .passive_recover_threshold = 2,
+        .max_retries = 1,
+        .retry_on_connect_fail = 1,
+    });
+    server_lb_add_upstream(s, "127.0.0.1", 9001, 1);
+   server_lb_route(s, "/proxy/*", 0xFF);
+    server_run(s);
+    server_free(s);
     return 0;
 }

@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
+#include "core/proxy.h"
 #include "http/h2.h"
 
 /* ── ID counter (worker-local in practice, atomic for safety) ───────────── */
@@ -24,7 +25,7 @@ void conn_init(conn_t *c, int fd, const char *ip, int port) {
     c->state        = CONN_READING;
     c->keep_alive   = 1;
     c->sendfile_fd  = -1;
-    c->upstream_fd  = -1;
+    c->proxy = NULL;
     c->id           = next_id();
     c->keepalive_deadline = time(NULL) + 30;
 
@@ -37,8 +38,6 @@ void conn_init(conn_t *c, int fd, const char *ip, int port) {
     buf_init(&c->read_buf);
     buf_init(&c->write_buf);
     buf_init(&c->hdr_buf);
-    buf_init(&c->upstream_req_buf);
-    buf_init(&c->upstream_resp_buf);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -182,13 +181,11 @@ conn_t *conn_new(int fd, const char *ip, int port) {
 void conn_free(conn_t *c) {
     if (!c) return;
     if (c->tls) tls_conn_free(c->tls);
-    if (c->upstream_fd >= 0) close(c->upstream_fd);
+    if (c->proxy) { proxy_conn_cleanup(c); }
     if (c->h2) { h2_conn_free(c->h2); c->h2 = NULL; }
     buf_free(&c->read_buf);
     buf_free(&c->write_buf);
     buf_free(&c->hdr_buf);
-    buf_free(&c->upstream_req_buf);
-    buf_free(&c->upstream_resp_buf);
     if (!c->from_slab) {
         free(c->recv_buf);
         free(c->send_buf);

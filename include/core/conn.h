@@ -66,13 +66,7 @@ typedef struct conn {
     int          pending_io;            /*  4 */
 
     /* ── CL3: COLD — upstream fields ───────────────────────────────────*/
-    int          upstream_fd;
-    void        *upstream_node;         /* upstream_node_t*                */
-    void        *upstream_conn;         /* upstream_conn_t*                */
-    buf_t        upstream_req_buf;
-    buf_t        upstream_resp_buf;
-    size_t       upstream_req_sent;
-    int          upstream_retry;
+    struct proxy_ctx *proxy;
 
     /* ── WebSocket fields ───────────────────────────────────────────────
      *

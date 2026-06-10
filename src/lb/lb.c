@@ -103,6 +103,9 @@ struct lb {
     volatile uint64_t stat_failed;
     volatile uint64_t stat_retries;
 };
+upstream_pool_t *lb_get_pool(lb_t *lb) {
+    return lb ? lb->pool : NULL;
+}
 
 /* ── Node selection ─────────────────────────────────────────────────────────*/
 

@@ -35,6 +35,7 @@
 #include <netinet/tcp.h>
 
 #include "core/config.h"
+#include "core/proxy.h"
 #include "http/h2.h"
 
 
@@ -182,7 +183,7 @@ tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop) {
 }
 
 /* Reset per-response writev state and free owned body */
-static void conn_reset_write_state(conn_t *conn) {
+void conn_reset_write_state(conn_t *conn) {
     free((void *)conn->resp_body_ptr);
     conn->resp_body_ptr  = NULL;
     conn->resp_body_len  = 0;
@@ -216,7 +217,7 @@ static void conn_close_and_free(worker_t *w, conn_t *conn) {
     if (conn->h2)  { h2_conn_free(conn->h2);  conn->h2  = NULL; }
     if (conn->tls) { tls_shutdown(conn->tls); tls_conn_free(conn->tls); conn->tls = NULL; }
     if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
-    if (conn->upstream_fd >= 0) { close(conn->upstream_fd); conn->upstream_fd = -1; }
+    proxy_conn_cleanup(conn);
 
     shutdown(conn->fd, SHUT_WR);
     net_close(conn->fd);
@@ -226,8 +227,6 @@ static void conn_close_and_free(worker_t *w, conn_t *conn) {
     buf_free(&conn->read_buf);
     buf_free(&conn->write_buf);
     buf_free(&conn->hdr_buf);
-    buf_free(&conn->upstream_req_buf);
-    buf_free(&conn->upstream_resp_buf);
 
     routa_metrics_conn_close();
 
@@ -245,7 +244,7 @@ static void conn_close_and_free(worker_t *w, conn_t *conn) {
  * the view passed to io_writev_response doesn't need status/headers.
  * Body is stolen from resp (zero extra malloc).
  */
-static void conn_prepare_writev(conn_t *conn, http_response_t *resp) {
+void conn_prepare_writev(conn_t *conn, http_response_t *resp) {
     conn_reset_write_state(conn);
 
     /* Serialize headers now, while resp is still fully populated */
@@ -478,71 +477,8 @@ static void handle_events_worker(worker_t *w) {
 
             /* ── Upstream response reading ── */
             if (conn->state == CONN_UPSTREAM_READING) {
-                char tmp[16384];
-                ssize_t n = read(conn->upstream_fd, tmp, sizeof(tmp));
-                if (n < 0 && errno != EAGAIN) {
-                    /* upstream error */
-                    poller_del(w->poller, conn->upstream_fd);
-                    close(conn->upstream_fd);
-                    conn->upstream_fd = -1;
-                    if (w->lb)
-                        lb_finish_forward(w->lb, &conn->upstream_resp_buf,
-                                         NULL,
-                                         (upstream_node_t *)conn->upstream_node,
-                                         (upstream_conn_t *)conn->upstream_conn,
-                                         0);
-                    conn->upstream_node = conn->upstream_conn = NULL;
-                    buf_reset(&conn->upstream_resp_buf);
-                    /* Send 502 */
-                    buf_reset(&conn->write_buf);
-                    http_response_simple(&conn->write_buf, 502, "Bad Gateway",
-                                        "text/plain", "Bad Gateway\n");
-                    conn_reset_write_state(conn);
-                    conn->state = CONN_WRITING;
-                    goto handle_state;
-                }
-                if (n > 0) {
-                    buf_append(&conn->upstream_resp_buf, tmp, (size_t)n);
-                }
-                if (n == 0 || (n < 0 && errno == EAGAIN)) {
-                    /* EOF or no more data — try to parse what we have */
-                    if (conn->upstream_resp_buf.len > 0) {
-                        /* Remove upstream fd from poller */
-                        poller_del(w->poller, conn->upstream_fd);
-                        close(conn->upstream_fd);
-                        conn->upstream_fd = -1;
-
-                        http_response_t resp;
-                        http_response_init(&resp);
-                        int ok = (w->lb)
-                            ? lb_finish_forward(w->lb,
-                                               &conn->upstream_resp_buf,
-                                               &resp,
-                                               (upstream_node_t *)conn->upstream_node,
-                                               (upstream_conn_t *)conn->upstream_conn,
-                                               1)
-                            : -1;
-                        conn->upstream_node = conn->upstream_conn = NULL;
-                        buf_reset(&conn->upstream_resp_buf);
-
-                        if (ok < 0) {
-                            http_response_destroy(&resp);
-                            buf_reset(&conn->write_buf);
-                            http_response_simple(&conn->write_buf, 502,
-                                                "Bad Gateway", "text/plain",
-                                                "Bad Gateway\n");
-                            conn_reset_write_state(conn);
-                        } else {
-                            http_response_set_header(&resp, "Connection",
-                                conn->keep_alive ? "keep-alive" : "close");
-                            conn_prepare_writev(conn, &resp);
-                            http_response_destroy(&resp);
-                        }
-                        conn->state = CONN_WRITING;
-                        goto handle_state;
-                    }
-                }
-                continue;
+                proxy_on_upstream_readable(w, conn);
+                goto handle_state;
             }
 
             /* TLS handshake */
@@ -804,34 +740,9 @@ static void handle_events_worker(worker_t *w) {
 
                 /* ── Async upstream: if handler set upstream_fd via lb ── */
                 if (w->lb && resp.status == 0) {
-                    /* Handler didn't fill resp — treat as LB proxy request */
-                    http_request_free(&req);
                     http_response_destroy(&resp);
-
-                    upstream_node_t *unode = NULL;
-                    upstream_conn_t *uconn = NULL;
-                    int ufd = lb_begin_forward(w->lb, &req, conn->remote_ip,
-                                               &conn->upstream_req_buf,
-                                               &unode, &uconn);
-                    if (ufd < 0) {
-                        buf_reset(&conn->write_buf);
-                        http_response_simple(&conn->write_buf, 502,
-                                            "Bad Gateway", "text/plain",
-                                            "Bad Gateway\n");
-                        conn_reset_write_state(conn);
-                        conn->state = CONN_WRITING;
-                        goto handle_state;
-                    }
-
-                    conn->upstream_fd   = ufd;
-                    conn->upstream_node = unode;
-                    conn->upstream_conn = uconn;
-                    conn->upstream_req_sent = 0;
-                    buf_reset(&conn->upstream_resp_buf);
-
-                    /* Connect may already be done (loopback) or in progress */
-                    conn->state = CONN_UPSTREAM_CONNECTING;
-                    poller_add(w->poller, ufd, POLLER_WRITE | POLLER_ET, conn);
+                    proxy_begin(w, conn, &req);
+                    http_request_free(&req);
                     goto handle_state;
                 }
 
@@ -951,61 +862,11 @@ static void handle_events_worker(worker_t *w) {
                 }
 
                 /* ── Upstream connecting ── */
-                if (conn->state == CONN_UPSTREAM_CONNECTING) {
-                    if (upstream_conn_check_connected(conn->upstream_fd) < 0) {
-                        poller_del(w->poller, conn->upstream_fd);
-                        close(conn->upstream_fd);
-                        conn->upstream_fd = -1;
-                        if (w->lb && conn->upstream_conn)
-                            upstream_conn_release(
-                                (upstream_conn_t *)conn->upstream_conn, 0);
-                        conn->upstream_node = conn->upstream_conn = NULL;
-                        buf_reset(&conn->upstream_req_buf);
-                        buf_reset(&conn->upstream_resp_buf);
-                        buf_reset(&conn->write_buf);
-                        http_response_simple(&conn->write_buf, 502, "Bad Gateway",
-                                            "text/plain", "Bad Gateway\n");
-                        conn_reset_write_state(conn);
-                        conn->state = CONN_WRITING;
-                        goto handle_state;
-                    }
-                    /* Connected — transition to writing */
-                    conn->state = CONN_UPSTREAM_WRITING;
-                    /* fall through to UPSTREAM_WRITING immediately */
+            if (conn->state == CONN_UPSTREAM_CONNECTING ||
+                conn->state == CONN_UPSTREAM_WRITING) {
+                proxy_on_upstream_writable(w, conn);
+                goto handle_state;
                 }
-
-                /* ── Upstream writing ── */
-                if (conn->state == CONN_UPSTREAM_WRITING) {
-                    buf_t *rb = &conn->upstream_req_buf;
-                    if (rb->len > 0) {
-                        ssize_t n = write(conn->upstream_fd,
-                                          rb->data + conn->upstream_req_sent,
-                                          rb->len - conn->upstream_req_sent);
-                        if (n < 0 && errno != EAGAIN) {
-                            poller_del(w->poller, conn->upstream_fd);
-                            close(conn->upstream_fd);
-                            conn->upstream_fd = -1;
-                            buf_reset(&conn->write_buf);
-                            http_response_simple(&conn->write_buf, 502, "Bad Gateway",
-                                                "text/plain", "Bad Gateway\n");
-                            conn_reset_write_state(conn);
-                            conn->state = CONN_WRITING;
-                            goto handle_state;
-                        }
-                        if (n > 0) conn->upstream_req_sent += (size_t)n;
-                    }
-
-                    if (conn->upstream_req_sent >= rb->len) {
-                        /* All sent — wait for response */
-                        conn->upstream_req_sent = 0;
-                        buf_reset(&conn->upstream_req_buf);
-                        conn->state = CONN_UPSTREAM_READING;
-                        conn_poller_mod(w, conn,
-                                   POLLER_READ | POLLER_ET);
-                    }
-                    continue;
-                }
-
                 /* TLS handshake */
                 if (conn->state == CONN_TLS_HANDSHAKE) {
                     int hs = tls_handshake(conn->tls);
@@ -1342,7 +1203,7 @@ static void *worker_run(void *arg) {
         }
 
         /* ── Periodic ping + H2 timeout sweep (~1 s) ── */
-        if (now_ms - last_ping_sweep_ms >= 10000) {
+        if (now_ms - last_ping_sweep_ms >= 1000) {
             ws_config_t default_cfg;
             ws_config_init(&default_cfg);
             ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
@@ -1381,7 +1242,10 @@ static void *worker_run(void *arg) {
         conn_t *c = w->active_conns[i];
         poller_del(w->poller, c->fd);
         if (c->sendfile_fd >= 0) { close(c->sendfile_fd); c->sendfile_fd = -1; }
-        if (c->upstream_fd >= 0) { close(c->upstream_fd); c->upstream_fd = -1; }
+        if (c->proxy && c->proxy->upstream_fd >= 0) {
+            close(c->proxy->upstream_fd);
+            c->proxy->upstream_fd = -1;
+        }
         if (c->tls) tls_shutdown(c->tls);
         if (c->h2 && c->h2->write_buf.len > 0) h2_conn_flush(c->h2);
         shutdown(c->fd, SHUT_WR);

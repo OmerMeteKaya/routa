@@ -44,7 +44,9 @@ typedef struct {
 
 /* ── Load balancer instance ────────────────────────────────────────────────*/
 typedef struct lb lb_t;
-
+/* Returns the upstream pool for direct node state recording.
+ * Used by proxy.c to call upstream_node_record_failure/success. */
+upstream_pool_t *lb_get_pool(lb_t *lb);
 /* Create / destroy */
 lb_t *lb_new(const lb_config_t *cfg);
 void  lb_free(lb_t *lb);

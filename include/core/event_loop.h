@@ -114,5 +114,8 @@ tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop);
 
 void event_loop_set_h2_config(event_loop_t *loop,
                                const routa_h2_config_t *cfg);
+/* ── Write path helpers (also used by proxy.c) ─────────────────────────── */
+void conn_reset_write_state(conn_t *conn);
+void conn_prepare_writev(conn_t *conn, http_response_t *resp);
 
 #endif /* ROUTA_CORE_EVENT_LOOP_H */

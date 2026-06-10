@@ -53,7 +53,9 @@ add_library(routa_core STATIC ${ROUTA_SOURCES}
         src/util/metrics.c
         src/http/mw_metrics.c
         include/util/metrics.h
-        include/http/mw_metrics.h)
+        include/http/mw_metrics.h
+        include/core/proxy.h
+        src/core/proxy.c)
 
 target_include_directories(routa_core PUBLIC include)
 
