@@ -26,16 +26,22 @@ proxy_ctx_t *proxy_ctx_new(lb_t *lb) {
     return ctx;
 }
 
-void proxy_ctx_free(proxy_ctx_t *ctx) {
-    if (!ctx) return;
-    if (ctx->upstream_fd >= 0) {
-        close(ctx->upstream_fd);
-        ctx->upstream_fd = -1;
-    }
+/* Drop the upstream connection, closing the fd exactly once.
+ * When uconn exists it owns the fd: upstream_conn_release(.., 0) closes it
+ * and fixes pool accounting. Only close directly when there is no uconn. */
+static void proxy_drop_upstream(proxy_ctx_t *ctx) {
     if (ctx->uconn) {
         upstream_conn_release(ctx->uconn, 0);
         ctx->uconn = NULL;
+    } else if (ctx->upstream_fd >= 0) {
+        close(ctx->upstream_fd);
     }
+    ctx->upstream_fd = -1;
+}
+
+void proxy_ctx_free(proxy_ctx_t *ctx) {
+    if (!ctx) return;
+    proxy_drop_upstream(ctx);
     buf_free(&ctx->req_buf);
     buf_free(&ctx->resp_buf);
     free(ctx);
@@ -67,10 +73,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req) {
         buf_reset(&conn->proxy->resp_buf);
         conn->proxy->req_sent = 0;
         conn->proxy->attempt  = 0;
-        if (conn->proxy->upstream_fd >= 0) {
-            close(conn->proxy->upstream_fd);
-            conn->proxy->upstream_fd = -1;
-        }
+        proxy_drop_upstream(conn->proxy);
     }
 
     proxy_ctx_t *ctx = conn->proxy;
@@ -78,6 +81,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req) {
     upstream_node_t *unode = NULL;
     upstream_conn_t *uconn = NULL;
     int ufd = lb_begin_forward(w->lb, req, conn->remote_ip,
+                               conn->tls ? "https" : "http",
                                &ctx->req_buf, &unode, &uconn);
     if (ufd < 0) {
         LOG_WARN("proxy: no upstream available for %s", conn->remote_ip);
@@ -107,15 +111,13 @@ int proxy_on_upstream_writable(worker_t *w, conn_t *conn) {
 
     if (conn->state == CONN_UPSTREAM_CONNECTING) {
         if (upstream_conn_check_connected(ctx->upstream_fd) < 0) {
+            /* Genuine connect failure (SO_ERROR set) — the only place a
+             * connect attempt may count against passive health. */
             LOG_WARN("proxy: upstream connect failed");
             poller_del(w->poller, ctx->upstream_fd);
-            close(ctx->upstream_fd); ctx->upstream_fd = -1;
-            if (ctx->uconn) {
-                upstream_conn_release(ctx->uconn, 0);
-                ctx->uconn = NULL;
-            }
             if (ctx->node && ctx->pool)
                 upstream_node_record_failure(ctx->node, ctx->pool);
+            proxy_drop_upstream(ctx);
             http_response_simple(&conn->write_buf, 502,
                                  "Bad Gateway", "text/plain",
                                  "Bad Gateway\n");
@@ -124,6 +126,8 @@ int proxy_on_upstream_writable(worker_t *w, conn_t *conn) {
             return 0;
         }
         conn->state = CONN_UPSTREAM_WRITING;
+        if (ctx->node && ctx->pool)
+            upstream_node_record_success(ctx->node, ctx->pool);
     }
 
     if (conn->state == CONN_UPSTREAM_WRITING) {
@@ -137,11 +141,7 @@ int proxy_on_upstream_writable(worker_t *w, conn_t *conn) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
                 LOG_WARN("proxy: upstream write failed: %s", strerror(errno));
                 poller_del(w->poller, ctx->upstream_fd);
-                close(ctx->upstream_fd); ctx->upstream_fd = -1;
-                if (ctx->uconn) {
-                    upstream_conn_release(ctx->uconn, 0);
-                    ctx->uconn = NULL;
-                }
+                proxy_drop_upstream(ctx);
                 http_response_simple(&conn->write_buf, 502,
                                      "Bad Gateway", "text/plain",
                                      "Bad Gateway\n");
@@ -175,13 +175,9 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn) {
 
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         poller_del(w->poller, ctx->upstream_fd);
-        close(ctx->upstream_fd); ctx->upstream_fd = -1;
-        if (ctx->uconn) {
-            upstream_conn_release(ctx->uconn, 0);
-            ctx->uconn = NULL;
-        }
         if (ctx->node && ctx->pool)
             upstream_node_record_failure(ctx->node, ctx->pool);
+        proxy_drop_upstream(ctx);
         http_response_simple(&conn->write_buf, 502,
                              "Bad Gateway", "text/plain",
                              "Bad Gateway\n");
@@ -193,19 +189,36 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn) {
     if (n > 0)
         buf_append(&ctx->resp_buf, tmp, (size_t)n);
 
-    if (n == 0 || (n < 0 && errno == EAGAIN)) {
-        if (ctx->resp_buf.len == 0) return 0;
-
+    if (n == 0) {
+        /* EOF — upstream closed connection, parse whatever we have */
         poller_del(w->poller, ctx->upstream_fd);
-        close(ctx->upstream_fd); ctx->upstream_fd = -1;
 
+        if (ctx->resp_buf.len == 0) {
+            /* No data at all — upstream closed without response */
+            if (ctx->node && ctx->pool)
+                upstream_node_record_failure(ctx->node, ctx->pool);
+            proxy_drop_upstream(ctx);
+            http_response_simple(&conn->write_buf, 502,
+                                 "Bad Gateway", "text/plain",
+                                 "Bad Gateway\n");
+            conn_reset_write_state(conn);
+            conn->state = CONN_WRITING;
+            return 0;
+        }
+
+        /* Parse accumulated response.  healthy=0: the request was sent with
+         * "Connection: close" and the upstream already half-closed, so the
+         * conn must never go back to the idle pool.  lb_finish_forward owns
+         * the fd from here (release closes it) and records success/failure
+         * itself — no duplicate record_* calls in this path. */
         http_response_t resp;
         http_response_init(&resp);
         int ok = lb_finish_forward(ctx->lb,
                                    &ctx->resp_buf, &resp,
-                                   ctx->node, ctx->uconn, 1);
-        ctx->uconn = NULL;
-        ctx->node  = NULL;
+                                   ctx->node, ctx->uconn, 0);
+        ctx->uconn       = NULL;
+        ctx->node        = NULL;
+        ctx->upstream_fd = -1;
         buf_reset(&ctx->resp_buf);
 
         if (ok < 0) {
@@ -221,6 +234,9 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn) {
             http_response_destroy(&resp);
         }
         conn->state = CONN_WRITING;
+        return 0;
     }
+
+    /* EAGAIN or partial data — more coming, keep waiting */
     return 0;
 }

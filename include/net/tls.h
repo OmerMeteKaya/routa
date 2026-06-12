@@ -73,4 +73,8 @@ const char *tls_negotiated_protocol(const tls_conn_t *tc);
 /* Returns 1 if the last handshake resumed a previous session. */
 int tls_session_resumed(const tls_conn_t *tc);
 
+/* Returns 1 when OpenSSL holds buffered records/plaintext that will never
+ * trigger another epoll edge — caller must drain via tls_read(). */
+int tls_has_pending(const tls_conn_t *tc);
+
 #endif /* ROUTA_NET_TLS_H */

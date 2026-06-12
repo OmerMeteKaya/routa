@@ -15,6 +15,7 @@ typedef struct {
     int                 static_config_count;
     middleware_chain_t *chain;
     lb_t               *lb;           /* NULL when load balancer disabled   */
+    void               *lb_route_ctx; /* lb_handler_ctx_t, freed in server_free */
 } server_t;
 
 server_t *server_new(int port, int n_threads);

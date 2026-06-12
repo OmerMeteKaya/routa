@@ -167,6 +167,7 @@ int server_lb_route(server_t *s, const char *path, int methods) {
     lb_handler_ctx_t *ctx = calloc(1, sizeof(lb_handler_ctx_t));
     if (!ctx) return -1;
     ctx->lb = s->lb;
+    s->lb_route_ctx = ctx;
 
     event_loop_add_route((event_loop_t *)s->loop,
                          path, methods, lb_route_handler, ctx);
@@ -287,6 +288,7 @@ void server_free(server_t *s) {
     if (s->loop)  event_loop_free((event_loop_t *)s->loop);
     if (s->chain) middleware_chain_free(s->chain);
     if (s->lb)    lb_free(s->lb);
+    free(s->lb_route_ctx);
     for (int i = 0; i < s->static_config_count; i++)
         free(s->static_configs[i]);
     file_cache_free();

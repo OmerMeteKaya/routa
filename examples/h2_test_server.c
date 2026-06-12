@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
                "-days 1 -nodes -subj '/CN=localhost' 2>/dev/null");
     }
 
-    server_t *s = server_new(port, 6);
+    server_t *s = server_new(port, 24);
     if (!s) { fprintf(stderr, "server failed\n"); return 1; }
     event_loop_t *loop = (event_loop_t *)s->loop;
     if (!no_tls)
@@ -138,10 +138,10 @@ int main(int argc, char **argv) {
                          routa_metrics_handler, NULL);
     server_enable_lb(s, &(lb_config_t){
         .algo = LB_ROUND_ROBIN,
-        .pool_max_per_node = 16,
+        .pool_max_per_node = 512,
         .pool_connect_timeout_ms = 2000,
         .pool_idle_timeout_s = 60,
-        .passive_fail_threshold = 3,
+        .passive_fail_threshold = 10,
         .passive_recover_threshold = 2,
         .max_retries = 1,
         .retry_on_connect_fail = 1,

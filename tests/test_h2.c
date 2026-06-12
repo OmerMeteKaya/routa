@@ -276,6 +276,9 @@ static void run_server_tls(void) {
 
     event_loop_t *loop = event_loop_new(TEST_PORT, 1);
     if (!loop) exit(1);
+    routa_config_t cfg;
+    routa_config_init(&cfg);
+    event_loop_set_h2_config(loop, &cfg.h2);
     event_loop_set_tls(loop, cert, key);
     register_routes(loop);
     event_loop_run(loop);
@@ -1294,8 +1297,8 @@ int main(void) {
     int startup_ok = 1;
 
     if (!skip_tls) {
-        g_pid_tls = fork();
-        if (g_pid_tls == 0) run_server_tls();
+        /* TLS server was already forked above — forking it again here would
+         * leave an unkillable duplicate listening on the same port */
         if (wait_for_tls_server(TEST_PORT, 10000) < 0) {
             FAIL("server startup", "TLS server timeout");
             startup_ok = 0;

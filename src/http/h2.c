@@ -1057,6 +1057,8 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
     http_response_t resp;
     stream_to_request(s, &req);
     req.start_us = dispatch_start;
+    strncpy(req.remote_ip, hc->conn->remote_ip, sizeof(req.remote_ip) - 1);
+    req.remote_ip[sizeof(req.remote_ip) - 1] = '\0';
     http_response_init(&resp);
 
     int allowed = 0;

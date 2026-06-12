@@ -430,3 +430,7 @@ void tls_shutdown(tls_conn_t *tc) {
 int tls_session_resumed(const tls_conn_t *tc) {
     return (tc && tc->ssl) ? SSL_session_reused(tc->ssl) : 0;
 }
+
+int tls_has_pending(const tls_conn_t *tc) {
+    return (tc && tc->ssl) ? SSL_has_pending(tc->ssl) : 0;
+}

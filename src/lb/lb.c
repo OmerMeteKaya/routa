@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <time.h>
+#include <ctype.h>
 
 /* ── Consistent hash ring ───────────────────────────────────────────────────*/
 #define VNODE_MAX (1024 * 8)   /* max total virtual nodes in ring            */
@@ -24,6 +25,17 @@ typedef struct {
     vnode_t *vnodes;
     int      count;
 } hash_ring_t;
+
+/* Thread-safe fast PRNG — xorshift32, no locks needed */
+static uint32_t lb_rand(void) {
+    static _Atomic uint32_t state = 0x9e3779b9u;
+    uint32_t x = atomic_load_explicit(&state, memory_order_relaxed);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    atomic_store_explicit(&state, x, memory_order_relaxed);
+    return x;
+}
 
 /* FNV-1a 32-bit */
 static uint32_t fnv1a(const char *s, size_t len) {
@@ -192,9 +204,9 @@ static upstream_node_t *pick_p2c(lb_t *lb) {
     if (up_cnt == 1) return up[0];
 
     /* Pick two distinct random candidates */
-    int a = (int)((uint32_t)rand() % (uint32_t)up_cnt);  // NOLINT
+    int a = (int)(lb_rand() % (uint32_t)up_cnt);
     int b;
-    do { b = (int)((uint32_t)rand() % (uint32_t)up_cnt); } while (b == a);  // NOLINT
+    do { b = (int)(lb_rand() % (uint32_t)up_cnt); } while (b == a);
 
     uint32_t inf_a = __atomic_load_n(&up[a]->inflight, __ATOMIC_RELAXED);
     uint32_t inf_b = __atomic_load_n(&up[b]->inflight, __ATOMIC_RELAXED);
@@ -253,7 +265,7 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
         /* Fisher-Yates sample */
         int n = pool->node_count;
         if (n == 0) return NULL;
-        int start = (int)((uint32_t)rand() % (uint32_t)n);  // NOLINT
+        int start = (int)(lb_rand() % (uint32_t)n);
         for (int i = 0; i < n; i++) {
             upstream_node_t *node = pool->nodes[(start + i) % n];
             pthread_spin_lock(&node->state_lock);
@@ -290,39 +302,120 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
  * interface stays the same.
  * -------------------------------------------------------------------------*/
 
-/* Build a forwarded request buffer */
+/* Hop-by-hop headers that must not cross the proxy (RFC 7230 §6.1) */
+static int is_hop_by_hop(const char *name) {
+    static const char *hop_by_hop[] = {
+        "connection", "keep-alive", "transfer-encoding",
+        "proxy-connection", "upgrade", "te", "trailer", NULL
+    };
+    for (int i = 0; hop_by_hop[i]; i++)
+        if (strcasecmp(name, hop_by_hop[i]) == 0) return 1;
+    return 0;
+}
+
+/* Serialize req into out for the upstream node, heap-backed so large bodies
+ * are never truncated.  Rewrites per RFC 7230/7239: strips hop-by-hop
+ * headers, rewrites Host to the upstream target, injects X-Forwarded-For,
+ * X-Forwarded-Proto (when the frontend scheme is known) and Via.
+ * Returns 0 on success, -1 on OOM. */
 static int build_forward_request(const http_request_t *req,
-                                  char *buf, size_t bufsz) {
+                                 const char *client_ip,
+                                 const char *proto,
+                                 const upstream_node_t *node,
+                                 buf_t *out)
+{
+#define BFR_PUT(s)            do { if (buf_append_str(out, (s)) < 0) return -1; } while (0)
+#define BFR_PUTN(p, n)        do { if (buf_append(out, (p), (n)) < 0) return -1; } while (0)
     static const char *method_str[] = {
         "GET","POST","PUT","DELETE","HEAD",
         "PATCH","OPTIONS","TRACE","CONNECT","UNKNOWN"
     };
     int m = ((int)req->method >= 0 && (int)req->method < 10) ? (int)req->method : 9;
 
-    int n = snprintf(buf, bufsz, "%s %s HTTP/1.1\r\n",
-                     method_str[m], req->path);
+    buf_reset(out);
 
-    /* Forward original headers, skip Connection and Host (rewritten below) */
-    for (int i = 0; i < req->header_count && n < (int)bufsz - 4; i++) {
-        if (!req->headers[i].key) continue;
-        if (strcasecmp(req->headers[i].key, "connection") == 0) continue;
-        if (strcasecmp(req->headers[i].key, "host") == 0)       continue;
-        n += snprintf(buf + n, bufsz - (size_t)n,
-                      "%s: %s\r\n",
-                      req->headers[i].key,
-                      req->headers[i].value ? req->headers[i].value : "");
+    /* Request line */
+    BFR_PUT(method_str[m]);
+    BFR_PUT(" ");
+    BFR_PUT(req->path);
+    if (req->query && req->query[0]) {
+        BFR_PUT("?");
+        BFR_PUT(req->query);
+    }
+    BFR_PUT(" HTTP/1.1\r\n");
+
+    /* Host: rewritten to the upstream target */
+    {
+        char host[128];
+        int n = snprintf(host, sizeof(host), "Host: %s:%d\r\n",
+                         node->host, node->port);
+        BFR_PUTN(host, (size_t)n);
     }
 
-    n += snprintf(buf + n, bufsz - (size_t)n, "Connection: close\r\n");
-    n += snprintf(buf + n, bufsz - (size_t)n, "\r\n");
-
-    /* Append body if any */
-    if (req->body && req->body_len > 0 &&
-        (size_t)n + req->body_len < bufsz) {
-        memcpy(buf + n, req->body, req->body_len);
-        n += (int)req->body_len;
+    /* Forward end-to-end headers; capture existing forwarding chains */
+    const char *prev_xff = NULL;
+    const char *prev_via = NULL;
+    int had_content_length = 0;
+    for (int i = 0; i < req->header_count; i++) {
+        const char *k = req->headers[i].key;
+        const char *v = req->headers[i].value ? req->headers[i].value : "";
+        if (!k) continue;
+        if (is_hop_by_hop(k))                            continue;
+        if (strcasecmp(k, "host") == 0)                  continue;
+        if (strcasecmp(k, "x-forwarded-proto") == 0)     continue;
+        if (strcasecmp(k, "x-forwarded-for") == 0) { prev_xff = v; continue; }
+        if (strcasecmp(k, "via") == 0)             { prev_via = v; continue; }
+        if (strcasecmp(k, "content-length") == 0) {
+            had_content_length = 1;   /* re-emitted from body_len below */
+            continue;
+        }
+        BFR_PUT(k);
+        BFR_PUT(": ");
+        BFR_PUT(v);
+        BFR_PUT("\r\n");
     }
-    return n;
+
+    /* X-Forwarded-For: append this client to any existing chain */
+    BFR_PUT("X-Forwarded-For: ");
+    if (prev_xff && prev_xff[0]) {
+        BFR_PUT(prev_xff);
+        BFR_PUT(", ");
+    }
+    BFR_PUT(client_ip && client_ip[0] ? client_ip : "unknown");
+    BFR_PUT("\r\n");
+
+    if (proto) {
+        BFR_PUT("X-Forwarded-Proto: ");
+        BFR_PUT(proto);
+        BFR_PUT("\r\n");
+    }
+
+    /* Via: append ourselves to any existing chain */
+    BFR_PUT("Via: ");
+    if (prev_via && prev_via[0]) {
+        BFR_PUT(prev_via);
+        BFR_PUT(", ");
+    }
+    BFR_PUT("1.1 routa\r\n");
+
+    /* Body is forwarded decoded, so Content-Length replaces any original
+     * framing (including chunked Transfer-Encoding stripped above) */
+    if (req->body_len > 0 || had_content_length) {
+        char cl[64];
+        int n = snprintf(cl, sizeof(cl), "Content-Length: %zu\r\n",
+                         req->body_len);
+        BFR_PUTN(cl, (size_t)n);
+    }
+
+    BFR_PUT("Connection: close\r\n");
+    BFR_PUT("\r\n");
+
+    if (req->body && req->body_len > 0)
+        BFR_PUTN(req->body, req->body_len);
+
+    return 0;
+#undef BFR_PUT
+#undef BFR_PUTN
 }
 
 /* Read full HTTP response from upstream fd into resp */
@@ -376,13 +469,22 @@ static int read_upstream_response(int fd, http_response_t *resp) {
             *colon = '\0';
             char *val = colon + 1;
             while (*val == ' ') val++;
-            http_response_set_header(resp, line, val);
+            /* Strip hop-by-hop headers; Content-Length is re-emitted by
+             * http_response_set_body.  Lowercase the name — the H2 frontend
+             * rejects uppercase header field names (RFC 7540 §8.1.2). */
+            if (!is_hop_by_hop(line) &&
+                strcasecmp(line, "content-length") != 0) {
+                for (char *p = line; *p; p++)
+                    *p = (char)tolower((unsigned char)*p);
+                http_response_set_header(resp, line, val);
+            }
 
             /* Content-Length → read body */
             if (strcasecmp(line, "content-length") == 0) {
                 size_t clen = (size_t)strtoll(val, NULL, 10);
                 char  *body = malloc(clen + 1);
                 if (body) {
+                    if (body_so_far > clen) body_so_far = clen;
                     if (body_so_far > 0)
                         memcpy(body, body_start, body_so_far);
 
@@ -390,7 +492,14 @@ static int read_upstream_response(int fd, http_response_t *resp) {
                     size_t got = body_so_far;
                     while (rem > 0) {
                         ssize_t n = read(fd, body + got, rem);
-                        if (n <= 0) break;
+                        if (n < 0) {
+                            /* Non-blocking fd: body may lag behind the
+                             * header segment — retry like the header loop */
+                            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                                continue;
+                            break;
+                        }
+                        if (n == 0) break;
                         got += (size_t)n;
                         rem -= (size_t)n;
                     }
@@ -431,16 +540,29 @@ int lb_forward(lb_t *lb,
             continue;
         }
 
-        /* Build and send request */
-        char req_buf[65536];
-        int  req_len = build_forward_request(req, req_buf, sizeof(req_buf));
-        if (req_len <= 0) {
+        /* Build and send request (heap buf — large bodies not truncated) */
+        buf_t req_buf;
+        buf_init(&req_buf);
+        if (build_forward_request(req, client_ip, NULL, node, &req_buf) < 0) {
+            buf_free(&req_buf);
             upstream_conn_release(conn, 0);
             continue;
         }
 
-        ssize_t w = write(conn->fd, req_buf, (size_t)req_len);
-        if (w != req_len) {
+        size_t off  = 0;
+        int    werr = 0;
+        while (off < req_buf.len) {
+            ssize_t w = write(conn->fd, buf_data(&req_buf) + off,
+                              req_buf.len - off);
+            if (w < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                werr = 1;
+                break;
+            }
+            off += (size_t)w;
+        }
+        buf_free(&req_buf);
+        if (werr) {
             upstream_conn_release(conn, 0);
             upstream_node_record_failure(node, lb->pool);
             continue;
@@ -453,10 +575,11 @@ int lb_forward(lb_t *lb,
             continue;
         }
 
-        /* Success */
+        /* Success.  The request was sent with "Connection: close", so the
+         * conn is never reusable — releasing it healthy would pool a dead
+         * fd and poison subsequent requests. */
         int is_5xx = (resp->status >= 500);
-        int conn_ok = !is_5xx || !lb->cfg.retry_on_5xx;
-        upstream_conn_release(conn, conn_ok);
+        upstream_conn_release(conn, 0);
 
         if (is_5xx && lb->cfg.retry_on_5xx && attempt < max_tries - 1) {
             http_response_destroy(resp);
@@ -508,7 +631,6 @@ lb_t *lb_new(const lb_config_t *cfg) {
     lb->pool->passive_recover_threshold = cfg->passive_recover_threshold;
 
     pthread_mutex_init(&lb->wrr_lock, NULL);
-    srand((unsigned)time(NULL));  /* NOLINT */
     return lb;
 }
 
@@ -588,6 +710,7 @@ void lb_free(lb_t *lb) {
 int lb_begin_forward(lb_t *lb,
                      const http_request_t *req,
                      const char           *client_ip,
+                     const char           *proto,
                      buf_t                *req_buf,
                      upstream_node_t     **out_node,
                      upstream_conn_t     **out_uconn)
@@ -641,13 +764,10 @@ int lb_begin_forward(lb_t *lb,
         __atomic_fetch_add(&node->inflight, 1u, __ATOMIC_RELAXED);
     }
 
-    /* Serialize request */
-    char tmp[65536];
-    int  len = build_forward_request(req, tmp, sizeof(tmp));
-    if (len <= 0) { upstream_conn_release(uconn, 0); return -1; }
-    buf_reset(req_buf);
-    if (buf_append(req_buf, tmp, (size_t)len) < 0) {
-        upstream_conn_release(uconn, 0); return -1;
+    /* Serialize request straight into the caller's buffer */
+    if (build_forward_request(req, client_ip, proto, node, req_buf) < 0) {
+        upstream_conn_release(uconn, 0);
+        return -1;
     }
 
     *out_node  = node;
@@ -668,7 +788,7 @@ int lb_finish_forward(lb_t            *lb,
     {
         char *raw = malloc(resp_buf->len + 1);
         if (!raw) { ret = -1; goto done; }
-        memcpy(raw, resp_buf->data, resp_buf->len);
+        memcpy(raw, buf_data(resp_buf), resp_buf->len);
         raw[resp_buf->len] = '\0';
 
         if (strncmp(raw, "HTTP/1.", 7) != 0) { free(raw); ret = -1; goto done; }
@@ -694,7 +814,15 @@ int lb_finish_forward(lb_t            *lb,
                     *colon = '\0';
                     char *val = colon + 1;
                     while (*val == ' ') val++;
-                    http_response_set_header(resp, line, val);
+                    /* Strip hop-by-hop headers; Content-Length is re-emitted
+                     * by http_response_set_body.  Lowercase the name — the
+                     * H2 frontend rejects uppercase header field names. */
+                    if (!is_hop_by_hop(line) &&
+                        strcasecmp(line, "content-length") != 0) {
+                        for (char *p = line; *p; p++)
+                            *p = (char)tolower((unsigned char)*p);
+                        http_response_set_header(resp, line, val);
+                    }
                     if (strcasecmp(line, "content-length") == 0) {
                         size_t clen = (size_t)strtoll(val, NULL, 10);
                         size_t blen = resp_buf->len - (size_t)(body_start - raw);

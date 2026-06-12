@@ -97,6 +97,7 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip);
 int lb_begin_forward(lb_t *lb,
                      const http_request_t *req,
                      const char           *client_ip,
+                     const char           *proto,          /* "https"/"http"/NULL */
                      buf_t                *req_buf,        /* out: serialized req */
                      upstream_node_t     **out_node,       /* out: for record_* */
                      upstream_conn_t     **out_uconn);     /* out: for release   */

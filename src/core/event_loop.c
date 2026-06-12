@@ -398,6 +398,7 @@ static void handle_events_worker(worker_t *w) {
 
         /* ── POLLER_READ ── */
         if (events[i].events & POLLER_READ) {
+            h2_read:
             if (conn->state == CONN_H2) {
                 int rc = h2_conn_flush(conn->h2);
                 if (rc < 0) {
@@ -499,15 +500,23 @@ static void handle_events_worker(worker_t *w) {
                         h2_conn_flush(conn->h2);
                         conn_poller_mod(w, conn,
                                    POLLER_READ | POLLER_WRITE | POLLER_ET);
-                    } else {
-                        conn->state = CONN_READING;
-                        conn_poller_mod(w, conn,
-                                   POLLER_READ | POLLER_ET);
+                        /* The client preface may already sit in the TLS
+                         * buffer (read together with Finished).  With ET no
+                         * further event fires for it — process it now. */
+                        goto h2_read;
                     }
+                    conn->state = CONN_READING;
+                    conn_poller_mod(w, conn,
+                               POLLER_READ | POLLER_ET);
+                    /* Only fall through to the read below when the TLS
+                     * buffer holds data — the read path treats EAGAIN as
+                     * fatal for h1 connections */
+                    if (!tls_has_pending(conn->tls)) continue;
                 } else if (hs == 1 || hs == -1) {
                     /* Always watch both during handshake — TLS 1.3 needs it         */
                     conn_poller_mod(w, conn,
                                POLLER_READ | POLLER_WRITE | POLLER_ET);
+                    continue;
                 } else {
                     poller_del(w->poller, conn->fd);
                     conn_remove(w, conn);
@@ -518,10 +527,10 @@ static void handle_events_worker(worker_t *w) {
                     if (conn->from_slab && w->slab) conn_slab_release(w->slab, conn);
                     continue;
                 }
-                continue;
             }
 
             /* Read data */
+            h1_read: ;
             ssize_t n = io_read_into_buf(conn->fd, &conn->read_buf, conn->tls);
             if (n < 0 || n == 0) { conn->state = CONN_CLOSING; goto handle_state; }
             if (conn->read_buf.len == 0) continue;
@@ -885,10 +894,14 @@ static void handle_events_worker(worker_t *w) {
                             h2_conn_flush(conn->h2);
                             conn_poller_mod(w, conn,
                                        POLLER_READ | POLLER_WRITE | POLLER_ET);
+                            /* Drain any preface bytes OpenSSL buffered
+                             * during the handshake (see READ branch) */
+                            goto h2_read;
                         } else {
                             conn->state = CONN_READING;
                             conn_poller_mod(w, conn,
                                        POLLER_READ | POLLER_ET);
+                            if (tls_has_pending(conn->tls)) goto h1_read;
                         }
                     } else if (hs == 1 || hs == -1) {
                         /* Always watch both during handshake — TLS 1.3 needs it         */
@@ -1242,10 +1255,9 @@ static void *worker_run(void *arg) {
         conn_t *c = w->active_conns[i];
         poller_del(w->poller, c->fd);
         if (c->sendfile_fd >= 0) { close(c->sendfile_fd); c->sendfile_fd = -1; }
-        if (c->proxy && c->proxy->upstream_fd >= 0) {
-            close(c->proxy->upstream_fd);
-            c->proxy->upstream_fd = -1;
-        }
+        if (c->proxy && c->proxy->upstream_fd >= 0)
+            poller_del(w->poller, c->proxy->upstream_fd);
+        /* upstream fd itself is closed by conn_free → proxy_conn_cleanup */
         if (c->tls) tls_shutdown(c->tls);
         if (c->h2 && c->h2->write_buf.len > 0) h2_conn_flush(c->h2);
         shutdown(c->fd, SHUT_WR);
