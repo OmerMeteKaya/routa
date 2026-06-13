@@ -7,6 +7,7 @@
 #include "http/request.h"
 #include "http/response.h"
 #include "core/conn.h"
+#include "core/proxy.h"
 #include "net/io.h"
 #include "util/logger.h"
 #include <stdlib.h>
@@ -14,6 +15,11 @@
 #include <stdint.h>
 #include <time.h>
 #include "util/metrics.h"
+
+/* Return value from dispatch_stream when the stream was handed to the proxy.
+ * The caller must NOT close or free the stream — it stays alive until the
+ * upstream response arrives and h2_proxy_send_response() closes it.          */
+#define H2_DISPATCH_PROXY  1
 
 static const char *req_method_str(http_method_t m) {
     switch (m) {
@@ -926,6 +932,29 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * h2_proxy_send_response — public API
+ *
+ * Relay a completed upstream HTTP response to the client on stream_id.
+ * Called by proxy_on_upstream_readable once the full response is buffered.
+ * Closes the stream after sending (mirrors the push-response lifecycle).     */
+int h2_proxy_send_response(h2_conn_t *hc, uint32_t stream_id,
+                            http_response_t *resp) {
+    if (!hc || !resp) return -1;
+    h2_stream_t *s = stream_find(hc, stream_id);
+    if (!s) return -1;
+
+    int rc = send_response(hc, stream_id, s, resp);
+
+    if (s->pending_data.len == 0) {
+        s->state = H2_STREAM_CLOSED;
+        ROUTA_METRIC_INC(h2_streams_closed_total);
+        ROUTA_METRIC_DEC(h2_active_streams);
+        stream_remove(hc, stream_id);
+    }
+    return rc;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * h2_push_promise  — public API
  *
  * Call from a route handler (before or after sending the main response) to
@@ -1077,6 +1106,27 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
             route->handler(&req, &resp, route->ctx);
         }
     }
+
+    /* H2 async proxy: handler left resp.status == 0 → hand off to upstream */
+    if (resp.status == 0 && hc->lb && hc->worker) {
+        http_response_destroy(&resp);
+        if (proxy_begin((struct worker *)hc->worker, hc->conn, &req,
+                        stream_id) == 0) {
+            /* Per-stream ctx is registered in the map; event loop dispatches
+             * upstream events directly to it via the PROXY_CTX_MAGIC tag.   */
+            http_request_free(&req);
+            return H2_DISPATCH_PROXY;
+        }
+        /* proxy_begin failed — send 503 */
+        http_response_init(&resp);
+        http_response_set_status(&resp, 503, "Service Unavailable");
+        http_response_set_body(&resp, "Service Unavailable\n", 20);
+        int rc = send_response(hc, stream_id, s, &resp);
+        http_response_destroy(&resp);
+        http_request_free(&req);
+        return rc;
+    }
+
     int rc = send_response(hc, stream_id, s, &resp);
 
     const char *mstr = req_method_str(req.method);
@@ -1182,14 +1232,16 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
 
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
-        dispatch_stream(hc, s, stream_id, router, chain);
+        int drc = dispatch_stream(hc, s, stream_id, router, chain);
         if (hc->write_buf.len > 0) {
             ssize_t wr = io_write_from_buf(hc->conn->fd,
                                             &hc->write_buf,
                                             hc->conn->tls);
             (void)wr;
         }
-
+        if (drc == H2_DISPATCH_PROXY) {
+            return 0;  /* stream kept alive; upstream response will close it */
+        }
         buf_reset(&s->body);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
@@ -1251,14 +1303,16 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
 
         /* FIX: match handle_headers pending_data pattern                */
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
-        dispatch_stream(hc, s, stream_id, router, chain);
+        int drc = dispatch_stream(hc, s, stream_id, router, chain);
         if (hc->write_buf.len > 0) {
             ssize_t wr = io_write_from_buf(hc->conn->fd,
                                             &hc->write_buf,
                                             hc->conn->tls);
             (void)wr;  /* partial flush OK — remainder handled by POLLER_WRITE */
         }
-
+        if (drc == H2_DISPATCH_PROXY) {
+            return 0;  /* stream kept alive; upstream response will close it */
+        }
         buf_reset(&s->body);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
@@ -1318,7 +1372,10 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
 
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
-        dispatch_stream(hc, s, stream_id, router, chain);
+        int drc = dispatch_stream(hc, s, stream_id, router, chain);
+        if (drc == H2_DISPATCH_PROXY) {
+            return 0;  /* stream kept alive; upstream response will close it */
+        }
         buf_reset(&s->body);
         if (s->pending_data.len == 0) {
             s->state = H2_STREAM_CLOSED;
@@ -1432,12 +1489,14 @@ int h2_upgrade_from_h1(h2_conn_t      *hc,
     }
 
     /* Dispatch — same path as a normal H2 stream                        */
-    dispatch_stream(hc, s, 1, router, chain);
+    int drc = dispatch_stream(hc, s, 1, router, chain);
 
-    s->body.data = NULL; s->body.len = 0; s->body.cap = 0; s->body.off  = 0;
-    if (s->pending_data.len == 0) {
-        s->state = H2_STREAM_CLOSED;
-        stream_remove(hc, 1);
+    if (drc != H2_DISPATCH_PROXY) {
+        s->body.data = NULL; s->body.len = 0; s->body.cap = 0; s->body.off  = 0;
+        if (s->pending_data.len == 0) {
+            s->state = H2_STREAM_CLOSED;
+            stream_remove(hc, 1);
+        }
     }
 
     /* Mark preface as done — client will send the H2 client preface next */

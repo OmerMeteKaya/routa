@@ -131,8 +131,8 @@ typedef struct { lb_t *lb; } lb_handler_ctx_t;
 
 static int lb_route_handler(const http_request_t *req,
                              http_response_t *resp, void *ctx) {
-    lb_handler_ctx_t *c = (lb_handler_ctx_t *)ctx;
-    return lb_forward(c->lb, req, resp, req->remote_ip);
+    (void)req; (void)resp; (void)ctx;
+    return 0;
 }
 
 int server_enable_lb(server_t *s, const lb_config_t *cfg) {

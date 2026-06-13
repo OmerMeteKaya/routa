@@ -175,6 +175,10 @@ typedef struct h2_conn {
 
     uint32_t          frame_count;
     uint32_t recv_pending_update;
+
+    /* Proxy support — set by event_loop after h2_conn_new */
+    struct worker    *worker;   /* owning worker, for proxy dispatch */
+    struct lb        *lb;       /* non-NULL when proxy/LB is enabled */
 } h2_conn_t;
 
 /* Forward declarations */
@@ -183,6 +187,8 @@ struct router;
 struct middleware_chain;
 struct http_request;
 struct http_response;
+struct worker;
+struct lb;
 
 /* ── Core API ────────────────────────────────────────────────────────────── */
 
@@ -258,5 +264,14 @@ int        h2_push_response(h2_conn_t        *hc,
 int        h2_early_hints(h2_conn_t   *hc,
                            uint32_t     stream_id,
                            const char **hints);
+
+/* ── Proxy response relay (RFC 7540 §8) ─────────────────────────────────── */
+
+/* Send an upstream HTTP response back to the client on the given H2 stream.
+ * Used by the proxy path after upstream_readable delivers a complete response.
+ * Closes the stream after sending (mirrors h2_push_response lifecycle).      */
+int        h2_proxy_send_response(h2_conn_t        *hc,
+                                   uint32_t          stream_id,
+                                   http_response_t  *resp);
 
 #endif /* ROUTA_HTTP_H2_H */

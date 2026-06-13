@@ -363,6 +363,7 @@ static int build_forward_request(const http_request_t *req,
         if (is_hop_by_hop(k))                            continue;
         if (strcasecmp(k, "host") == 0)                  continue;
         if (strcasecmp(k, "x-forwarded-proto") == 0)     continue;
+        if (k[0] == ':')                                  continue;
         if (strcasecmp(k, "x-forwarded-for") == 0) { prev_xff = v; continue; }
         if (strcasecmp(k, "via") == 0)             { prev_via = v; continue; }
         if (strcasecmp(k, "content-length") == 0) {
@@ -407,7 +408,7 @@ static int build_forward_request(const http_request_t *req,
         BFR_PUTN(cl, (size_t)n);
     }
 
-    BFR_PUT("Connection: close\r\n");
+    BFR_PUT("Connection: keep-alive\r\n");
     BFR_PUT("\r\n");
 
     if (req->body && req->body_len > 0)

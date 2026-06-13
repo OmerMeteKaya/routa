@@ -378,6 +378,27 @@ static void handle_events_worker(worker_t *w) {
             continue;
         }
 
+        /* ── Upstream proxy fd event (H2 frontend path) ────────────────── */
+        /* For H2 connections, proxy_begin uses ctx as the poller ptr so
+         * upstream-fd events can be distinguished from client-fd events.
+         * Detect by checking the magic tag at the start of proxy_ctx_t.     */
+        if (((proxy_ctx_t *)events[i].ptr)->magic == PROXY_CTX_MAGIC) {
+            proxy_ctx_t *pctx  = (proxy_ctx_t *)events[i].ptr;
+            conn_t      *pconn = pctx->conn;
+            if (events[i].events & POLLER_WRITE)
+                proxy_on_upstream_writable(w, pconn, pctx);
+            else if (events[i].events & POLLER_READ)
+                proxy_on_upstream_readable(w, pconn, pctx);
+            /* Flush any H2 response data written into the frontend's write_buf */
+            if (pconn->h2 && pconn->h2->write_buf.len > 0) {
+                h2_conn_flush(pconn->h2);
+                if (pconn->h2->write_buf.len > 0)
+                    conn_poller_mod(w, pconn,
+                                    POLLER_READ | POLLER_WRITE | POLLER_ET);
+            }
+            continue;
+        }
+
         /* ── Client event ── */
         conn_t *conn = (conn_t *)events[i].ptr;
 
@@ -478,7 +499,7 @@ static void handle_events_worker(worker_t *w) {
 
             /* ── Upstream response reading ── */
             if (conn->state == CONN_UPSTREAM_READING) {
-                proxy_on_upstream_readable(w, conn);
+                proxy_on_upstream_readable(w, conn, conn->proxy);
                 goto handle_state;
             }
 
@@ -496,6 +517,8 @@ static void handle_events_worker(worker_t *w) {
                             conn->state = CONN_CLOSING;
                             goto handle_state;
                         }
+                        conn->h2->worker = w;
+                        conn->h2->lb     = w->lb;
                         conn->state = CONN_H2;
                         h2_conn_flush(conn->h2);
                         conn_poller_mod(w, conn,
@@ -553,6 +576,8 @@ static void handle_events_worker(worker_t *w) {
                         conn->state = CONN_CLOSING;
                         goto handle_state;
                     }
+                    conn->h2->worker = w;
+                    conn->h2->lb     = w->lb;
                     conn->state = CONN_H2;
                     h2_conn_flush(conn->h2);
                     conn_poller_mod(w, conn,
@@ -593,6 +618,8 @@ static void handle_events_worker(worker_t *w) {
                         conn->state = CONN_WRITING;
                         goto handle_state;
                     }
+                    conn->h2->worker = w;
+                    conn->h2->lb     = w->lb;
                     if (h2_upgrade_from_h1(conn->h2, &req,
                                            w->router, w->chain) < 0) {
                         h2_conn_free(conn->h2);
@@ -750,7 +777,7 @@ static void handle_events_worker(worker_t *w) {
                 /* ── Async upstream: if handler set upstream_fd via lb ── */
                 if (w->lb && resp.status == 0) {
                     http_response_destroy(&resp);
-                    proxy_begin(w, conn, &req);
+                    proxy_begin(w, conn, &req, 0);  /* stream_id=0 for H1 */
                     http_request_free(&req);
                     goto handle_state;
                 }
@@ -873,7 +900,7 @@ static void handle_events_worker(worker_t *w) {
                 /* ── Upstream connecting ── */
             if (conn->state == CONN_UPSTREAM_CONNECTING ||
                 conn->state == CONN_UPSTREAM_WRITING) {
-                proxy_on_upstream_writable(w, conn);
+                proxy_on_upstream_writable(w, conn, conn->proxy);
                 goto handle_state;
                 }
                 /* TLS handshake */
@@ -890,6 +917,8 @@ static void handle_events_worker(worker_t *w) {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
                             }
+                            conn->h2->worker = w;
+                            conn->h2->lb     = w->lb;
                             conn->state = CONN_H2;
                             h2_conn_flush(conn->h2);
                             conn_poller_mod(w, conn,
@@ -1257,7 +1286,13 @@ static void *worker_run(void *arg) {
         if (c->sendfile_fd >= 0) { close(c->sendfile_fd); c->sendfile_fd = -1; }
         if (c->proxy && c->proxy->upstream_fd >= 0)
             poller_del(w->poller, c->proxy->upstream_fd);
-        /* upstream fd itself is closed by conn_free → proxy_conn_cleanup */
+        if (c->proxy_map) {
+            proxy_stream_map_t *pm = c->proxy_map;
+            for (int pi = 0; pi < pm->count; pi++)
+                if (pm->ctxs[pi]->upstream_fd >= 0)
+                    poller_del(w->poller, pm->ctxs[pi]->upstream_fd);
+        }
+        /* upstream fds are closed by conn_free → proxy_conn_cleanup */
         if (c->tls) tls_shutdown(c->tls);
         if (c->h2 && c->h2->write_buf.len > 0) h2_conn_flush(c->h2);
         shutdown(c->fd, SHUT_WR);
