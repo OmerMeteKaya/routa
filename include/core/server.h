@@ -6,6 +6,9 @@
 #include "core/config.h"
 #include "http/middleware.h"
 #include "lb/lb.h"
+#include <stdatomic.h>
+
+extern atomic_int g_drain_flag;
 
 struct event_loop;
 

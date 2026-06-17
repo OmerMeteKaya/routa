@@ -19,18 +19,19 @@
 
 /* ── Internal: open a new TCP connection to node ───────────────────────────*/
 static int node_connect(upstream_node_t *node, int timeout_ms) {
-    /* Resolve once, cache result */
+    pthread_spin_lock(&node->state_lock);
     if (!node->addr_resolved) {
         memset(&node->addr, 0, sizeof(node->addr));
         node->addr.sin_family = AF_INET;
         node->addr.sin_port   = htons(node->port);
         if (inet_pton(AF_INET, node->host, &node->addr.sin_addr) != 1) {
+            pthread_spin_unlock(&node->state_lock);
             LOG_ERROR("upstream: cannot parse IP '%s'", node->host);
             return -1;
         }
         node->addr_resolved = 1;
     }
-
+    pthread_spin_unlock(&node->state_lock);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd >= 0) {
         net_set_nonblocking(fd);
@@ -173,16 +174,19 @@ void upstream_node_drain_idle(upstream_node_t *node) {
 /* ── Async connect ──────────────────────────────────────────────────────────*/
 
 int upstream_conn_connect_async(upstream_node_t *node) {
+    pthread_spin_lock(&node->state_lock);
     if (!node->addr_resolved) {
         memset(&node->addr, 0, sizeof(node->addr));
         node->addr.sin_family = AF_INET;
         node->addr.sin_port   = htons(node->port);
         if (inet_pton(AF_INET, node->host, &node->addr.sin_addr) != 1) {
+            pthread_spin_unlock(&node->state_lock);
             LOG_ERROR("upstream: cannot parse IP '%s'", node->host);
             return -1;
         }
         node->addr_resolved = 1;
     }
+    pthread_spin_unlock(&node->state_lock);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd >= 0) {
@@ -230,29 +234,34 @@ void upstream_node_set_state(upstream_node_t *node, node_state_t state) {
 
 void upstream_node_record_success(upstream_node_t *node,
                                    upstream_pool_t *pool) {
+    pthread_spin_lock(&node->state_lock);
     node->success_count++;
     node->fail_count = 0;
     node->total_requests++;
-
-    pthread_spin_lock(&node->state_lock);
     node_state_t st = node->state;
     pthread_spin_unlock(&node->state_lock);
 
     if (st == NODE_DOWN &&
         node->success_count >= (uint32_t)pool->passive_recover_threshold) {
         upstream_node_set_state(node, NODE_UP);
+        /* reset under lock */
+        pthread_spin_lock(&node->state_lock);
         node->success_count = 0;
-    }
+        pthread_spin_unlock(&node->state_lock);
+        }
 }
 
 void upstream_node_record_failure(upstream_node_t *node,
                                    upstream_pool_t *pool) {
+    pthread_spin_lock(&node->state_lock);
     node->fail_count++;
     node->success_count = 0;
     node->total_errors++;
     node->last_fail_time = time(NULL);
+    uint32_t fail = node->fail_count;
+    pthread_spin_unlock(&node->state_lock);
 
-    if (node->fail_count >= (uint32_t)pool->passive_fail_threshold) {
+    if (fail >= (uint32_t)pool->passive_fail_threshold) {
         upstream_node_set_state(node, NODE_DOWN);
     }
 }

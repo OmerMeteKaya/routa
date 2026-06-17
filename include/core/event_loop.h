@@ -38,7 +38,7 @@ struct worker {
     event_loop_t   *loop;            /* parent loop — read-only after init */
 
     /* Graceful shutdown */
-    int             draining;
+    volatile int             draining;
     int             shutdown_timeout_ms;  /* ms to wait before force-close  */
 
     /* Load balancer — shared across workers, thread-safe internally */

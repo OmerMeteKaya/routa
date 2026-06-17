@@ -787,6 +787,8 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
 /* ── Write HTTP response as H2 HEADERS + DATA frames ────────────────────── */
 static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                           http_response_t *resp) {
+    int saved_dtu = hc->hpack_tx.dynamic_table_update;
+    hc->hpack_tx.dynamic_table_update = 0;
     char status_str[4];
     (void)snprintf(status_str, sizeof(status_str), "%d", resp->status);
 
@@ -826,6 +828,7 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
     uint8_t hdr_block[4096];
     int hdr_len = hpack_encode(&hc->hpack_tx, enc_headers, nhdr,
                                 hdr_block, sizeof(hdr_block));
+    hc->hpack_tx.dynamic_table_update = saved_dtu;
     if (hdr_len < 0) return -1;
 
     /* FIX: correctly detect body presence including fd path              */

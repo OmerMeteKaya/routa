@@ -229,12 +229,15 @@ static void conn_close_and_free(worker_t *w, conn_t *conn) {
     buf_free(&conn->hdr_buf);
 
     routa_metrics_conn_close();
-
     if (conn->from_slab && w->slab) {
+        conn->recv_buf = NULL;
+        conn->send_buf = NULL;
         conn_slab_release(w->slab, conn);
     } else {
         free(conn->recv_buf);
+        conn->recv_buf = NULL;
         free(conn->send_buf);
+        conn->send_buf = NULL;
         free(conn);
     }
 }
@@ -385,6 +388,11 @@ static void handle_events_worker(worker_t *w) {
         if (((proxy_ctx_t *)events[i].ptr)->magic == PROXY_CTX_MAGIC) {
             proxy_ctx_t *pctx  = (proxy_ctx_t *)events[i].ptr;
             conn_t      *pconn = pctx->conn;
+            if (pconn->h2 && pconn->h2->worker != w) {
+                /* BUG: cross-worker dispatch detected, skip silently.
+                 * This upstream fd will be re-registered on the correct worker. */
+                continue;
+            }
             if (events[i].events & POLLER_WRITE)
                 proxy_on_upstream_writable(w, pconn, pctx);
             else if (events[i].events & POLLER_READ)
@@ -1237,12 +1245,22 @@ static void *worker_run(void *arg) {
             }
         }
 
+        /* ── Graceful drain trigger from signal handler ── */
+        if (!w->draining && w->loop) {
+            int expected = 1;
+            /* Only one worker does the drain_start, others pick up via w->draining */
+            extern atomic_int g_drain_flag;
+            if (atomic_compare_exchange_strong(&g_drain_flag, &expected, 0)) {
+                event_loop_drain_start(w->loop);
+            }
+        }
+
         /* ── Hot reload (worker 0 only, skip during drain) ── */
         if (!w->draining && w->worker_id == 0 && w->loop &&
             w->loop->reload_flag && *w->loop->reload_flag) {
             *w->loop->reload_flag = 0;
             worker_apply_reload(w);
-        }
+            }
 
         /* ── Periodic ping + H2 timeout sweep (~1 s) ── */
         if (now_ms - last_ping_sweep_ms >= 1000) {
@@ -1298,9 +1316,22 @@ static void *worker_run(void *arg) {
         shutdown(c->fd, SHUT_WR);
         net_close(c->fd);
         conn_reset_write_state(c);
+        if (c->h2)  { h2_conn_free(c->h2);  c->h2  = NULL; }
+        if (c->tls) { tls_conn_free(c->tls); c->tls = NULL; }
+        proxy_conn_cleanup(c);
+        buf_free(&c->read_buf);
+        buf_free(&c->write_buf);
+        buf_free(&c->hdr_buf);
         routa_metrics_conn_close();
-        conn_free(c);
-        if (c->from_slab && w->slab) conn_slab_release(w->slab, c);
+        if (c->from_slab && w->slab) {
+            c->recv_buf = NULL;
+            c->send_buf = NULL;
+            conn_slab_release(w->slab, c);
+        } else {
+            free(c->recv_buf);
+            free(c->send_buf);
+            free(c);
+        }
     }
     if (w->server_fd >= 0) net_close(w->server_fd);
     poller_free(w->poller);
@@ -1604,7 +1635,7 @@ void event_loop_stop(event_loop_t *loop) {
 }
 
 void event_loop_drain_start(event_loop_t *loop) {
-    if (!loop) return;
+    if (!loop || loop->draining) return;
     loop->draining = 1;
     for (int i = 0; i < loop->n_workers; i++)
         loop->workers[i].draining = 1;

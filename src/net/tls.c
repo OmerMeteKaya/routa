@@ -112,11 +112,9 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
 
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
                           SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_session_cache_mode(ctx,
-    SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
-    SSL_CTX_sess_set_cache_size(ctx, 10000);
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 
-    SSL_CTX_set_num_tickets(ctx, 2);
+    SSL_CTX_set_num_tickets(ctx, 0);
     SSL_CTX_set_session_id_context(ctx,
         (const unsigned char *)"routa", 5);
     SSL_CTX_set_max_early_data(ctx, 16384);
@@ -212,10 +210,8 @@ int tls_context_reload(tls_context_t *tls_ctx,
 
     SSL_CTX_set_mode(new_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
                            SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    SSL_CTX_set_session_cache_mode(new_ctx,
-        SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
-    SSL_CTX_sess_set_cache_size(new_ctx, 10000);
-    SSL_CTX_set_num_tickets(new_ctx, 2);
+    SSL_CTX_set_session_cache_mode(new_ctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_num_tickets(new_ctx, 0);
     SSL_CTX_set_session_id_context(new_ctx,
         (const unsigned char *)"routa", 5);
     SSL_CTX_set_max_early_data(new_ctx, 16384);
@@ -413,7 +409,7 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len) {
         case SSL_ERROR_ZERO_RETURN: return  0;
         default: {
             unsigned long ssl_err = ERR_peek_last_error();
-            if (ERR_GET_REASON(ssl_err) == ERR_R_SYS_LIB) {
+            if (ERR_GET_REASON(ssl_err) == ERR_R_SYS_LIB || errno == EPIPE || errno == ECONNRESET) {
                 ERR_clear_error();
             } else {
                 log_ssl_error("TLS write");

@@ -1,0 +1,8 @@
+# TSAN suppressions for known false positives in third-party libraries
+
+# OpenSSL 3.x provider/algorithm lazy-initialization race.
+# CRYPTO_THREAD_run_once creates rwlocks for provider loading; one thread
+# holds the lock during a write while another thread reads a shared structure
+# without the same lock — this is intentional in OpenSSL's design (init-once
+# semantics that TSAN cannot prove safe).  Not a bug in our code.
+race:libcrypto.so

@@ -130,8 +130,8 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
                 return 0;
             }
         } else {
-            buf_reset(&conn->proxy->req_buf);
-            buf_reset(&conn->proxy->resp_buf);
+            buf_free(&conn->proxy->req_buf);   buf_init(&conn->proxy->req_buf);
+            buf_free(&conn->proxy->resp_buf);  buf_init(&conn->proxy->resp_buf);
             conn->proxy->req_sent            = 0;
             conn->proxy->attempt             = 0;
             conn->proxy->resp_head_done      = 0;
@@ -171,7 +171,13 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     if (conn->h2 && stream_id > 0) {
         /* H2: register ctx as the poller ptr so the event loop identifies
          * which per-stream context owns the upstream fd event.              */
-        poller_add(w->poller, ufd, POLLER_WRITE | POLLER_ET, ctx);
+        struct worker *h2_worker = (struct worker *)conn->h2->worker;
+        if (!h2_worker) {
+            proxy_ctx_free(ctx);
+            proxy_stream_remove(conn, stream_id);
+            return -1;
+        }
+        poller_add(h2_worker->poller, ufd, POLLER_WRITE | POLLER_ET, ctx);
     } else {
         conn->state = CONN_UPSTREAM_CONNECTING;
         poller_add(w->poller, ufd, POLLER_WRITE | POLLER_ET, conn);
@@ -329,7 +335,8 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
     ctx->uconn               = NULL;
     ctx->node                = NULL;
     ctx->upstream_fd         = -1;
-    buf_reset(&ctx->resp_buf);
+    buf_free(&ctx->resp_buf);
+    buf_init(&ctx->resp_buf);
     ctx->resp_head_done      = 0;
     ctx->resp_content_length = -1;
 

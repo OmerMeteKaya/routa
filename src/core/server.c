@@ -14,6 +14,8 @@
 #include "util/metrics.h"
 #include "http/mw_metrics.h"
 
+#include <stdatomic.h>
+atomic_int g_drain_flag = 0;
 static struct event_loop  *g_loop        = NULL;
 static volatile sig_atomic_t g_reload_flag = 0;
 static char                g_config_path[512] = {0};
@@ -21,9 +23,8 @@ static char                g_config_path[512] = {0};
 /* SIGTERM / SIGINT — initiate graceful drain */
 static void signal_handler(int sig) {
     (void)sig;
-    if (g_loop) event_loop_drain_start(g_loop);
+    g_drain_flag = 1;
 }
-
 /* SIGHUP — hot reload: set flag, worker 0 processes it asynchronously */
 static void sighup_handler(int sig) {
     (void)sig;

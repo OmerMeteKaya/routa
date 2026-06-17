@@ -1,4 +1,7 @@
 #include "../include/http/h2_hpack.h"
+
+#include <pthread.h>
+
 #include "util/logger.h"
 #include <stdlib.h>
 #include <string.h>
@@ -74,7 +77,7 @@ static const hpack_header_t hpack_static_table[] = {
 };
 #define HPACK_STATIC_COUNT 61
 static int static_name_idx[256];   /* hash → static table index */
-static int static_hash_ready = 0;
+static pthread_once_t static_hash_once = PTHREAD_ONCE_INIT;
 
 static uint8_t header_hash(const char *s) {
     uint8_t h = 0;
@@ -83,13 +86,11 @@ static uint8_t header_hash(const char *s) {
 }
 
 static void build_static_hash(void) {
-    if (static_hash_ready) return;
     memset(static_name_idx, 0, sizeof(static_name_idx));
     for (int i = 1; i <= HPACK_STATIC_COUNT; i++) {
         uint8_t h = header_hash(hpack_static_table[i].name);
         if (!static_name_idx[h]) static_name_idx[h] = i;
     }
-    static_hash_ready = 1;
 }
 /* ═══════════════════════════════════════════════════════════════════════════
  * RFC 7541 Appendix B — Huffman Code Table
@@ -427,10 +428,9 @@ typedef struct {
 
 /* 256-entry table indexed by next 8 bits */
 static huff_lut_entry_t huff_lut[256];
-static int huff_lut_ready = 0;
+static pthread_once_t huff_lut_once = PTHREAD_ONCE_INIT;
 
 static void build_huff_lut(void) {
-    if (huff_lut_ready) return;
     memset(huff_lut, 0, sizeof(huff_lut));
     for (int sym = 0; sym < 256; sym++) {
         int      bl   = hpack_huffman_table[sym].bits;
@@ -449,7 +449,6 @@ static void build_huff_lut(void) {
             }
         }
     }
-    huff_lut_ready = 1;
 }
 /* Build a simple decode table on first use (lazy, done once per process).
  * Maps (state, bit) → (next_state, symbol, is_terminal).
@@ -464,7 +463,7 @@ static void build_huff_lut(void) {
  * Combined complexity: O(n) for typical header content.                      */
 static int huffman_decode(const uint8_t *src, size_t src_len,
                            char *dst, size_t dst_len) {
-    if (!huff_lut_ready) build_huff_lut();
+    pthread_once(&huff_lut_once, build_huff_lut);
 
     uint64_t bits   = 0;
     int      n_bits = 0;
@@ -868,6 +867,7 @@ fail:
 int hpack_encode(hpack_ctx_t *ctx,
                  const hpack_header_t *headers, int count,
                  uint8_t *dst, size_t dst_len) {
+    pthread_once(&static_hash_once, build_static_hash);
     size_t pos = 0;
 
     for (int i = 0; i < count; i++) {
