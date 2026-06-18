@@ -47,18 +47,18 @@ typedef struct proxy_ctx {
     int               resp_head_done;       /* headers fully received        */
     long long         resp_content_length;  /* -1 = unknown/chunked          */
     size_t            resp_body_received;   /* bytes received so far         */
+    int               resp_chunked;         /* 1 = Transfer-Encoding: chunked */
 
     proxy_state_t     upstream_state;       /* connecting / writing / reading */
 } proxy_ctx_t;
 
 /* Per-stream proxy context map for H2 — one ctx per concurrent stream.
  * H1 connections use the single conn->proxy pointer instead.                */
-#define PROXY_STREAM_MAP_SIZE 64  /* covers h2load -m50 and typical production concurrency */
-
-typedef struct proxy_stream_map {
-    uint32_t      stream_ids[PROXY_STREAM_MAP_SIZE];
-    proxy_ctx_t  *ctxs[PROXY_STREAM_MAP_SIZE];
-    int           count;
+typedef struct proxy_stream_map_s {
+    int          count;
+    int          cap;
+    uint32_t    *stream_ids;
+    proxy_ctx_t **ctxs;
 } proxy_stream_map_t;
 
 proxy_ctx_t *proxy_ctx_new(lb_t *lb, struct conn *conn);

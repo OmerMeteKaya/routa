@@ -127,6 +127,9 @@ void upstream_conn_release(upstream_conn_t *conn, int healthy);
 /* Force-close all idle connections on a node (e.g. after health failure).  */
 void upstream_node_drain_idle(upstream_node_t *node);
 
+/* Close idle connections whose last_used timestamp is older than max_age_s. */
+void upstream_node_reap_idle(upstream_node_t *node, time_t max_age_s);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Health check thread API (internal — called by lb.c)
  * ═══════════════════════════════════════════════════════════════════════════*/

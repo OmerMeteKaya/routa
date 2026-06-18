@@ -317,7 +317,7 @@ static void handle_events_worker(worker_t *w) {
 
         /* ── Accept ── */
         if (events[i].ptr == NULL) {
-            if (w->draining) continue;
+            if (__atomic_load_n(&w->draining, __ATOMIC_RELAXED)) continue;
             for (;;) {
                 struct sockaddr_in client_addr = {0};
                 socklen_t client_len = sizeof(client_addr);
@@ -1184,6 +1184,7 @@ static void *worker_run(void *arg) {
     }
 
     uint64_t last_ping_sweep_ms = 0;
+    uint64_t last_idle_reap_ms  = 0;
     int      drain_init_done    = 0;
     uint64_t drain_start_ms     = 0;
 
@@ -1196,7 +1197,7 @@ static void *worker_run(void *arg) {
                         + (uint64_t)ts.tv_nsec / 1000000;
 
         /* ── Graceful drain ── */
-        if (w->draining && !drain_init_done) {
+        if (__atomic_load_n(&w->draining, __ATOMIC_RELAXED) && !drain_init_done) {
             drain_init_done = 1;
             drain_start_ms  = now_ms;
             LOG_INFO("Worker %d: graceful drain started", w->worker_id);
@@ -1230,7 +1231,7 @@ static void *worker_run(void *arg) {
             }
         }
 
-        if (w->draining && drain_init_done) {
+        if (__atomic_load_n(&w->draining, __ATOMIC_RELAXED) && drain_init_done) {
             if (w->active_conn_count == 0) {
                 LOG_INFO("Worker %d: all connections drained, stopping",
                          w->worker_id);
@@ -1246,7 +1247,7 @@ static void *worker_run(void *arg) {
         }
 
         /* ── Graceful drain trigger from signal handler ── */
-        if (!w->draining && w->loop) {
+        if (!__atomic_load_n(&w->draining, __ATOMIC_RELAXED) && w->loop) {
             int expected = 1;
             /* Only one worker does the drain_start, others pick up via w->draining */
             extern atomic_int g_drain_flag;
@@ -1256,11 +1257,22 @@ static void *worker_run(void *arg) {
         }
 
         /* ── Hot reload (worker 0 only, skip during drain) ── */
-        if (!w->draining && w->worker_id == 0 && w->loop &&
+        if (!__atomic_load_n(&w->draining, __ATOMIC_RELAXED) && w->worker_id == 0 && w->loop &&
             w->loop->reload_flag && *w->loop->reload_flag) {
             *w->loop->reload_flag = 0;
             worker_apply_reload(w);
             }
+
+        /* ── Upstream idle connection reaper (~30 s, worker 0 only) ── */
+        if (w->worker_id == 0 && w->lb &&
+            now_ms - last_idle_reap_ms >= 30000) {
+            upstream_pool_t *_pool = lb_get_pool(w->lb);
+            if (_pool) {
+                for (int _pi = 0; _pi < _pool->node_count; _pi++)
+                    upstream_node_reap_idle(_pool->nodes[_pi], 60);
+            }
+            last_idle_reap_ms = now_ms;
+        }
 
         /* ── Periodic ping + H2 timeout sweep (~1 s) ── */
         if (now_ms - last_ping_sweep_ms >= 1000) {
@@ -1635,10 +1647,14 @@ void event_loop_stop(event_loop_t *loop) {
 }
 
 void event_loop_drain_start(event_loop_t *loop) {
-    if (!loop || loop->draining) return;
-    loop->draining = 1;
+    if (!loop) return;
+    /* Atomic gate: only the first caller proceeds; others return immediately */
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&loop->draining, &expected, 1, 0,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
     for (int i = 0; i < loop->n_workers; i++)
-        loop->workers[i].draining = 1;
+        __atomic_store_n(&loop->workers[i].draining, 1, __ATOMIC_RELAXED);
     LOG_INFO("Graceful shutdown initiated (timeout %d ms)",
              loop->shutdown_timeout_ms);
 }

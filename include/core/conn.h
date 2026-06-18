@@ -67,7 +67,7 @@ typedef struct conn {
 
     /* ── CL3: COLD — upstream fields ───────────────────────────────────*/
     struct proxy_ctx        *proxy;      /* H1: single ctx                   */
-    struct proxy_stream_map *proxy_map;  /* H2: per-stream ctx map, NULL=H1  */
+    struct proxy_stream_map_s *proxy_map;  /* H2: per-stream ctx map, NULL=H1  */
 
     /* ── WebSocket fields ───────────────────────────────────────────────
      *

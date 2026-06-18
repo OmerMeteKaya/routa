@@ -171,6 +171,36 @@ void upstream_node_drain_idle(upstream_node_t *node) {
     }
 }
 
+void upstream_node_reap_idle(upstream_node_t *node, time_t max_age_s) {
+    time_t threshold = time(NULL) - max_age_s;
+    upstream_conn_t *keep  = NULL;
+    upstream_conn_t *drain = NULL;
+
+    pthread_mutex_lock(&node->pool_lock);
+    upstream_conn_t *c = node->idle_conns;
+    while (c) {
+        upstream_conn_t *next = c->next;
+        if (c->last_used < threshold) {
+            c->next = drain;
+            drain   = c;
+            node->idle_count--;
+        } else {
+            c->next = keep;
+            keep    = c;
+        }
+        c = next;
+    }
+    node->idle_conns = keep;
+    pthread_mutex_unlock(&node->pool_lock);
+
+    while (drain) {
+        upstream_conn_t *next = drain->next;
+        close(drain->fd);
+        free(drain);
+        drain = next;
+    }
+}
+
 /* ── Async connect ──────────────────────────────────────────────────────────*/
 
 int upstream_conn_connect_async(upstream_node_t *node) {

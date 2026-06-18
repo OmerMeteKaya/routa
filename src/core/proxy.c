@@ -67,11 +67,40 @@ proxy_ctx_t *proxy_stream_get(conn_t *conn, uint32_t stream_id, lb_t *lb) {
     if (!conn->proxy_map) {
         conn->proxy_map = calloc(1, sizeof(proxy_stream_map_t));
         if (!conn->proxy_map) return NULL;
+        conn->proxy_map->cap = 16;
+        conn->proxy_map->stream_ids = calloc(16, sizeof(uint32_t));
+        conn->proxy_map->ctxs       = calloc(16, sizeof(proxy_ctx_t *));
+        if (!conn->proxy_map->stream_ids || !conn->proxy_map->ctxs) {
+            free(conn->proxy_map->stream_ids);
+            free(conn->proxy_map->ctxs);
+            free(conn->proxy_map);
+            conn->proxy_map = NULL;
+            return NULL;
+        }
     }
     proxy_stream_map_t *m = conn->proxy_map;
+
+    /* existing stream */
     for (int i = 0; i < m->count; i++)
         if (m->stream_ids[i] == stream_id) return m->ctxs[i];
-    if (m->count >= PROXY_STREAM_MAP_SIZE) return NULL;
+
+    /* grow if needed */
+    if (m->count >= m->cap) {
+        int new_cap = m->cap * 2;
+        uint32_t    *new_ids  = realloc(m->stream_ids,
+                                        (size_t)new_cap * sizeof(uint32_t));
+        proxy_ctx_t **new_ctxs = realloc(m->ctxs,
+                                         (size_t)new_cap * sizeof(proxy_ctx_t *));
+        if (!new_ids || !new_ctxs) {
+            free(new_ids);
+            free(new_ctxs);
+            return NULL;
+        }
+        m->stream_ids = new_ids;
+        m->ctxs       = new_ctxs;
+        m->cap        = new_cap;
+    }
+
     proxy_ctx_t *ctx = proxy_ctx_new(lb, conn);
     if (!ctx) return NULL;
     m->stream_ids[m->count] = stream_id;
@@ -99,6 +128,8 @@ void proxy_stream_map_free(conn_t *conn) {
     proxy_stream_map_t *m = conn->proxy_map;
     for (int i = 0; i < m->count; i++)
         proxy_ctx_free(m->ctxs[i]);
+    free(m->stream_ids);
+    free(m->ctxs);
     free(m);
     conn->proxy_map = NULL;
 }
@@ -107,14 +138,23 @@ void proxy_stream_map_free(conn_t *conn) {
 
 int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
                 uint32_t stream_id) {
-    if (!w || !conn || !req || !w->lb) return -1;
+    if (!w || !conn || !req || !w->lb) {
+        LOG_WARN("proxy_begin: null check failed w=%p conn=%p req=%p lb=%p",
+                 (void*)w, (void*)conn, (void*)req, w ? (void*)w->lb : NULL);
+        return -1;
+    }
 
     proxy_ctx_t *ctx;
 
     if (conn->h2 && stream_id > 0) {
         /* H2 path: each stream gets its own proxy_ctx from the per-conn map */
         ctx = proxy_stream_get(conn, stream_id, w->lb);
-        if (!ctx) return -1;
+        if (!ctx) {
+            LOG_WARN("proxy_begin: proxy_stream_get failed stream_id=%u map_count=%d",
+                    stream_id,
+                    conn->proxy_map ? conn->proxy_map->count : -1);
+            return -1;
+        }
         ctx->front_h2        = conn->h2;
         ctx->front_stream_id = stream_id;
     } else {
@@ -136,6 +176,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
             conn->proxy->attempt             = 0;
             conn->proxy->resp_head_done      = 0;
             conn->proxy->resp_content_length = -1;
+            conn->proxy->resp_chunked        = 0;
             conn->proxy->front_h2            = NULL;
             conn->proxy->front_stream_id     = 0;
             proxy_drop_upstream(conn->proxy);
@@ -148,6 +189,13 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     int ufd = lb_begin_forward(w->lb, req, conn->remote_ip,
                                conn->tls ? "https" : "http",
                                &ctx->req_buf, &unode, &uconn);
+    if (ufd < 0 && ctx->attempt == 0) {
+        ctx->attempt = 1;
+        buf_reset(&ctx->req_buf);
+        ufd = lb_begin_forward(w->lb, req, conn->remote_ip,
+                               conn->tls ? "https" : "http",
+                               &ctx->req_buf, &unode, &uconn);
+    }
     if (ufd < 0) {
         LOG_WARN("proxy: no upstream available for %s", conn->remote_ip);
         if (conn->h2 && stream_id > 0) {
@@ -166,13 +214,16 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     ctx->node           = unode;
     ctx->uconn          = uconn;
     ctx->req_sent       = 0;
-    ctx->upstream_state = PROXY_STATE_CONNECTING;
+    ctx->upstream_state = (uconn && uconn->requests > 0)
+                      ? PROXY_STATE_WRITING
+                      : PROXY_STATE_CONNECTING;
 
     if (conn->h2 && stream_id > 0) {
         /* H2: register ctx as the poller ptr so the event loop identifies
          * which per-stream context owns the upstream fd event.              */
         struct worker *h2_worker = (struct worker *)conn->h2->worker;
         if (!h2_worker) {
+            LOG_WARN("proxy_begin: h2_worker is NULL stream_id=%u", stream_id);
             proxy_ctx_free(ctx);
             proxy_stream_remove(conn, stream_id);
             return -1;
@@ -289,16 +340,32 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
     if (n > 0)
         buf_append(&ctx->resp_buf, tmp, (size_t)n);
 
-    /* Parse Content-Length from headers once */
+    /* Parse response headers once (bounded within the header section) */
     if (!ctx->resp_head_done && ctx->resp_buf.len > 0) {
         const char *raw = (const char *)buf_data(&ctx->resp_buf);
         size_t raw_len  = ctx->resp_buf.len;
         const char *hdr_end = memmem(raw, raw_len, "\r\n\r\n", 4);
         if (hdr_end) {
             ctx->resp_head_done = 1;
-            const char *cl = strcasestr(raw, "content-length:");
-            if (cl && cl < hdr_end) {
-                ctx->resp_content_length = strtoll(cl + 15, NULL, 10);
+            /* Scan headers line by line without reading past hdr_end */
+            const char *p = memchr(raw, '\n', (size_t)(hdr_end - raw));
+            if (p) p++;   /* skip status line */
+            while (p && p < hdr_end) {
+                const char *eol = memmem(p, (size_t)(hdr_end - p), "\r\n", 2);
+                if (!eol || eol == p) break;
+                const char *col = memchr(p, ':', (size_t)(eol - p));
+                if (col) {
+                    size_t klen = (size_t)(col - p);
+                    const char *val = col + 1;
+                    while (val < eol && *val == ' ') val++;
+                    if (klen == 14 && strncasecmp(p, "content-length", 14) == 0)
+                        ctx->resp_content_length = strtoll(val, NULL, 10);
+                    else if (klen == 17 &&
+                             strncasecmp(p, "transfer-encoding", 17) == 0 &&
+                             strncasecmp(val, "chunked", 7) == 0)
+                        ctx->resp_chunked = 1;
+                }
+                p = eol + 2;
             }
         }
     }
@@ -318,6 +385,16 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
             if ((long long)body_received >= ctx->resp_content_length)
                 response_complete = 1;
         }
+    } else if (ctx->resp_head_done && ctx->resp_chunked) {
+        /* Chunked: complete when terminal chunk 0\r\n\r\n is present */
+        const char *raw = (const char *)buf_data(&ctx->resp_buf);
+        const char *hdr_end = memmem(raw, ctx->resp_buf.len, "\r\n\r\n", 4);
+        if (hdr_end) {
+            const char *body_start = hdr_end + 4;
+            size_t body_len = (size_t)(raw + ctx->resp_buf.len - body_start);
+            if (body_len > 0 && memmem(body_start, body_len, "0\r\n\r\n", 5))
+                response_complete = 1;
+        }
     }
 
     if (!response_complete) return 0; /* wait for more */
@@ -325,7 +402,7 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
     /* Full response received — parse and forward */
     poller_del(w->poller, ctx->upstream_fd);
 
-    int healthy = (ctx->resp_content_length >= 0 && n != 0);
+    int healthy = ((ctx->resp_content_length >= 0 || ctx->resp_chunked) && n != 0);
 
     http_response_t resp;
     http_response_init(&resp);

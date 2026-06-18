@@ -735,8 +735,19 @@ int lb_begin_forward(lb_t *lb,
     int fd;
     if (uconn) {
         fd = uconn->fd;
-        __atomic_fetch_add(&node->inflight, 1u, __ATOMIC_RELAXED);
-    } else {
+        /* Validate: check if peer closed the idle connection              */
+        char probe;
+        ssize_t rc = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (rc == 0 || (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            /* Connection closed or errored — discard and open fresh one   */
+            upstream_conn_release(uconn, 0);
+            uconn = NULL;
+        } else {
+            __atomic_fetch_add(&node->inflight, 1u, __ATOMIC_RELAXED);
+        }
+    }
+
+    if (!uconn) {
         pthread_mutex_lock(&node->pool_lock);
         if (node->active_count >= node->pool_max) {
             pthread_mutex_unlock(&node->pool_lock);
@@ -754,7 +765,6 @@ int lb_begin_forward(lb_t *lb,
             upstream_node_record_failure(node, lb->pool);
             return -1;
         }
-
         uconn = calloc(1, sizeof(upstream_conn_t));
         if (!uconn) { close(fd); return -1; }
         uconn->fd         = fd;
@@ -774,6 +784,25 @@ int lb_begin_forward(lb_t *lb,
     *out_node  = node;
     *out_uconn = uconn;
     return fd;
+}
+
+static ssize_t decode_chunked(const char *src, size_t src_len, char *dst) {
+    const char *p   = src;
+    const char *end = src + src_len;
+    size_t out = 0;
+    while (p < end) {
+        char *crlf = memmem(p, (size_t)(end - p), "\r\n", 2);
+        if (!crlf) break;
+        size_t chunk_sz = (size_t)strtoul(p, NULL, 16);
+        p = crlf + 2;
+        if (chunk_sz == 0) break;
+        if (p + chunk_sz > end) chunk_sz = (size_t)(end - p);
+        memcpy(dst + out, p, chunk_sz);
+        out += chunk_sz;
+        p   += chunk_sz;
+        if (p + 2 <= end && p[0] == '\r' && p[1] == '\n') p += 2;
+    }
+    return (ssize_t)out;
 }
 
 int lb_finish_forward(lb_t            *lb,
@@ -806,6 +835,7 @@ int lb_finish_forward(lb_t            *lb,
             if (line) line++;
             body_start += 4;
 
+            int is_chunked = 0;
             while (line && line < body_start) {
                 char *end = strstr(line, "\r\n");
                 if (!end || end == line) break;
@@ -831,9 +861,26 @@ int lb_finish_forward(lb_t            *lb,
                         if (use > 0)
                             http_response_set_body(resp, body_start, use);
                     }
+                    if (strcasecmp(line, "transfer-encoding") == 0 &&
+                        strncasecmp(val, "chunked", 7) == 0)
+                        is_chunked = 1;
                 }
                 *end = '\r';
                 line = end + 2;
+            }
+            if (is_chunked) {
+                size_t blen = resp_buf->len - (size_t)(body_start - raw);
+                if (blen > 0) {
+                    char *dbuf = malloc(blen + 1);
+                    if (dbuf) {
+                        ssize_t dlen = decode_chunked(body_start, blen, dbuf);
+                        if (dlen > 0) {
+                            dbuf[dlen] = '\0';
+                            http_response_set_body(resp, dbuf, (size_t)dlen);
+                        }
+                        free(dbuf);
+                    }
+                }
             }
         }
         free(raw);

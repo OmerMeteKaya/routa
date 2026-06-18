@@ -1109,7 +1109,6 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
             route->handler(&req, &resp, route->ctx);
         }
     }
-
     /* H2 async proxy: handler left resp.status == 0 → hand off to upstream */
     if (resp.status == 0 && hc->lb && hc->worker) {
         http_response_destroy(&resp);
@@ -1155,6 +1154,11 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
                            uint8_t flags,
                            struct router *router,
                            struct middleware_chain *chain) {
+
+    if (stream_count(hc) >= (int)hc->peer_max_concurrent_streams) {
+        write_rst_stream(&hc->write_buf, stream_id, H2_ERR_STREAM_CLOSED);
+        return 0;
+    }
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     if ((stream_id & 1) == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
