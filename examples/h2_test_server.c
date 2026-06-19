@@ -93,10 +93,12 @@ static int handle_hello(const http_request_t *req,
 }
 
 int main(int argc, char **argv) {
-    int no_tls = 0;
-    int port   = 18443;
+    int no_tls      = 0;
+    int h2_upstream = 0;
+    int port        = 18443;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-tls") == 0) { no_tls = 1; port = 18080; }
+        if (strcmp(argv[i], "--no-tls") == 0)      { no_tls = 1; port = 18080; }
+        else if (strcmp(argv[i], "--h2-upstream") == 0) { h2_upstream = 1; }
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
     }
 
@@ -138,15 +140,18 @@ int main(int argc, char **argv) {
                          routa_metrics_handler, NULL);
     server_enable_lb(s, &(lb_config_t){
         .algo = LB_ROUND_ROBIN,
-        .pool_max_per_node = 16384,
+        .pool_max_per_node = 150000,  /* H2: 150K streams ≈ 600 conns × 250 */
         .pool_connect_timeout_ms = 2000,
         .pool_idle_timeout_s = 60,
-        .passive_fail_threshold = 10,
-        .passive_recover_threshold = 2,
+        .passive_fail_threshold = 1000,
+        .passive_recover_threshold = 1,
         .max_retries = 1,
         .retry_on_connect_fail = 1,
     });
-    server_lb_add_upstream(s, "127.0.0.1", 9001, 1);
+    if (h2_upstream)
+        server_lb_add_upstream_tls(s, "127.0.0.1", 9001, 1);
+    else
+        server_lb_add_upstream(s, "127.0.0.1", 9001, 1);
    server_lb_route(s, "/proxy/*", 0xFF);
     server_run(s);
     server_free(s);

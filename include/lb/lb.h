@@ -55,6 +55,13 @@ void  lb_free(lb_t *lb);
 int lb_add_upstream(lb_t *lb,
                     const char *host, uint16_t port, int weight);
 
+/* Add a TLS upstream node (H2 via ALPN when supported).                    */
+int lb_add_upstream_tls(lb_t *lb,
+                        const char *host, uint16_t port, int weight);
+
+/* Returns 1 if any upstream node uses TLS (potential H2 path).             */
+int lb_is_tls_upstream(lb_t *lb);
+
 /* Start background threads (health check, idle conn reaper).
  * Call after all upstreams are added, before first request.                */
 int lb_start(lb_t *lb);

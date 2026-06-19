@@ -12,6 +12,7 @@
 struct conn;
 struct worker;
 struct h2_conn;
+struct h2up_conn;
 
 /* Magic value at the start of proxy_ctx_t so the event loop can distinguish
  * upstream-fd events (ptr = proxy_ctx_t*) from client-fd events (ptr = conn_t*). */
@@ -50,6 +51,10 @@ typedef struct proxy_ctx {
     int               resp_chunked;         /* 1 = Transfer-Encoding: chunked */
 
     proxy_state_t     upstream_state;       /* connecting / writing / reading */
+
+    /* H2 upstream (NULL = H1 path) */
+    struct h2up_conn *up_h2up;
+    uint32_t          up_stream_id;
 } proxy_ctx_t;
 
 /* Per-stream proxy context map for H2 — one ctx per concurrent stream.

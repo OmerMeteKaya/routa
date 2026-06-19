@@ -37,6 +37,7 @@
 #include "core/config.h"
 #include "core/proxy.h"
 #include "http/h2.h"
+#include "net/h2_client.h"
 
 
 #if defined(__linux__) && defined(ROUTA_IO_URING)
@@ -191,6 +192,20 @@ void conn_reset_write_state(conn_t *conn) {
     buf_reset(&conn->hdr_buf);
 }
 
+/* Flush a frontend conn after an h2up response delivery.
+ * Called from h2_client.c deliver_response / proc_rst_stream. */
+void worker_conn_flush(worker_t *w, conn_t *conn)
+{
+    if (!conn) return;
+    if (conn->h2 && conn->h2->write_buf.len > 0) {
+        h2_conn_flush(conn->h2);
+        if (conn->h2->write_buf.len > 0)
+            conn_poller_mod(w, conn, POLLER_READ | POLLER_WRITE | POLLER_ET);
+    } else if (!conn->h2 && conn->write_buf.len > 0) {
+        conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
+    }
+}
+
 /* TLS sendfile fallback: read file → tls_write */
 static int send_file_tls(worker_t *w, conn_t *conn,
                          int fd, off_t off, size_t len) {
@@ -211,6 +226,24 @@ static int send_file_tls(worker_t *w, conn_t *conn,
 static void conn_close_and_free(worker_t *w, conn_t *conn) {
     poller_del(w->poller, conn->fd);
     conn_remove(w, conn);
+
+    if (conn->proxy && conn->proxy->upstream_fd >= 0)
+        poller_del(w->poller, conn->proxy->upstream_fd);
+    if (conn->proxy_map) {
+        proxy_stream_map_t *pm = conn->proxy_map;
+        for (int i = 0; i < pm->count; i++) {
+            if (pm->ctxs[i]->upstream_fd >= 0)
+                poller_del(w->poller, pm->ctxs[i]->upstream_fd);
+            /* H2-upstream-backed streams don't own a poller fd themselves
+             * (the shared h2up->fd is separate) — detach so deliver_response
+             * or proc_rst_stream never touches this ctx after it's freed.  */
+            if (pm->ctxs[i]->up_h2up) {
+                h2up_stream_remove(pm->ctxs[i]->up_h2up, pm->ctxs[i]->up_stream_id);
+                pm->ctxs[i]->up_h2up      = NULL;
+                pm->ctxs[i]->up_stream_id = 0;
+            }
+        }
+    }
 
     if (conn->h2 && conn->h2->write_buf.len > 0)
         h2_conn_flush(conn->h2);
@@ -381,10 +414,31 @@ static void handle_events_worker(worker_t *w) {
             continue;
         }
 
-        /* ── Upstream proxy fd event (H2 frontend path) ────────────────── */
-        /* For H2 connections, proxy_begin uses ctx as the poller ptr so
-         * upstream-fd events can be distinguished from client-fd events.
-         * Detect by checking the magic tag at the start of proxy_ctx_t.     */
+        /* ── H2 upstream fd event ──────────────────────────────────────── */
+        if (((uint32_t *)events[i].ptr)[0] == H2UP_MAGIC) {
+            h2up_conn_t *h2up = (h2up_conn_t *)events[i].ptr;
+            /* Handle write before read: flush queued request frames first  */
+            if (!h2up->closed && (events[i].events & POLLER_WRITE))
+                h2up_on_writable(h2up, w);
+            if (!h2up->closed && (events[i].events & POLLER_READ))
+                h2up_on_readable(h2up, w);
+            if (h2up->closed) {
+                /* Remove from per-worker pool */
+                poller_del(w->poller, h2up->fd);
+                for (int j = 0; j < w->h2up_count; j++) {
+                    if (w->h2up_conns[j] == h2up) {
+                        w->h2up_conns[j] =
+                            w->h2up_conns[--w->h2up_count];
+                        break;
+                    }
+                }
+                h2up_conn_free(h2up);
+            }
+            continue;
+        }
+
+        /* ── Upstream proxy fd event (H1 path, H2 frontend) ─────────── */
+        /* proxy_begin sets ctx as the poller ptr; detect by magic tag.    */
         if (((proxy_ctx_t *)events[i].ptr)->magic == PROXY_CTX_MAGIC) {
             proxy_ctx_t *pctx  = (proxy_ctx_t *)events[i].ptr;
             conn_t      *pconn = pctx->conn;
@@ -1183,6 +1237,46 @@ static void *worker_run(void *arg) {
                    (void *)(uintptr_t)w->ws_notify_fd);
     }
 
+    /* Pre-warm H2 upstream connections so the first request burst doesn't
+     * block the event loop creating TLS connections one at a time.           */
+    if (w->lb && lb_is_tls_upstream(w->lb)) {
+        upstream_pool_t *_p = lb_get_pool(w->lb);
+        /* pre_warm: enough conns to cover peak concurrency = pool_max / n_workers
+         * / peer_max_concurrent_streams (250).  Clamp to [2, 16].           */
+        int n_workers = w->loop ? w->loop->n_workers : 1;
+        int pool_max  = _p && _p->node_count > 0
+                      ? _p->nodes[0]->pool_max : 64;
+        /* pre_warm: conns per worker = (pool_max / n_workers) / 250,
+         * so total capacity = pool_max upstream streams. Clamp [2, 32]. */
+        int pre_warm  = 16; //(pool_max / n_workers + 249) / 250; // DÜZENLENECEK
+        if (pre_warm < 2)  pre_warm = 2;
+        if (pre_warm > 32) pre_warm = 32;
+        if (_p) {
+            for (int _ni = 0; _ni < _p->node_count; _ni++) {
+                upstream_node_t *_nd = _p->nodes[_ni];
+                if (!_nd->use_tls) continue;
+                for (int _k = 0; _k < pre_warm; _k++) {
+                    h2up_conn_t *_h = h2up_conn_create(_nd);
+                    if (!_h) break;
+                    _h->worker = w;
+                    if (w->h2up_count >= w->h2up_cap) {
+                        int _nc = w->h2up_cap ? w->h2up_cap * 2 : 32;
+                        h2up_conn_t **_tmp = realloc(w->h2up_conns,
+                                                     (size_t)_nc * sizeof(*_tmp));
+                        if (!_tmp) { h2up_conn_free(_h); break; }
+                        w->h2up_conns = _tmp;
+                        w->h2up_cap   = _nc;
+                    }
+                    w->h2up_conns[w->h2up_count++] = _h;
+                    poller_add(w->poller, _h->fd, POLLER_READ | POLLER_ET, _h);
+                }
+            }
+        }
+        LOG_INFO("worker %d: pre-warmed %d H2 upstream connections (peer_max_streams~%u)",
+         w->worker_id, w->h2up_count,
+         w->h2up_count > 0 ? w->h2up_conns[0]->peer_max_concurrent_streams : 0);
+    }
+
     uint64_t last_ping_sweep_ms = 0;
     uint64_t last_idle_reap_ms  = 0;
     int      drain_init_done    = 0;
@@ -1345,6 +1439,19 @@ static void *worker_run(void *arg) {
             free(c);
         }
     }
+    /* Close all H2 upstream connections owned by this worker */
+    for (int i = 0; i < w->h2up_count; i++) {
+        h2up_conn_t *h2up = w->h2up_conns[i];
+        if (!h2up) continue;
+        poller_del(w->poller, h2up->fd);
+        h2up_conn_close(h2up, w);
+        h2up_conn_free(h2up);
+    }
+    free(w->h2up_conns);
+    w->h2up_conns = NULL;
+    w->h2up_count = 0;
+    w->h2up_cap   = 0;
+
     if (w->server_fd >= 0) net_close(w->server_fd);
     poller_free(w->poller);
     free((void *)w->active_conns);

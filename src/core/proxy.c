@@ -5,9 +5,11 @@
 #include "core/conn.h"
 #include "core/event_loop.h"
 #include "net/poller.h"
+#include "net/h2_client.h"
 #include "http/request.h"
 #include "http/response.h"
 #include "http/h2.h"
+#include "lb/lb.h"
 #include "util/logger.h"
 #include <stdlib.h>
 #include <string.h>
@@ -32,9 +34,17 @@ proxy_ctx_t *proxy_ctx_new(lb_t *lb, struct conn *conn) {
 }
 
 /* Drop the upstream connection, closing the fd exactly once.
- * When uconn exists it owns the fd: upstream_conn_release(.., 0) closes it
- * and fixes pool accounting. Only close directly when there is no uconn. */
+ * For H2 upstream (up_h2up != NULL): just remove the stream slot — the
+ * shared h2up conn is owned by the worker, not this ctx.
+ * For H1: upstream_conn_release closes via pool accounting, or direct close. */
 static void proxy_drop_upstream(proxy_ctx_t *ctx) {
+    if (ctx->up_h2up) {
+        /* H2 upstream: detach this ctx from its stream slot so the
+         * upstream connection's pending I/O never touches a freed ctx. */
+        h2up_stream_remove(ctx->up_h2up, ctx->up_stream_id);
+        ctx->up_h2up      = NULL;
+        ctx->up_stream_id = 0;
+    }
     if (ctx->uconn) {
         upstream_conn_release(ctx->uconn, 0);
         ctx->uconn = NULL;
@@ -43,7 +53,6 @@ static void proxy_drop_upstream(proxy_ctx_t *ctx) {
     }
     ctx->upstream_fd = -1;
 }
-
 void proxy_ctx_free(proxy_ctx_t *ctx) {
     if (!ctx) return;
     proxy_drop_upstream(ctx);
@@ -134,6 +143,35 @@ void proxy_stream_map_free(conn_t *conn) {
     conn->proxy_map = NULL;
 }
 
+/* ── H2 upstream acquire ────────────────────────────────────────────────────*/
+
+/* Find or create an h2up_conn_t for node on this worker.
+ * Searches the per-worker pool first; creates a new (blocking) conn if needed.
+ * Returns NULL on failure (node unreachable or H2 not negotiated). */
+static h2up_conn_t *h2up_acquire_for_node(worker_t *w, upstream_node_t *node)
+{
+    for (int i = 0; i < w->h2up_count; i++) {
+        h2up_conn_t *h = w->h2up_conns[i];
+        if (h->node == node && h2up_has_capacity(h))
+            return h;
+    }
+
+    h2up_conn_t *h = h2up_conn_create(node);
+    if (!h) return NULL;
+    h->worker = w;
+
+    if (w->h2up_count >= w->h2up_cap) {
+        int nc = w->h2up_cap ? w->h2up_cap * 2 : 4;
+        h2up_conn_t **tmp = realloc(w->h2up_conns, (size_t)nc * sizeof(*tmp));
+        if (!tmp) { h2up_conn_free(h); return NULL; }
+        w->h2up_conns = tmp;
+        w->h2up_cap   = nc;
+    }
+    w->h2up_conns[w->h2up_count++] = h;
+    poller_add(w->poller, h->fd, POLLER_READ | POLLER_ET, h);
+    return h;
+}
+
 /* ── proxy_begin ────────────────────────────────────────────────────────────*/
 
 int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
@@ -184,6 +222,42 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
         ctx = conn->proxy;
     }
 
+    /* ── H2 upstream path ────────────────────────────────────────────────── */
+    if (w->lb && lb_is_tls_upstream(w->lb)) {
+        upstream_node_t *unode = lb_pick_node(w->lb, conn->remote_ip);
+        if (!unode) {
+            LOG_WARN("proxy: no H2 upstream node for %s", conn->remote_ip);
+            goto upstream_error;
+        }
+
+        h2up_conn_t *h2up = h2up_acquire_for_node(w, unode);
+        if (!h2up) {
+            LOG_WARN("proxy: failed to acquire H2 upstream to %s:%d",
+                     unode->host, unode->port);
+            goto upstream_error;
+        }
+
+        const char *proto = conn->tls ? "https" : "http";
+        int sid = h2up_begin_stream(h2up, ctx, req, conn->remote_ip, proto);
+        if (sid < 0) {
+            LOG_WARN("proxy: h2up_begin_stream failed (capacity=%d count=%d)",
+                     h2up_has_capacity(h2up), h2up->stream_count);
+            goto upstream_error;
+        }
+
+        ctx->up_h2up      = h2up;
+        ctx->up_stream_id = (uint32_t)sid;
+        ctx->node         = unode;
+        ctx->upstream_fd  = -1;
+
+        /* Arm h2up fd for write — we just queued frames in write_buf */
+        poller_mod(w->poller, h2up->fd,
+                   POLLER_READ | POLLER_WRITE | POLLER_ET, h2up);
+        return 0;
+    }
+
+    /* ── H1 upstream path ────────────────────────────────────────────────── */
+    {
     upstream_node_t *unode = NULL;
     upstream_conn_t *uconn = NULL;
     int ufd = lb_begin_forward(w->lb, req, conn->remote_ip,
@@ -198,16 +272,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     }
     if (ufd < 0) {
         LOG_WARN("proxy: no upstream available for %s", conn->remote_ip);
-        if (conn->h2 && stream_id > 0) {
-            proxy_stream_remove(conn, stream_id);
-            return -1;
-        }
-        http_response_simple(&conn->write_buf, 502,
-                             "Bad Gateway", "text/plain",
-                             "Bad Gateway\n");
-        conn_reset_write_state(conn);
-        conn->state = CONN_WRITING;
-        return 0;
+        goto upstream_error;
     }
 
     ctx->upstream_fd    = ufd;
@@ -219,8 +284,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
                       : PROXY_STATE_CONNECTING;
 
     if (conn->h2 && stream_id > 0) {
-        /* H2: register ctx as the poller ptr so the event loop identifies
-         * which per-stream context owns the upstream fd event.              */
+        /* H2 frontend: register ctx as the poller ptr */
         struct worker *h2_worker = (struct worker *)conn->h2->worker;
         if (!h2_worker) {
             LOG_WARN("proxy_begin: h2_worker is NULL stream_id=%u", stream_id);
@@ -233,6 +297,19 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
         conn->state = CONN_UPSTREAM_CONNECTING;
         poller_add(w->poller, ufd, POLLER_WRITE | POLLER_ET, conn);
     }
+    return 0;
+    } /* H1 block */
+
+upstream_error:
+    if (conn->h2 && stream_id > 0) {
+        proxy_stream_remove(conn, stream_id);
+        return -1;
+    }
+    http_response_simple(&conn->write_buf, 502,
+                         "Bad Gateway", "text/plain",
+                         "Bad Gateway\n");
+    conn_reset_write_state(conn);
+    conn->state = CONN_WRITING;
     return 0;
 }
 

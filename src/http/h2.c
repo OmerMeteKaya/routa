@@ -385,6 +385,7 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
                                    ? (uint32_t)cfg->stream_timeout_ms    : 30000;
     hc->cfg_keepalive_timeout_ms = cfg->keepalive_timeout_ms > 0
                                    ? (uint32_t)cfg->keepalive_timeout_ms : 120000;
+    hc->max_concurrent_streams       = cfg->max_concurrent_streams;
     hc->peer_header_table_size      = 4096;
     hc->peer_max_concurrent_streams = 128;
     hc->peer_max_frame_size         = 16384;
@@ -1155,8 +1156,8 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
                            struct router *router,
                            struct middleware_chain *chain) {
 
-    if (stream_count(hc) >= (int)hc->peer_max_concurrent_streams) {
-        write_rst_stream(&hc->write_buf, stream_id, H2_ERR_STREAM_CLOSED);
+    if (stream_count(hc) >= (int)hc->max_concurrent_streams) {
+        write_rst_stream(&hc->write_buf, stream_id, H2_ERR_REFUSED_STREAM);
         return 0;
     }
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
@@ -1164,11 +1165,6 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
 
     if (length > hc->peer_max_frame_size)
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
-
-    if (stream_count(hc) >= (int)hc->peer_max_concurrent_streams) {
-        write_rst_stream(&hc->write_buf, stream_id, H2_ERR_STREAM_CLOSED);
-        return 0;
-    }
 
     /* ── Strip padding and priority BEFORE creating the stream ────────── */
     const uint8_t *hdr_data = payload;

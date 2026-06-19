@@ -33,6 +33,7 @@ file(GLOB_RECURSE ROUTA_SOURCES
         src/net/poller.c
         src/net/io.c
         src/net/tls.c
+        src/net/h2_client.c
         src/util/*.c
         src/lb/*.c
 )

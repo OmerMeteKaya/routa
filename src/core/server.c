@@ -154,6 +154,15 @@ int server_lb_add_upstream(server_t *s,
     return lb_add_upstream(s->lb, host, port, weight);
 }
 
+int server_lb_add_upstream_tls(server_t *s,
+                                const char *host, uint16_t port, int weight) {
+    if (!s || !s->lb) {
+        LOG_ERROR("server_lb_add_upstream_tls: LB not enabled");
+        return -1;
+    }
+    return lb_add_upstream_tls(s->lb, host, port, weight);
+}
+
 /* Register a route that proxies to the LB.
  * Call after all upstreams are added.
  * path: e.g. "/api/"  methods: HTTP_GET_M|HTTP_POST_M|...             */

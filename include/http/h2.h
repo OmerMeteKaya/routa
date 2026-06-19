@@ -133,6 +133,9 @@ typedef struct h2_conn {
     int32_t           recv_window;
     uint32_t          initial_send_window;
 
+    /* Our SETTINGS (what we sent to the peer) */
+    uint32_t          max_concurrent_streams;
+
     /* Peer SETTINGS (updated on each SETTINGS frame from client)         */
     uint32_t          peer_header_table_size;
     uint32_t          peer_max_concurrent_streams;

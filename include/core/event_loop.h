@@ -70,6 +70,11 @@ struct worker {
     routa_h2_config_t h2_cfg;
 
     conn_slab_t    *slab;
+
+    /* Per-worker H2 upstream connection pool (no cross-thread sharing) */
+    struct h2up_conn **h2up_conns;
+    int                h2up_count;
+    int                h2up_cap;
 };
 
 event_loop_t *event_loop_new(int port, int n_threads);
@@ -114,8 +119,12 @@ tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop);
 
 void event_loop_set_h2_config(event_loop_t *loop,
                                const routa_h2_config_t *cfg);
-/* ── Write path helpers (also used by proxy.c) ─────────────────────────── */
+/* ── Write path helpers (also used by proxy.c and h2_client.c) ─────────── */
 void conn_reset_write_state(conn_t *conn);
 void conn_prepare_writev(conn_t *conn, http_response_t *resp);
+
+/* Flush a frontend conn's H2 write_buf (or arm write for H1) after an
+ * h2up response has been delivered from a worker event.                    */
+void worker_conn_flush(worker_t *w, conn_t *conn);
 
 #endif /* ROUTA_CORE_EVENT_LOOP_H */

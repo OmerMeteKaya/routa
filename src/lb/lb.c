@@ -114,6 +114,8 @@ struct lb {
     volatile uint64_t stat_requests;
     volatile uint64_t stat_failed;
     volatile uint64_t stat_retries;
+
+    int has_tls_upstreams;    /* >0 when any node has use_tls=1             */
 };
 upstream_pool_t *lb_get_pool(lb_t *lb) {
     return lb ? lb->pool : NULL;
@@ -660,6 +662,39 @@ int lb_add_upstream(lb_t *lb, const char *host, uint16_t port, int weight) {
     return 0;
 }
 
+int lb_add_upstream_tls(lb_t *lb, const char *host, uint16_t port, int weight)
+{
+    upstream_node_t *n = calloc(1, sizeof(upstream_node_t));
+    if (!n) return -1;
+
+    strncpy(n->host, host, sizeof(n->host) - 1);
+    n->port     = port;
+    n->weight   = weight > 0 ? weight : 1;
+    n->state    = NODE_UP;
+    n->pool_max = lb->cfg.pool_max_per_node;
+    n->hc       = lb->cfg.hc;
+    n->use_tls  = 1;
+
+    pthread_mutex_init(&n->pool_lock, NULL);
+    pthread_spin_init(&n->state_lock, PTHREAD_PROCESS_PRIVATE);
+
+    if (upstream_pool_add_node(lb->pool, n) < 0) {
+        pthread_mutex_destroy(&n->pool_lock);
+        pthread_spin_destroy(&n->state_lock);
+        free(n);
+        return -1;
+    }
+
+    lb->has_tls_upstreams = 1;
+    LOG_INFO("lb: added TLS upstream %s:%d weight=%d", host, port, n->weight);
+    return 0;
+}
+
+int lb_is_tls_upstream(lb_t *lb)
+{
+    return lb && lb->has_tls_upstreams;
+}
+
 int lb_start(lb_t *lb) {
     /* Build consistent hash ring if needed */
     if (lb->cfg.algo == LB_CONSISTENT_HASH) {
@@ -751,7 +786,8 @@ int lb_begin_forward(lb_t *lb,
         pthread_mutex_lock(&node->pool_lock);
         if (node->active_count >= node->pool_max) {
             pthread_mutex_unlock(&node->pool_lock);
-            LOG_WARN("lb_begin_forward: pool exhausted %s:%d", node->host, node->port);
+            LOG_WARN("lb_begin_forward: pool exhausted %s:%d active=%d max=%d",
+            node->host, node->port, node->active_count, node->pool_max);
             return -1;
         }
         node->active_count++;

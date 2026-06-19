@@ -109,6 +109,9 @@ struct upstream_node {
     /* Resolved address (cached) */
     struct sockaddr_in addr;
     int                addr_resolved;
+
+    /* TLS upstream: 1 = connect with TLS, try ALPN h2 */
+    int                use_tls;
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════

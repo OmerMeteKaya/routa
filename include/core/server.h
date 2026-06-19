@@ -37,6 +37,8 @@ int       server_enable_ocsp_stapling(server_t *s, const char *ocsp_file);
 int  server_enable_lb(server_t *s, const lb_config_t *cfg);
 int  server_lb_add_upstream(server_t *s,
                              const char *host, uint16_t port, int weight);
+int  server_lb_add_upstream_tls(server_t *s,
+                                 const char *host, uint16_t port, int weight);
 
 /* Create server from config struct / file */
 server_t *server_from_config(const routa_config_t *cfg);
