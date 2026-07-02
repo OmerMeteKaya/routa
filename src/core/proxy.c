@@ -293,9 +293,24 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
             return -1;
         }
         poller_add(h2_worker->poller, ufd, POLLER_WRITE | POLLER_ET, ctx);
+        /* Eager write: ONLY for pooled (idle) connections, which are
+         * already connected and typically already writable RIGHT NOW.
+         * With EPOLLET, adding interest in an fd already in the ready
+         * state is not guaranteed to generate a fresh edge. Restricted to
+         * PROXY_STATE_WRITING (pooled) — a fresh PROXY_STATE_CONNECTING
+         * socket hasn't completed its handshake yet, and calling
+         * check_connected()/attempting a write before the real POLLER_WRITE
+         * edge for that case is unnecessary (fresh connects reliably
+         * deliver their first edge) and risks racing the connect(). */
+        if (ctx->upstream_state == PROXY_STATE_WRITING)
+            proxy_on_upstream_writable(h2_worker, conn, ctx);
     } else {
         conn->state = CONN_UPSTREAM_CONNECTING;
         poller_add(w->poller, ufd, POLLER_WRITE | POLLER_ET, conn);
+        /* Same eager-write rationale as the H2 branch above, for the H1
+         * frontend path. */
+        if (ctx->upstream_state == PROXY_STATE_WRITING)
+            proxy_on_upstream_writable(w, conn, ctx);
     }
     return 0;
     } /* H1 block */
@@ -428,7 +443,14 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
             const char *p = memchr(raw, '\n', (size_t)(hdr_end - raw));
             if (p) p++;   /* skip status line */
             while (p && p < hdr_end) {
-                const char *eol = memmem(p, (size_t)(hdr_end - p), "\r\n", 2);
+                /* Include the terminator's own \r\n bytes in the search
+                 * window — otherwise the last header before the blank line
+                 * (its \r\n lives at [hdr_end, hdr_end+2), just outside the
+                 * old [p, hdr_end) window) is silently dropped. If that
+                 * header happens to be Content-Length, resp_content_length
+                 * stays -1 forever and the connection hangs indefinitely
+                 * waiting for a "complete" response that already arrived. */
+                const char *eol = memmem(p, (size_t)(hdr_end + 2 - p), "\r\n", 2);
                 if (!eol || eol == p) break;
                 const char *col = memchr(p, ':', (size_t)(eol - p));
                 if (col) {

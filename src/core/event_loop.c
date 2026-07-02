@@ -466,6 +466,28 @@ static void handle_events_worker(worker_t *w) {
 
         /* HUP / ERR */
         if (events[i].events & (POLLER_HUP | POLLER_ERR)) {
+            /* The H1 async-proxy upstream fd shares the same poller tag
+             * (data.ptr == conn) as the client fd — see proxy_begin()'s
+             * poller_add(w->poller, ufd, POLLER_WRITE | POLLER_ET, conn).
+             * When connect() to a dead/refusing upstream fails fast, the
+             * kernel reports EPOLLERR|EPOLLHUP on THAT fd, but since it
+             * carries the same conn pointer, without this check it would
+             * fall straight into the generic "tear down the client" path
+             * below — closing the client connection with no response at
+             * all (curl sees "Empty reply from server") instead of giving
+             * proxy_on_upstream_writable()/readable() a chance to inspect
+             * SO_ERROR and send a proper 502 Bad Gateway. Route to the
+             * matching proxy handler first; it already knows how to detect
+             * and report the failure. */
+            if (conn->state == CONN_UPSTREAM_CONNECTING ||
+                conn->state == CONN_UPSTREAM_WRITING) {
+                proxy_on_upstream_writable(w, conn, conn->proxy);
+                goto handle_state;
+            }
+            if (conn->state == CONN_UPSTREAM_READING) {
+                proxy_on_upstream_readable(w, conn, conn->proxy);
+                goto handle_state;
+            }
             if (conn->state == CONN_TLS_HANDSHAKE) {
                 poller_del(w->poller, conn->fd);
                 conn_remove(w, conn);
@@ -647,7 +669,7 @@ static void handle_events_worker(worker_t *w) {
                     continue;
                     }
             }
-            
+
             if (pr == -1) {
                 /* 400 — legacy write_buf path */
                 buf_reset(&conn->write_buf);
@@ -960,11 +982,26 @@ static void handle_events_worker(worker_t *w) {
                 }
 
                 /* ── Upstream connecting ── */
-            if (conn->state == CONN_UPSTREAM_CONNECTING ||
-                conn->state == CONN_UPSTREAM_WRITING) {
-                proxy_on_upstream_writable(w, conn, conn->proxy);
-                goto handle_state;
-                }
+                if (conn->state == CONN_UPSTREAM_CONNECTING ||
+                                conn->state == CONN_UPSTREAM_WRITING) {
+                                proxy_on_upstream_writable(w, conn, conn->proxy);
+                                /* If proxy_on_upstream_writable() buffered an error response
+                                 * (e.g. 502 after an upstream connect failure) and moved us
+                                 * to CONN_WRITING, attempt to flush it immediately instead
+                                 * of relying solely on the next epoll WRITE event. In ET
+                                 * mode, re-arming the poller via conn_poller_mod() when the
+                                 * fd is already writable is not guaranteed to generate a
+                                 * fresh edge, which can strand the buffered response and
+                                 * leave the client with a bare connection close (curl 000)
+                                 * instead of the intended 502. */
+                                if (conn->state == CONN_WRITING && conn->write_buf.len > 0 &&
+                                    conn->hdr_buf.len == 0 && conn->resp_body_ptr == NULL) {
+                                    ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf,
+                                                                  conn->tls);
+                                    if (n < 0) { conn->state = CONN_CLOSING; goto handle_state; }
+                                }
+                                goto handle_state;
+                                }
                 /* TLS handshake */
                 if (conn->state == CONN_TLS_HANDSHAKE) {
                     int hs = tls_handshake(conn->tls);
@@ -1159,6 +1196,28 @@ static void handle_events_worker(worker_t *w) {
                         conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
                         break;
             case CONN_WRITING:
+                        /* Attempt an immediate flush of any buffered response
+                         * (e.g. a 502 from proxy_begin()'s synchronous upstream_error
+                         * path, or from proxy_on_upstream_writable()) before relying
+                         * on the next epoll WRITE event. In ET mode, re-arming the
+                         * poller via conn_poller_mod() when the fd is already
+                         * writable is not guaranteed to generate a fresh edge, which
+                         * can strand the buffered response and leave the client with
+                         * a bare connection close (curl 000) instead of the intended
+                         * HTTP response. Guarded to the plain write_buf path only —
+                         * CONN_SENDFILE and writev/hdr_buf responses use a different
+                         * write mechanism and must not be touched here. */
+                        if (conn->write_buf.len > 0 && conn->hdr_buf.len == 0 &&
+                            conn->resp_body_ptr == NULL) {
+                            ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf,
+                                                          conn->tls);
+                            if (n < 0) {
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                        }
+                        conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
+                        break;
             case CONN_SENDFILE:
                         conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
                         break;
@@ -1779,4 +1838,3 @@ void event_loop_set_shutdown_timeout(event_loop_t *loop, int ms) {
     if (!loop || ms <= 0) return;
     loop->shutdown_timeout_ms = ms;
 }
-
