@@ -109,6 +109,17 @@ int lb_begin_forward(lb_t *lb,
                      upstream_node_t     **out_node,       /* out: for record_* */
                      upstream_conn_t     **out_uconn);     /* out: for release   */
 
+/* Like lb_begin_forward() but uses a node the caller has already selected
+ * via lb_pick_node(), instead of picking internally. Used by proxy_begin()
+ * so node selection happens exactly once per request. */
+int lb_begin_forward_to_node(lb_t *lb,
+                             upstream_node_t      *node,
+                             const http_request_t *req,
+                             const char            *client_ip,
+                             const char            *proto,
+                             buf_t                 *req_buf,
+                             upstream_conn_t      **out_uconn);
+
 int lb_finish_forward(lb_t            *lb,
                       buf_t           *resp_buf,           /* raw upstream bytes */
                       http_response_t *resp,               /* out: parsed resp   */

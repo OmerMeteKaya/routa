@@ -743,16 +743,14 @@ void lb_free(lb_t *lb) {
 
 /* ── Async forwarding ───────────────────────────────────────────────────────*/
 
-int lb_begin_forward(lb_t *lb,
-                     const http_request_t *req,
-                     const char           *client_ip,
-                     const char           *proto,
-                     buf_t                *req_buf,
-                     upstream_node_t     **out_node,
-                     upstream_conn_t     **out_uconn)
+static int begin_forward_on_node(lb_t *lb,
+                                  upstream_node_t      *node,
+                                  const http_request_t *req,
+                                  const char            *client_ip,
+                                  const char            *proto,
+                                  buf_t                 *req_buf,
+                                  upstream_conn_t      **out_uconn)
 {
-    upstream_node_t *node = lb_pick_node(lb, client_ip);
-    if (!node) { LOG_WARN("lb_begin_forward: no upstream"); return -1; }
 
     /* Try idle pooled connection first */
     upstream_conn_t *uconn = NULL;
@@ -817,9 +815,38 @@ int lb_begin_forward(lb_t *lb,
         return -1;
     }
 
-    *out_node  = node;
     *out_uconn = uconn;
     return fd;
+}
+
+int lb_begin_forward(lb_t *lb,
+                     const http_request_t *req,
+                     const char           *client_ip,
+                     const char           *proto,
+                     buf_t                *req_buf,
+                     upstream_node_t     **out_node,
+                     upstream_conn_t     **out_uconn)
+{
+    upstream_node_t *node = lb_pick_node(lb, client_ip);
+    if (!node) { LOG_WARN("lb_begin_forward: no upstream"); return -1; }
+
+    int fd = begin_forward_on_node(lb, node, req, client_ip, proto,
+                                   req_buf, out_uconn);
+    if (fd >= 0) *out_node = node;
+    return fd;
+}
+
+int lb_begin_forward_to_node(lb_t *lb,
+                             upstream_node_t      *node,
+                             const http_request_t *req,
+                             const char            *client_ip,
+                             const char            *proto,
+                             buf_t                 *req_buf,
+                             upstream_conn_t      **out_uconn)
+{
+    if (!node) return -1;
+    return begin_forward_on_node(lb, node, req, client_ip, proto,
+                                 req_buf, out_uconn);
 }
 
 static ssize_t decode_chunked(const char *src, size_t src_len, char *dst) {

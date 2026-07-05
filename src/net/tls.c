@@ -382,7 +382,7 @@ int tls_handshake(tls_conn_t *tc) {
 /* ── I/O ───────────────────────────────────────────────────────────────────*/
 
 ssize_t tls_read(tls_conn_t *tc, void *buf, size_t len) {
-    if (!tc || !buf || !tc->handshake_done) return -1;
+    if (!tc || !buf || !tc->handshake_done) return -2;
 
     int n = SSL_read(tc->ssl, buf, (int)len);
     if (n > 0) return n;
@@ -392,13 +392,16 @@ ssize_t tls_read(tls_conn_t *tc, void *buf, size_t len) {
         case SSL_ERROR_WANT_WRITE:  return -1;
         case SSL_ERROR_ZERO_RETURN: return  0;
         default:
-            log_ssl_error("TLS read");
-            return -1;
+            if (ERR_peek_last_error() != 0)
+                log_ssl_error("TLS read");
+            else
+                ERR_clear_error();
+            return -2;
     }
 }
 
 ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len) {
-    if (!tc || !buf || !tc->handshake_done) return -1;
+    if (!tc || !buf || !tc->handshake_done) return -2;
 
     int n = SSL_write(tc->ssl, buf, (int)len);
     if (n > 0) return n;
@@ -409,12 +412,21 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len) {
         case SSL_ERROR_ZERO_RETURN: return  0;
         default: {
             unsigned long ssl_err = ERR_peek_last_error();
-            if (ERR_GET_REASON(ssl_err) == ERR_R_SYS_LIB || errno == EPIPE || errno == ECONNRESET) {
+            /* Treat a genuinely empty error queue the same as a syscall-level
+             * disconnect: log nothing and just drain/clear. Calling
+             * log_ssl_error() here would call ERR_get_error() on an empty
+             * queue, which returns 0 and formats as a meaningless
+             * "error:00000000:lib(0)::reason(0)" string — and since it
+             * doesn't consume a real error, every future write on this
+             * same broken connection re-triggers the identical empty log
+             * line, potentially without bound. */
+            if (ssl_err == 0 || ERR_GET_REASON(ssl_err) == ERR_R_SYS_LIB ||
+                errno == EPIPE || errno == ECONNRESET) {
                 ERR_clear_error();
             } else {
                 log_ssl_error("TLS write");
             }
-            return -1;
+            return -2;
         }
     }
 }

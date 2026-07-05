@@ -201,8 +201,46 @@ void worker_conn_flush(worker_t *w, conn_t *conn)
         h2_conn_flush(conn->h2);
         if (conn->h2->write_buf.len > 0)
             conn_poller_mod(w, conn, POLLER_READ | POLLER_WRITE | POLLER_ET);
-    } else if (!conn->h2 && conn->write_buf.len > 0) {
-        conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
+        return;
+    }
+    if (conn->h2) return;
+
+    /* H1 frontend response, queued via conn_prepare_writev() (the path used
+     * by deliver_response() for H2-upstream responses, and by most normal
+     * H1 responses): attempt an immediate flush using the SAME mechanism
+     * as the CONN_WRITING case in handle_events_worker() (io_writev_response
+     * for hdr_buf/resp_body_ptr, or io_write_from_buf for the legacy
+     * write_buf error-response path) before relying on the next epoll
+     * WRITE event. In ET mode, re-arming the poller via conn_poller_mod()
+     * when the client fd is already writable (very likely on loopback / a
+     * fast client) is not guaranteed to produce a fresh edge — without an
+     * eager flush here, a response queued by deliver_response() can sit in
+     * hdr_buf/resp_body_ptr forever and the client sees a bare connection
+     * hang/close instead of the response. */
+    if (conn->hdr_buf.len > 0 || conn->resp_body_ptr != NULL) {
+        http_response_t view;
+        memset(&view, 0, sizeof(view));
+        view.body_fd  = -1;
+        view.body     = (char *)conn->resp_body_ptr;
+        view.body_len = conn->resp_body_len;
+
+        ssize_t n = io_writev_response(conn->fd, conn->tls, &view,
+                                       &conn->hdr_buf, &conn->writev_written);
+        if (n < 0) {
+            conn->state = CONN_CLOSING;
+            return;
+        }
+        size_t total = conn->hdr_buf.len + conn->resp_body_len;
+        if (total > 0 && conn->writev_written < total)
+            conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
+    } else if (conn->write_buf.len > 0) {
+        ssize_t n = io_write_from_buf(conn->fd, &conn->write_buf, conn->tls);
+        if (n < 0) {
+            conn->state = CONN_CLOSING;
+            return;
+        }
+        if (conn->write_buf.len > 0)
+            conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
     }
 }
 
@@ -417,11 +455,36 @@ static void handle_events_worker(worker_t *w) {
         /* ── H2 upstream fd event ──────────────────────────────────────── */
         if (((uint32_t *)events[i].ptr)[0] == H2UP_MAGIC) {
             h2up_conn_t *h2up = (h2up_conn_t *)events[i].ptr;
-            /* Handle write before read: flush queued request frames first  */
-            if (!h2up->closed && (events[i].events & POLLER_WRITE))
-                h2up_on_writable(h2up, w);
-            if (!h2up->closed && (events[i].events & POLLER_READ))
-                h2up_on_readable(h2up, w);
+            /* Drain both directions in a flat loop on this single
+             * epoll_wait turn, instead of nesting h2up_on_readable() and
+             * h2up_on_writable() inside each other (as used to happen via
+             * calls buried inside those two functions). Nested calls
+             * created an ET-mode edge-timing hazard: a response could
+             * arrive from the upstream in the microsecond window *between*
+             * a nested call re-arming poller interest and control returning
+             * to the outer function, and that edge would never be observed
+             * again until the connection was force-closed. Looping here,
+             * at the top level, right after epoll_wait, closes that window:
+             * we keep alternating write/read until BOTH report no more
+             * progress (write_buf empty and no more frames parsed from
+             * read_buf), all before this epoll_wait turn ends. Capped
+             * iteration count is a defensive bound, not expected to bite in
+             * practice (a handful of queued control frames at most). */
+            for (int _drain = 0; _drain < 8 && !h2up->closed; _drain++) {
+                size_t wb_before = h2up->write_buf.len;
+                size_t rb_before = h2up->read_buf.len;
+
+                if (!h2up->closed && h2up->write_buf.len > 0)
+                    h2up_on_writable(h2up, w);
+                if (!h2up->closed)
+                    h2up_on_readable(h2up, w);
+
+                if (h2up->closed) break;
+                /* Stop once neither buffer changed size this round. */
+                if (h2up->write_buf.len == wb_before &&
+                    h2up->read_buf.len  == rb_before)
+                    break;
+            }
             if (h2up->closed) {
                 /* Remove from per-worker pool */
                 poller_del(w->poller, h2up->fd);
@@ -1307,7 +1370,7 @@ static void *worker_run(void *arg) {
                       ? _p->nodes[0]->pool_max : 64;
         /* pre_warm: conns per worker = (pool_max / n_workers) / 250,
          * so total capacity = pool_max upstream streams. Clamp [2, 32]. */
-        int pre_warm  = 16; //(pool_max / n_workers + 249) / 250; // DÜZENLENECEK
+        int pre_warm  = 2; //(pool_max / n_workers + 249) / 250; // DÜZENLENECEK — temporarily lowered from 16 for debugging (CPU-safety, was causing system slowdown at 48 workers)
         if (pre_warm < 2)  pre_warm = 2;
         if (pre_warm > 32) pre_warm = 32;
         if (_p) {
@@ -1327,7 +1390,7 @@ static void *worker_run(void *arg) {
                         w->h2up_cap   = _nc;
                     }
                     w->h2up_conns[w->h2up_count++] = _h;
-                    poller_add(w->poller, _h->fd, POLLER_READ | POLLER_ET, _h);
+                    poller_add(w->poller, _h->fd, POLLER_READ, _h);
                 }
             }
         }

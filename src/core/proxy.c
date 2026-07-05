@@ -222,14 +222,20 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
         ctx = conn->proxy;
     }
 
-    /* ── H2 upstream path ────────────────────────────────────────────────── */
-    if (w->lb && lb_is_tls_upstream(w->lb)) {
-        upstream_node_t *unode = lb_pick_node(w->lb, conn->remote_ip);
-        if (!unode) {
-            LOG_WARN("proxy: no H2 upstream node for %s", conn->remote_ip);
-            goto upstream_error;
-        }
+    /* Pick upstream node ONCE; branch per-node on use_tls, not pool-wide.
+     * A mixed pool (some H1, some TLS/H2 nodes) must not force every H1
+     * node's traffic through the H2/TLS path just because SOME node in
+     * the pool is TLS. */
+    upstream_node_t *unode = lb_pick_node(w->lb, conn->remote_ip);
+    if (!unode) {
+        LOG_WARN("proxy: no upstream node for %s", conn->remote_ip);
+        goto upstream_error;
+    }
+    LOG_WARN("DEBUG proxy_begin: path=%s picked node=%s:%d use_tls=%d",
+             req && req->path ? req->path : "(null)",
+             unode->host, unode->port, unode->use_tls);
 
+    if (unode->use_tls) {
         h2up_conn_t *h2up = h2up_acquire_for_node(w, unode);
         if (!h2up) {
             LOG_WARN("proxy: failed to acquire H2 upstream to %s:%d",
@@ -252,23 +258,42 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
 
         /* Arm h2up fd for write — we just queued frames in write_buf */
         poller_mod(w->poller, h2up->fd,
-                   POLLER_READ | POLLER_WRITE | POLLER_ET, h2up);
+                   POLLER_READ | POLLER_WRITE, h2up);
+        /* Eager write: h2up connections are frequently reused/pre-warmed
+         * (see worker_run()'s pre_warm block) and are typically already
+         * connected and writable at this point. Same ET-mode caveat as
+         * the H1 pooled-connection path: re-arming interest via
+         * poller_mod() on an fd that's already in the ready state is not
+         * guaranteed to produce a fresh edge, which can strand the queued
+         * HEADERS/DATA frames until an edge that never comes. Flush once,
+         * synchronously, right after arming — h2up_on_writable() already
+         * handles the EAGAIN case correctly if the fd isn't ready yet. */
+        h2up_on_writable(h2up, w);
         return 0;
     }
 
     /* ── H1 upstream path ────────────────────────────────────────────────── */
     {
-    upstream_node_t *unode = NULL;
     upstream_conn_t *uconn = NULL;
-    int ufd = lb_begin_forward(w->lb, req, conn->remote_ip,
-                               conn->tls ? "https" : "http",
-                               &ctx->req_buf, &unode, &uconn);
+    int ufd = lb_begin_forward_to_node(w->lb, unode, req, conn->remote_ip,
+                                       conn->tls ? "https" : "http",
+                                       &ctx->req_buf, &uconn);
     if (ufd < 0 && ctx->attempt == 0) {
         ctx->attempt = 1;
         buf_reset(&ctx->req_buf);
-        ufd = lb_begin_forward(w->lb, req, conn->remote_ip,
-                               conn->tls ? "https" : "http",
-                               &ctx->req_buf, &unode, &uconn);
+        /* Re-pick: maybe another node is UP now. If the retry lands on a
+         * TLS node, don't cross into the H2 path mid-attempt — just fail
+         * this attempt and let the normal error handling below take over
+         * (502). Crossing protocols mid-retry is out of scope. */
+        upstream_node_t *retry_node = lb_pick_node(w->lb, conn->remote_ip);
+        if (retry_node && !retry_node->use_tls) {
+            unode = retry_node;
+            ufd = lb_begin_forward_to_node(w->lb, unode, req, conn->remote_ip,
+                                           conn->tls ? "https" : "http",
+                                           &ctx->req_buf, &uconn);
+        } else {
+            ufd = -1;
+        }
     }
     if (ufd < 0) {
         LOG_WARN("proxy: no upstream available for %s", conn->remote_ip);

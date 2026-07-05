@@ -465,6 +465,8 @@ int h2up_begin_stream(h2up_conn_t *h2up, proxy_ctx_t *ctx,
 
     uint32_t stream_id = h2up->next_stream_id;
     h2up->next_stream_id += 2;
+    LOG_WARN("DEBUG h2up_begin_stream: fd=%d stream_id=%u path=%s",
+             h2up->fd, stream_id, req && req->path ? req->path : "(null)");
 
     /* Init stream slot */
     memset(s, 0, sizeof(*s));
@@ -623,6 +625,8 @@ static const char *status_reason(int status)
 static void deliver_response(h2up_conn_t *h2up, h2up_stream_t *s, worker_t *w)
 {
     proxy_ctx_t *ctx = s->ctx;
+    LOG_WARN("DEBUG deliver_response: ENTER ctx=%p status=%d body_len=%zu",
+             (void*)ctx, s->resp.status, s->body_buf.len);
     if (!ctx) return;
 
     conn_t     *conn      = ctx->conn;
@@ -805,6 +809,8 @@ static void proc_data(h2up_conn_t *h2up, uint32_t stream_id,
 
     if (flags & FL_END_STREAM) {
         s->end_stream = 1;
+        LOG_WARN("DEBUG proc_data: stream=%u end_stream=1 hdr_done=%d calling_deliver=%d",
+                 stream_id, s->hdr_done, s->hdr_done ? 1 : 0);
         if (s->hdr_done) deliver_response(h2up, s, w);
     }
 }
@@ -874,6 +880,9 @@ static void proc_rst_stream(h2up_conn_t *h2up, uint32_t stream_id, worker_t *w)
 void h2up_conn_close(h2up_conn_t *h2up, worker_t *w)
 {
     if (!h2up || h2up->closed) return;
+    LOG_WARN("DEBUG h2up_close: fd=%d next_stream_id=%u stream_count=%d peer_max_streams=%u goaway=%d",
+             h2up->fd, h2up->next_stream_id, h2up->stream_count,
+             h2up->peer_max_concurrent_streams, h2up->goaway_received);
     h2up->closed = 1;
 
     for (int i = 0; i < H2UP_MAX_STREAMS; i++) {
@@ -900,7 +909,15 @@ int h2up_on_readable(h2up_conn_t *h2up, worker_t *w)
                 h2up_conn_close(h2up, w);
                 return -1;
             }
-            break;  /* EAGAIN */
+            if (n == -2) {
+                /* Permanent TLS error — connection is broken, must not
+                 * be left in the pool for a future request to pick up
+                 * and hang against. See the matching fix in
+                 * h2up_on_writable() for the full rationale. */
+                h2up_conn_close(h2up, w);
+                return -1;
+            }
+            break;  /* EAGAIN (n == -1) */
         }
     }
 
@@ -921,6 +938,9 @@ int h2up_on_readable(h2up_conn_t *h2up, worker_t *w)
             break;   /* wait for more data */
 
         const uint8_t *payload = p + H2_FRAME_HDR_SZ;
+
+        LOG_WARN("DEBUG frame: fd=%d type=%u flags=%u stream_id=%u len=%u",
+                 h2up->fd, frame_type, frame_flags, stream_id, frame_len);
 
         switch (frame_type) {
         case FRM_SETTINGS:
@@ -992,12 +1012,18 @@ int h2up_on_readable(h2up_conn_t *h2up, worker_t *w)
         buf_consume(&h2up->read_buf, (size_t)(H2_FRAME_HDR_SZ + frame_len));
     }
 
-    /* Flush any SETTINGS ACK / PING ACK / WINDOW_UPDATE we queued */
+    /* NOTE: any SETTINGS ACK / PING ACK / WINDOW_UPDATE frames queued into
+     * write_buf during frame processing above are intentionally NOT flushed
+     * here via a nested h2up_on_writable() call. See h2up_service() in
+     * event_loop.c, which drains read+write in a flat loop after this
+     * function returns — nested read/write calls between these two
+     * functions previously created an ET-mode edge-timing hazard where a
+     * response arriving during the nested call window could be missed
+     * until the connection was force-closed. Just re-arm for both
+     * directions if we still have data to send. */
     if (h2up->write_buf.len > 0 && !h2up->closed) {
-        h2up_on_writable(h2up, w);
-        if (h2up->write_buf.len > 0)
-            poller_mod(w->poller, h2up->fd,
-                       POLLER_READ | POLLER_WRITE | POLLER_ET, h2up);
+        poller_mod(w->poller, h2up->fd,
+                   POLLER_READ | POLLER_WRITE, h2up);
     }
 
     if (h2up->closed) return -1;
@@ -1008,6 +1034,8 @@ int h2up_on_readable(h2up_conn_t *h2up, worker_t *w)
 
 int h2up_on_writable(h2up_conn_t *h2up, worker_t *w)
 {
+    LOG_WARN("DEBUG h2up_writable: ENTER fd=%d closed=%d write_buf.len=%zu",
+             h2up->fd, h2up->closed, h2up->write_buf.len);
     if (h2up->closed || h2up->write_buf.len == 0) return 0;
 
     buf_t *wb = &h2up->write_buf;
@@ -1016,24 +1044,45 @@ int h2up_on_writable(h2up_conn_t *h2up, worker_t *w)
 
     while (rem > 0) {
         ssize_t n = tls_write(h2up->tls, buf_data(wb) + off, rem);
+        LOG_WARN("DEBUG h2up_writable: tls_write returned %zd (rem=%zu off=%zu)",
+                 n, rem, off);
         if (n > 0) {
             off += (size_t)n;
             rem -= (size_t)n;
+        } else if (n == -2) {
+            /* Permanent error (or clean EOF via n==0 handled by the
+             * n > 0 branch above not matching) — this connection is
+             * broken and must not be reused. Without this check, a
+             * dead h2up connection stays in the pool forever: every
+             * future request that picks it calls tls_write() again,
+             * gets the same permanent error, and is silently treated
+             * as "try again later" — the request hangs and the
+             * connection is never retired. */
+            if (off > 0) buf_consume(wb, off);
+            h2up_conn_close(h2up, w);
+            return -1;
         } else {
-            /* EAGAIN / WANT_WRITE */
+            /* EAGAIN / WANT_WRITE (n == -1) */
             break;
         }
     }
 
     if (off > 0) buf_consume(wb, off);
 
-    /* Re-arm poller */
+    /* Re-arm poller. NOTE: we deliberately do NOT nest-call
+     * h2up_on_readable() here anymore (see h2up_service() in
+     * event_loop.c) — nesting read/write calls between these two
+     * functions created an ET-mode edge-timing hazard where a response
+     * arriving during the nested call window could be silently missed
+     * until the connection was force-closed by the caller. The caller
+     * (h2up_service) drains both directions in a flat loop right after
+     * this function returns, on the same epoll_wait turn. */
     if (wb->len > 0) {
         poller_mod(w->poller, h2up->fd,
-                   POLLER_READ | POLLER_WRITE | POLLER_ET, h2up);
+                   POLLER_READ | POLLER_WRITE, h2up);
     } else {
         poller_mod(w->poller, h2up->fd,
-                   POLLER_READ | POLLER_ET, h2up);
+                   POLLER_READ, h2up);
     }
     return 0;
 }

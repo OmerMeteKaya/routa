@@ -104,7 +104,7 @@ conn_slab_t *conn_slab_new(int capacity) {
     }
     slab->freelist = &slab->slots[0];
 
-    LOG_INFO("conn_slab: allocated %d slots (%.1f MB)",
+    LOG_DEBUG("conn_slab: allocated %d slots (%.1f MB)",
              capacity,
              (double)((size_t)capacity *
                  (sizeof(conn_t) + CONN_RECV_BUF_SZ + CONN_SEND_BUF_SZ))
