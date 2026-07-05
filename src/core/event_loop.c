@@ -36,6 +36,7 @@
 
 #include "core/config.h"
 #include "core/proxy.h"
+#include "core/server.h"
 #include "http/h2.h"
 #include "net/h2_client.h"
 
@@ -62,7 +63,9 @@ struct event_loop {
     int            max_connections;
     worker_t      *workers;
     tls_context_t *tls_ctx;
-    lb_t          *lb;
+    lb_t          *lb;              /* legacy: == lbs[0] when lb_count > 0 */
+    lb_t          *lbs[ROUTA_MAX_LB_POOLS];
+    int            lb_count;
     int            should_stop;
     routa_h2_config_t h2_cfg;
 
@@ -921,10 +924,24 @@ static void handle_events_worker(worker_t *w) {
                     matched_route->handler(&req, &resp, matched_route->ctx);
                 }
 
-                /* ── Async upstream: if handler set upstream_fd via lb ── */
-                if (w->lb && resp.status == 0) {
-                    http_response_destroy(&resp);
-                    proxy_begin(w, conn, &req, 0);  /* stream_id=0 for H1 */
+                /* ── Async upstream: if handler set upstream_fd via lb ──
+                 * Resolve the lb_t for THIS route from matched_route->ctx
+                 * (an lb_handler_ctx_t*), not from a single server-wide
+                 * w->lb -- a server may have multiple independently
+                 * configured pools bound to different path patterns. */
+                {
+                    lb_t *route_lb = NULL;
+                    if (matched_route != NULL && matched_route->ctx != NULL) {
+                        route_lb = ((lb_handler_ctx_t *)matched_route->ctx)->lb;
+                    }
+                    if (route_lb && resp.status == 0) {
+                        http_response_destroy(&resp);
+                        proxy_begin(w, conn, &req, 0, route_lb);  /* stream_id=0 for H1 */
+                        http_request_free(&req);
+                        goto handle_state;
+                    }
+                }
+                if (0) {
                     http_request_free(&req);
                     goto handle_state;
                 }
@@ -1790,7 +1807,9 @@ void event_loop_run(event_loop_t *loop) {
         w->tls_ctx            = loop->tls_ctx;
         w->router             = g_router;
         w->chain              = g_chain;
-        w->lb                 = loop->lb;
+        w->lb                 = loop->lb;   /* legacy mirror, last pool added */
+        w->lb_count           = loop->lb_count;
+        for (int _li = 0; _li < loop->lb_count; _li++) w->lbs[_li] = loop->lbs[_li];
         w->should_stop        = 0;
         w->draining           = 0;
         w->worker_id          = i;
@@ -1842,7 +1861,19 @@ void event_loop_set_tls(event_loop_t *loop,
 }
 
 void event_loop_set_lb(event_loop_t *loop, lb_t *lb) {
-    if (loop) loop->lb = lb;
+    if (!loop || !lb) return;
+    /* Legacy mirror: always the most recently added pool. */
+    loop->lb = lb;
+    /* Avoid adding the same lb_t twice (server_lb_route() may be called
+     * once per pool, but guard anyway in case of a duplicate call). */
+    for (int i = 0; i < loop->lb_count; i++) {
+        if (loop->lbs[i] == lb) return;
+    }
+    if (loop->lb_count < ROUTA_MAX_LB_POOLS) {
+        loop->lbs[loop->lb_count++] = lb;
+    } else {
+        LOG_ERROR("event_loop_set_lb: max %d LB pools exceeded", ROUTA_MAX_LB_POOLS);
+    }
 }
 
 void event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain) {

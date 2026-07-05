@@ -41,8 +41,13 @@ struct worker {
     volatile int             draining;
     int             shutdown_timeout_ms;  /* ms to wait before force-close  */
 
-    /* Load balancer — shared across workers, thread-safe internally */
+    /* Load balancer(s) — shared across workers, thread-safe internally.
+     * lb is kept as the legacy single-pool field (== lbs[0] when
+     * lb_count > 0) for source compatibility; new multi-pool-aware code
+     * should use lbs[]/lb_count via event_loop_add_lb(). */
     lb_t           *lb;
+    lb_t           *lbs[ROUTA_MAX_LB_POOLS];
+    int             lb_count;
 
     /* io_uring (optional) */
    // uring_t        *uring;

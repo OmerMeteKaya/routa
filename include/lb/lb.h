@@ -42,6 +42,8 @@ typedef struct {
     int retry_on_5xx;           /* default: 0                               */
 } lb_config_t;
 
+#define ROUTA_MAX_LB_POOLS 16
+
 /* ── Load balancer instance ────────────────────────────────────────────────*/
 typedef struct lb lb_t;
 /* Returns the upstream pool for direct node state recording.

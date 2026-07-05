@@ -175,10 +175,10 @@ static h2up_conn_t *h2up_acquire_for_node(worker_t *w, upstream_node_t *node)
 /* ── proxy_begin ────────────────────────────────────────────────────────────*/
 
 int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
-                uint32_t stream_id) {
-    if (!w || !conn || !req || !w->lb) {
+                uint32_t stream_id, lb_t *lb) {
+    if (!w || !conn || !req || !lb) {
         LOG_WARN("proxy_begin: null check failed w=%p conn=%p req=%p lb=%p",
-                 (void*)w, (void*)conn, (void*)req, w ? (void*)w->lb : NULL);
+                 (void*)w, (void*)conn, (void*)req, (void*)lb);
         return -1;
     }
 
@@ -186,7 +186,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
 
     if (conn->h2 && stream_id > 0) {
         /* H2 path: each stream gets its own proxy_ctx from the per-conn map */
-        ctx = proxy_stream_get(conn, stream_id, w->lb);
+        ctx = proxy_stream_get(conn, stream_id, lb);
         if (!ctx) {
             LOG_WARN("proxy_begin: proxy_stream_get failed stream_id=%u map_count=%d",
                     stream_id,
@@ -198,7 +198,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     } else {
         /* H1 path: single proxy_ctx reused across keep-alive requests */
         if (!conn->proxy) {
-            conn->proxy = proxy_ctx_new(w->lb, conn);
+            conn->proxy = proxy_ctx_new(lb, conn);
             if (!conn->proxy) {
                 http_response_simple(&conn->write_buf, 503,
                                      "Service Unavailable", "text/plain",
@@ -226,14 +226,11 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
      * A mixed pool (some H1, some TLS/H2 nodes) must not force every H1
      * node's traffic through the H2/TLS path just because SOME node in
      * the pool is TLS. */
-    upstream_node_t *unode = lb_pick_node(w->lb, conn->remote_ip);
+    upstream_node_t *unode = lb_pick_node(lb, conn->remote_ip);
     if (!unode) {
         LOG_WARN("proxy: no upstream node for %s", conn->remote_ip);
         goto upstream_error;
     }
-    LOG_WARN("DEBUG proxy_begin: path=%s picked node=%s:%d use_tls=%d",
-             req && req->path ? req->path : "(null)",
-             unode->host, unode->port, unode->use_tls);
 
     if (unode->use_tls) {
         h2up_conn_t *h2up = h2up_acquire_for_node(w, unode);
@@ -275,7 +272,7 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     /* ── H1 upstream path ────────────────────────────────────────────────── */
     {
     upstream_conn_t *uconn = NULL;
-    int ufd = lb_begin_forward_to_node(w->lb, unode, req, conn->remote_ip,
+    int ufd = lb_begin_forward_to_node(lb, unode, req, conn->remote_ip,
                                        conn->tls ? "https" : "http",
                                        &ctx->req_buf, &uconn);
     if (ufd < 0 && ctx->attempt == 0) {
@@ -285,10 +282,10 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
          * TLS node, don't cross into the H2 path mid-attempt — just fail
          * this attempt and let the normal error handling below take over
          * (502). Crossing protocols mid-retry is out of scope. */
-        upstream_node_t *retry_node = lb_pick_node(w->lb, conn->remote_ip);
+        upstream_node_t *retry_node = lb_pick_node(lb, conn->remote_ip);
         if (retry_node && !retry_node->use_tls) {
             unode = retry_node;
-            ufd = lb_begin_forward_to_node(w->lb, unode, req, conn->remote_ip,
+            ufd = lb_begin_forward_to_node(lb, unode, req, conn->remote_ip,
                                            conn->tls ? "https" : "http",
                                            &ctx->req_buf, &uconn);
         } else {

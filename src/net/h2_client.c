@@ -465,8 +465,6 @@ int h2up_begin_stream(h2up_conn_t *h2up, proxy_ctx_t *ctx,
 
     uint32_t stream_id = h2up->next_stream_id;
     h2up->next_stream_id += 2;
-    LOG_WARN("DEBUG h2up_begin_stream: fd=%d stream_id=%u path=%s",
-             h2up->fd, stream_id, req && req->path ? req->path : "(null)");
 
     /* Init stream slot */
     memset(s, 0, sizeof(*s));
@@ -625,8 +623,6 @@ static const char *status_reason(int status)
 static void deliver_response(h2up_conn_t *h2up, h2up_stream_t *s, worker_t *w)
 {
     proxy_ctx_t *ctx = s->ctx;
-    LOG_WARN("DEBUG deliver_response: ENTER ctx=%p status=%d body_len=%zu",
-             (void*)ctx, s->resp.status, s->body_buf.len);
     if (!ctx) return;
 
     conn_t     *conn      = ctx->conn;
@@ -809,8 +805,6 @@ static void proc_data(h2up_conn_t *h2up, uint32_t stream_id,
 
     if (flags & FL_END_STREAM) {
         s->end_stream = 1;
-        LOG_WARN("DEBUG proc_data: stream=%u end_stream=1 hdr_done=%d calling_deliver=%d",
-                 stream_id, s->hdr_done, s->hdr_done ? 1 : 0);
         if (s->hdr_done) deliver_response(h2up, s, w);
     }
 }
@@ -880,9 +874,6 @@ static void proc_rst_stream(h2up_conn_t *h2up, uint32_t stream_id, worker_t *w)
 void h2up_conn_close(h2up_conn_t *h2up, worker_t *w)
 {
     if (!h2up || h2up->closed) return;
-    LOG_WARN("DEBUG h2up_close: fd=%d next_stream_id=%u stream_count=%d peer_max_streams=%u goaway=%d",
-             h2up->fd, h2up->next_stream_id, h2up->stream_count,
-             h2up->peer_max_concurrent_streams, h2up->goaway_received);
     h2up->closed = 1;
 
     for (int i = 0; i < H2UP_MAX_STREAMS; i++) {
@@ -938,9 +929,6 @@ int h2up_on_readable(h2up_conn_t *h2up, worker_t *w)
             break;   /* wait for more data */
 
         const uint8_t *payload = p + H2_FRAME_HDR_SZ;
-
-        LOG_WARN("DEBUG frame: fd=%d type=%u flags=%u stream_id=%u len=%u",
-                 h2up->fd, frame_type, frame_flags, stream_id, frame_len);
 
         switch (frame_type) {
         case FRM_SETTINGS:
@@ -1034,8 +1022,6 @@ int h2up_on_readable(h2up_conn_t *h2up, worker_t *w)
 
 int h2up_on_writable(h2up_conn_t *h2up, worker_t *w)
 {
-    LOG_WARN("DEBUG h2up_writable: ENTER fd=%d closed=%d write_buf.len=%zu",
-             h2up->fd, h2up->closed, h2up->write_buf.len);
     if (h2up->closed || h2up->write_buf.len == 0) return 0;
 
     buf_t *wb = &h2up->write_buf;
@@ -1044,8 +1030,6 @@ int h2up_on_writable(h2up_conn_t *h2up, worker_t *w)
 
     while (rem > 0) {
         ssize_t n = tls_write(h2up->tls, buf_data(wb) + off, rem);
-        LOG_WARN("DEBUG h2up_writable: tls_write returned %zd (rem=%zu off=%zu)",
-                 n, rem, off);
         if (n > 0) {
             off += (size_t)n;
             rem -= (size_t)n;

@@ -75,9 +75,14 @@ proxy_ctx_t *proxy_stream_get(struct conn *conn, uint32_t stream_id, lb_t *lb);
 void         proxy_stream_remove(struct conn *conn, uint32_t stream_id);
 void         proxy_stream_map_free(struct conn *conn);
 
-/* stream_id: 0 for H1, non-zero for H2 per-stream dispatch */
+/* stream_id: 0 for H1, non-zero for H2 per-stream dispatch.
+ * lb: the specific load-balancer pool this request's matched route is
+ * bound to. Callers get this from the route's lb_handler_ctx_t (see
+ * server.c) rather than assuming a single server-wide pool, so that a
+ * server with multiple independently configured upstream pools routes
+ * each request to the correct one. */
 int proxy_begin(struct worker *w, struct conn *conn,
-                const http_request_t *req, uint32_t stream_id);
+                const http_request_t *req, uint32_t stream_id, lb_t *lb);
 
 /* ctx: the specific proxy_ctx_t whose upstream fd fired */
 int proxy_on_upstream_writable(struct worker *w, struct conn *conn,

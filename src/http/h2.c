@@ -8,6 +8,7 @@
 #include "http/response.h"
 #include "core/conn.h"
 #include "core/proxy.h"
+#include "core/server.h"
 #include "net/io.h"
 #include "util/logger.h"
 #include <stdlib.h>
@@ -1110,11 +1111,21 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
             route->handler(&req, &resp, route->ctx);
         }
     }
-    /* H2 async proxy: handler left resp.status == 0 → hand off to upstream */
-    if (resp.status == 0 && hc->lb && hc->worker) {
+    /* H2 async proxy: handler left resp.status == 0 → hand off to upstream.
+     * Resolve the lb_t for THIS route from route->ctx (an
+     * lb_handler_ctx_t*) rather than a single connection-wide hc->lb, so a
+     * server with multiple independently configured upstream pools routes
+     * each request to the correct one. Falls back to hc->lb for requests
+     * that matched no route object (defensive; shouldn't normally happen
+     * given the resp.status==0 + route->ctx contract above). */
+    lb_t *route_lb = hc->lb;
+    if (route && route->ctx) {
+        route_lb = ((lb_handler_ctx_t *)route->ctx)->lb;
+    }
+    if (resp.status == 0 && route_lb && hc->worker) {
         http_response_destroy(&resp);
         if (proxy_begin((struct worker *)hc->worker, hc->conn, &req,
-                        stream_id) == 0) {
+                        stream_id, route_lb) == 0) {
             /* Per-stream ctx is registered in the map; event loop dispatches
              * upstream events directly to it via the PROXY_CTX_MAGIC tag.   */
             http_request_free(&req);

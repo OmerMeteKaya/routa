@@ -12,13 +12,39 @@ extern atomic_int g_drain_flag;
 
 struct event_loop;
 
+/* One independently-configured load-balancer pool bound to a path pattern.
+ * Introduced to support multiple upstream pools per server (e.g. /api/*
+ * -> pool A, /static-proxy/* -> pool B), instead of the previous design
+ * where a server could only ever have a single global lb_t. */
+typedef struct {
+    lb_t *lb;
+    void *route_ctx;   /* lb_handler_ctx_t, freed in server_free */
+} lb_pool_entry_t;
+
+/* ctx passed to the internal route handler that marks a path as "proxy to
+ * this lb" (see server.c's lb_route_handler / server_lb_route()).
+ * Public so event_loop.c's request-dispatch loop can read ctx->lb to
+ * find the correct pool for a matched route, instead of assuming a
+ * single server-wide lb_t. */
+typedef struct { lb_t *lb; } lb_handler_ctx_t;
+
 typedef struct {
     struct event_loop  *loop;
     void               *static_configs[16];
     int                 static_config_count;
     middleware_chain_t *chain;
-    lb_t               *lb;           /* NULL when load balancer disabled   */
-    void               *lb_route_ctx; /* lb_handler_ctx_t, freed in server_free */
+
+    /* Legacy single-pool fields. Kept for source compatibility with
+     * existing callers of server_enable_lb()/server_lb_add_upstream() that
+     * only ever want one pool: they operate on lb_pools[0]. New code that
+     * needs multiple pools should prefer server_enable_lb_named() /
+     * server_lb_add_upstream_named() / server_lb_route() with distinct
+     * pool names. */
+    lb_t               *lb;           /* NULL when load balancer disabled; == lb_pools[0].lb */
+    void               *lb_route_ctx; /* == lb_pools[0].route_ctx */
+
+    lb_pool_entry_t     lb_pools[ROUTA_MAX_LB_POOLS];
+    int                 lb_pool_count;
 } server_t;
 
 server_t *server_new(int port, int n_threads);

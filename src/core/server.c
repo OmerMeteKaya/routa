@@ -128,7 +128,6 @@ void server_use(server_t *s, middleware_fn_t fn, void *ctx) {
 /* ── Load balancer ──────────────────────────────────────────────────────────*/
 
 /* Internal route handler that forwards to LB */
-typedef struct { lb_t *lb; } lb_handler_ctx_t;
 
 static int lb_route_handler(const http_request_t *req,
                              http_response_t *resp, void *ctx) {
@@ -136,31 +135,57 @@ static int lb_route_handler(const http_request_t *req,
     return 0;
 }
 
+/* Adds a NEW load-balancer pool every time it's called (does not require
+ * -- or reuse -- a previously created pool). This supports servers with
+ * multiple independent upstream pools, each later bound to its own path
+ * via server_lb_route(). The legacy single-pool fields (s->lb,
+ * s->lb_route_ctx) always mirror the MOST RECENTLY added pool, so old
+ * call sites that only ever call this once keep working unmodified. */
 int server_enable_lb(server_t *s, const lb_config_t *cfg) {
     if (!s) return -1;
-    if (s->lb) { LOG_WARN("LB already enabled"); return 0; }
+    if (s->lb_pool_count >= ROUTA_MAX_LB_POOLS) {
+        LOG_ERROR("server_enable_lb: max %d LB pools per server exceeded",
+                  ROUTA_MAX_LB_POOLS);
+        return -1;
+    }
 
-    s->lb = lb_new(cfg);
-    if (!s->lb) { LOG_ERROR("Failed to create load balancer"); return -1; }
+    lb_t *lb = lb_new(cfg);
+    if (!lb) { LOG_ERROR("Failed to create load balancer"); return -1; }
+
+    int idx = s->lb_pool_count++;
+    s->lb_pools[idx].lb        = lb;
+    s->lb_pools[idx].route_ctx = NULL;
+
+    /* Legacy mirror: always points at the most recently added pool */
+    s->lb           = lb;
+    s->lb_route_ctx = NULL;
     return 0;
 }
 
+/* Adds an upstream to the MOST RECENTLY added pool (server_enable_lb()'s
+ * last call). To add upstreams to an earlier pool, finish configuring and
+ * route it (server_lb_route()) before calling server_enable_lb() again
+ * for the next pool -- pools are configured and routed one at a time,
+ * left to right, matching how server_from_config()/the config file loader
+ * builds them. */
 int server_lb_add_upstream(server_t *s,
                             const char *host, uint16_t port, int weight) {
-    if (!s || !s->lb) {
+    if (!s || s->lb_pool_count == 0) {
         LOG_ERROR("server_lb_add_upstream: LB not enabled");
         return -1;
     }
-    return lb_add_upstream(s->lb, host, port, weight);
+    lb_t *lb = s->lb_pools[s->lb_pool_count - 1].lb;
+    return lb_add_upstream(lb, host, port, weight);
 }
 
 int server_lb_add_upstream_tls(server_t *s,
                                 const char *host, uint16_t port, int weight) {
-    if (!s || !s->lb) {
+    if (!s || s->lb_pool_count == 0) {
         LOG_ERROR("server_lb_add_upstream_tls: LB not enabled");
         return -1;
     }
-    return lb_add_upstream_tls(s->lb, host, port, weight);
+    lb_t *lb = s->lb_pools[s->lb_pool_count - 1].lb;
+    return lb_add_upstream_tls(lb, host, port, weight);
 }
 
 /* Register a route that proxies to the LB.
