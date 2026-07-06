@@ -60,6 +60,51 @@ typedef enum {
     CFG_HC_CUSTOM = 3,
 } cfg_hc_type_t;
 
+#define ROUTA_MAX_LB_POOLS 16
+
+/* One independently-configured upstream pool: its own upstream list, LB
+ * algorithm, health-check settings, retry policy, and the path pattern
+ * it's routed to. See routa_config_t.pools[] for the config file syntax. */
+typedef struct {
+    char name[64];      /* from "[pool NAME]", or "" for the implicit/legacy
+                         * single pool when no [pool ...] section is used  */
+    char route[256];    /* from lb_route = ..., default "/*"               */
+
+    int            lb_enabled;
+    cfg_lb_algo_t  lb_algo;
+    struct {
+        char host[256];
+        int  port;
+        int  weight;
+        int  use_tls;    /* set when the upstream line used https://       */
+    } upstreams[ROUTA_MAX_UPSTREAMS];
+    int upstream_count;
+
+    /* Connection pool */
+    int lb_pool_max_per_node;
+    int lb_pool_connect_timeout_ms;
+    int lb_pool_idle_timeout_s;
+
+    /* Passive health */
+    int lb_passive_fail_threshold;
+    int lb_passive_recover_threshold;
+
+    /* Active health check */
+    cfg_hc_type_t lb_hc_type;
+    char          lb_hc_path[256];
+    int           lb_hc_interval_ms;
+    int           lb_hc_timeout_ms;
+    int           lb_hc_threshold_up;
+    int           lb_hc_threshold_down;
+
+    /* Retry */
+    int lb_max_retries;
+    int lb_retry_on_5xx;
+
+    /* Consistent hash */
+    int lb_consistent_hash_vnodes;
+} lb_pool_config_t;
+
 /* ── HTTP/2 ──────────────────────────────────────────────────────────────── */
 typedef enum {
     H2_STREAM_LOOKUP_LINEAR  = 0,   /* fixed pool, linear scan, default   */
@@ -138,48 +183,42 @@ typedef struct {
     int  file_cache_strategy;   /* 0=ttl, 1=stat_ttl, 2=inotify */
 
     /* ── Load balancer ──────────────────────────────────────────────────── */
-    int            lb_enabled;          /* 0 = disabled (default)           */
-    cfg_lb_algo_t  lb_algo;             /* default: CFG_LB_ROUND_ROBIN      */
-
-    struct {
-        char host[256];
-        int  port;
-        int  weight;                    /* default: 1                       */
-    } upstreams[ROUTA_MAX_UPSTREAMS];
-    int upstream_count;
-
-    /* Connection pool */
-    int lb_pool_max_per_node;           /* default: 64                      */
-    int lb_pool_connect_timeout_ms;     /* default: 2000                    */
-    int lb_pool_idle_timeout_s;         /* default: 60                      */
-
-    /* Passive health */
-    int lb_passive_fail_threshold;      /* default: 3                       */
-    int lb_passive_recover_threshold;   /* default: 2                       */
-
-    /* Active health check */
-    cfg_hc_type_t lb_hc_type;          /* default: CFG_HC_NONE             */
-    char          lb_hc_path[256];      /* default: "/health"               */
-    int           lb_hc_interval_ms;    /* default: 5000                    */
-    int           lb_hc_timeout_ms;     /* default: 2000                    */
-    int           lb_hc_threshold_up;   /* default: 2                       */
-    int           lb_hc_threshold_down; /* default: 3                       */
-
-    /* Retry */
-    int lb_max_retries;                 /* default: 1                       */
-    int lb_retry_on_5xx;                /* default: 0                       */
-
-    /* Consistent hash */
-    int lb_consistent_hash_vnodes;      /* default: 150       */
+    /* ── Load balancer pools ────────────────────────────────────────────────
+     * One or more independently configured upstream pools, each bound to
+     * its own path pattern (route). Config file syntax:
+     *
+     *   [pool api]
+     *   lb_algo = round_robin
+     *   lb_route = /api/*
+     *   upstream 10.0.0.1:3000 weight=1
+     *   upstream https://10.0.0.2:3443 weight=2
+     *   lb_hc_type = http
+     *   lb_hc_path = /health
+     *
+     *   [pool static]
+     *   lb_route = /static-proxy/*
+     *   upstream 10.0.0.3:4000 weight=1
+     *
+     * A config with no [pool ...] sections but a bare `upstream` line
+     * (legacy single-pool style) is treated as a single implicit pool
+     * (pools[0]), routed to "/*" by default -- see routa_config_load(). */
     h2_stream_lookup_t stream_lookup;        /* default: H2_STREAM_LOOKUP_LINEAR  */
     routa_h2_config_t h2;
-
     /* Graceful shutdown */
     int shutdown_timeout_ms;     /* drain timeout before force-close, default: 30000 */
+
+    lb_pool_config_t pools[ROUTA_MAX_LB_POOLS];
+    int              pool_count;
 } routa_config_t;
 
 /* Initialize config with sensible defaults */
 void routa_config_init(routa_config_t *cfg);
+
+/* Initializes a single lb_pool_config_t with sane defaults, mirroring the
+ * defaults lb_config_init() (lb.c) uses for the runtime lb_config_t --
+ * kept in sync manually since these are separate structs in separate
+ * layers (file-config vs. runtime). */
+void lb_pool_config_init(lb_pool_config_t *pool);
 
 /* Parse routa.conf file. Returns 0 on success, -1 on error. */
 int routa_config_load(routa_config_t *cfg, const char *path);

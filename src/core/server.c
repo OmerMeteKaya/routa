@@ -269,37 +269,52 @@ server_t *server_from_config(const routa_config_t *cfg) {
                       cfg->static_dirs[i].doc_root,
                       cfg->static_dirs[i].enable_index);
 
-    /* ── Load balancer ── */
-    if (cfg->lb_enabled && cfg->upstream_count > 0) {
+    /* Load balancer(s) -- one server_enable_lb()/add_upstream/route()
+     * sequence per configured pool (cfg->pools[]). Each pool gets its own
+     * independent lb_t bound to its own route pattern; see the multi-pool
+     * architecture in server.h/event_loop.c/proxy.c. */
+    for (int p = 0; p < cfg->pool_count; p++) {
+        const lb_pool_config_t *pcfg = &cfg->pools[p];
+        if (!pcfg->lb_enabled || pcfg->upstream_count == 0) continue;
+
         lb_config_t lbc;
         lb_config_init(&lbc);
-        lbc.algo                     = (lb_algo_t)cfg->lb_algo;
-        lbc.pool_max_per_node        = cfg->lb_pool_max_per_node;
-        lbc.pool_connect_timeout_ms  = cfg->lb_pool_connect_timeout_ms;
-        lbc.pool_idle_timeout_s      = cfg->lb_pool_idle_timeout_s;
-        lbc.passive_fail_threshold   = cfg->lb_passive_fail_threshold;
-        lbc.passive_recover_threshold= cfg->lb_passive_recover_threshold;
-        lbc.max_retries              = cfg->lb_max_retries;
-        lbc.retry_on_5xx             = cfg->lb_retry_on_5xx;
-        lbc.consistent_hash_vnodes   = cfg->lb_consistent_hash_vnodes;
-        lbc.hc.type                  = (health_check_type_t)cfg->lb_hc_type;
-        lbc.hc.interval_ms           = cfg->lb_hc_interval_ms;
-        lbc.hc.timeout_ms            = cfg->lb_hc_timeout_ms;
-        lbc.hc.threshold_up          = cfg->lb_hc_threshold_up;
-        lbc.hc.threshold_down        = cfg->lb_hc_threshold_down;
-        strncpy(lbc.hc.path, cfg->lb_hc_path, sizeof(lbc.hc.path) - 1);
+        lbc.algo                      = (lb_algo_t)pcfg->lb_algo;
+        lbc.pool_max_per_node         = pcfg->lb_pool_max_per_node;
+        lbc.pool_connect_timeout_ms   = pcfg->lb_pool_connect_timeout_ms;
+        lbc.pool_idle_timeout_s       = pcfg->lb_pool_idle_timeout_s;
+        lbc.passive_fail_threshold    = pcfg->lb_passive_fail_threshold;
+        lbc.passive_recover_threshold = pcfg->lb_passive_recover_threshold;
+        lbc.max_retries               = pcfg->lb_max_retries;
+        lbc.retry_on_5xx              = pcfg->lb_retry_on_5xx;
+        lbc.consistent_hash_vnodes    = pcfg->lb_consistent_hash_vnodes;
+        lbc.hc.type                   = (health_check_type_t)pcfg->lb_hc_type;
+        lbc.hc.interval_ms            = pcfg->lb_hc_interval_ms;
+        lbc.hc.timeout_ms             = pcfg->lb_hc_timeout_ms;
+        lbc.hc.threshold_up           = pcfg->lb_hc_threshold_up;
+        lbc.hc.threshold_down         = pcfg->lb_hc_threshold_down;
+        strncpy(lbc.hc.path, pcfg->lb_hc_path, sizeof(lbc.hc.path) - 1);
 
-        if (server_enable_lb(s, &lbc) == 0) {
-            for (int i = 0; i < cfg->upstream_count; i++)
-                server_lb_add_upstream(s,
-                    cfg->upstreams[i].host,
-                    (uint16_t)cfg->upstreams[i].port,
-                    cfg->upstreams[i].weight);
-
-            /* Default: proxy everything — override by calling
-             * server_lb_route() manually for path-specific proxying.      */
-            server_lb_route(s, "/*", 0xFF);
+        if (server_enable_lb(s, &lbc) != 0) {
+            LOG_ERROR("server_from_config: failed to enable pool '%s'",
+                      pcfg->name[0] ? pcfg->name : "(default)");
+            continue;
         }
+        for (int i = 0; i < pcfg->upstream_count; i++) {
+            if (pcfg->upstreams[i].use_tls) {
+                server_lb_add_upstream_tls(s,
+                    pcfg->upstreams[i].host,
+                    (uint16_t)pcfg->upstreams[i].port,
+                    pcfg->upstreams[i].weight);
+            } else {
+                server_lb_add_upstream(s,
+                    pcfg->upstreams[i].host,
+                    (uint16_t)pcfg->upstreams[i].port,
+                    pcfg->upstreams[i].weight);
+            }
+        }
+        const char *route = pcfg->route[0] ? pcfg->route : "/*";
+        server_lb_route(s, route, 0xFF);
     }
 
     return s;
