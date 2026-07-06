@@ -58,6 +58,10 @@ void proxy_ctx_free(proxy_ctx_t *ctx) {
     proxy_drop_upstream(ctx);
     buf_free(&ctx->req_buf);
     buf_free(&ctx->resp_buf);
+    if (ctx->has_retry_req) {
+        http_request_free(&ctx->retry_req);
+        ctx->has_retry_req = 0;
+    }
     free(ctx);
 }
 
@@ -218,8 +222,26 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
             conn->proxy->front_h2            = NULL;
             conn->proxy->front_stream_id     = 0;
             proxy_drop_upstream(conn->proxy);
+            if (conn->proxy->has_retry_req) {
+                http_request_free(&conn->proxy->retry_req);
+                conn->proxy->has_retry_req = 0;
+            }
         }
         ctx = conn->proxy;
+    }
+
+    /* Deep-copy the request so a later ASYNC connect-refused failure
+     * (discovered in proxy_on_upstream_writable(), after this function has
+     * already returned and the caller's req has been freed) can retry
+     * against a different node. See proxy_ctx_t.retry_req. Best-effort:
+     * if the clone fails (OOM), retry is simply unavailable for this
+     * request -- not a fatal error. */
+    if (ctx->has_retry_req) {
+        http_request_free(&ctx->retry_req);
+        ctx->has_retry_req = 0;
+    }
+    if (http_request_clone(req, &ctx->retry_req) == 0) {
+        ctx->has_retry_req = 1;
     }
 
     /* Pick upstream node ONCE; branch per-node on use_tls, not pool-wide.
@@ -381,6 +403,46 @@ int proxy_on_upstream_writable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
             if (ctx->node && ctx->pool)
                 upstream_node_record_failure(ctx->node, ctx->pool);
             proxy_drop_upstream(ctx);
+
+            /* Async connect-refused retry: proxy_begin()'s retry only
+             * covers a SYNCHRONOUS lb_begin_forward_to_node() failure.
+             * connect() to a dead upstream frequently returns EINPROGRESS
+             * and fails asynchronously instead (discovered here, on the
+             * first writable event) -- without this branch, that case
+             * skipped retry entirely and went straight to a 502, even
+             * though ctx->attempt was still 0 and a healthy node might be
+             * available. Uses ctx->retry_req (a deep copy taken in
+             * proxy_begin(), since the caller's original http_request_t
+             * has already been freed by this point). */
+            if (ctx->attempt == 0 && ctx->has_retry_req) {
+                ctx->attempt = 1;
+                buf_reset(&ctx->req_buf);
+                upstream_node_t *retry_node = lb_pick_node(ctx->lb, conn->remote_ip);
+                if (retry_node && !retry_node->use_tls) {
+                    upstream_conn_t *retry_uconn = NULL;
+                    int retry_fd = lb_begin_forward_to_node(
+                        ctx->lb, retry_node, &ctx->retry_req, conn->remote_ip,
+                        conn->tls ? "https" : "http", &ctx->req_buf, &retry_uconn);
+                    if (retry_fd >= 0) {
+                        ctx->upstream_fd    = retry_fd;
+                        ctx->node           = retry_node;
+                        ctx->uconn          = retry_uconn;
+                        ctx->req_sent       = 0;
+                        ctx->upstream_state = (retry_uconn && retry_uconn->requests > 0)
+                                            ? PROXY_STATE_WRITING
+                                            : PROXY_STATE_CONNECTING;
+                        void *poller_ptr = (conn->h2 && ctx->front_stream_id > 0)
+                                         ? (void *)ctx : (void *)conn;
+                        if (!conn->h2) conn->state = CONN_UPSTREAM_CONNECTING;
+                        poller_add(w->poller, retry_fd, POLLER_WRITE | POLLER_ET,
+                                  poller_ptr);
+                        if (ctx->upstream_state == PROXY_STATE_WRITING)
+                            proxy_on_upstream_writable(w, conn, ctx);
+                        return 0;
+                    }
+                }
+            }
+
             uint32_t sid = ctx->front_stream_id;
             proxy_send_upstream_error(conn, ctx, 502, "Bad Gateway",
                                       "Bad Gateway\n");

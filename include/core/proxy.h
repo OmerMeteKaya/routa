@@ -55,6 +55,15 @@ typedef struct proxy_ctx {
     /* H2 upstream (NULL = H1 path) */
     struct h2up_conn *up_h2up;
     uint32_t          up_stream_id;
+
+    /* Deep-copied request, kept alive for the lifetime of this ctx so an
+     * async connect-refused failure (discovered later, in
+     * proxy_on_upstream_writable(), not synchronously in proxy_begin())
+     * can retry against a different node without needing the original
+     * (already-freed-by-then) http_request_t from the caller's stack.
+     * has_retry_req guards whether retry_req needs http_request_free(). */
+    http_request_t   retry_req;
+    int               has_retry_req;
 } proxy_ctx_t;
 
 /* Per-stream proxy context map for H2 — one ctx per concurrent stream.

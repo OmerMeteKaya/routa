@@ -297,6 +297,52 @@ done:
     return ret;
 }
 
+/* Deep-copies everything build_forward_request() reads (method, path,
+ * query, headers, body) so a proxy_ctx_t can retry a request against a
+ * different upstream node after the original req has already been freed
+ * by the caller (see proxy.c's async connect-retry path). Does NOT copy
+ * query_params[] (unused by the forwarding path) or remote_ip/trace_id
+ * (retry keeps using the values already stored elsewhere in proxy_ctx_t).
+ * Returns 0 on success, -1 on allocation failure (partial state is safe
+ * to pass to http_request_free()). */
+int http_request_clone(const http_request_t *src, http_request_t *dst) {
+    if (!src || !dst) return -1;
+    memset(dst, 0, sizeof(*dst));
+
+    dst->method         = src->method;
+    dst->version_major  = src->version_major;
+    dst->version_minor  = src->version_minor;
+    dst->keep_alive     = src->keep_alive;
+    dst->body_len       = src->body_len;
+    dst->headers_owned  = 1;   /* clone always owns its own header strings */
+    memcpy(dst->remote_ip, src->remote_ip, sizeof(dst->remote_ip));
+    memcpy(dst->trace_id,  src->trace_id,  sizeof(dst->trace_id));
+    dst->start_us       = src->start_us;
+
+    if (src->path) {
+        dst->path = strdup(src->path);
+        if (!dst->path) return -1;
+    }
+    if (src->query) {
+        dst->query = strdup(src->query);
+        if (!dst->query) return -1;
+    }
+    if (src->body && src->body_len > 0) {
+        dst->body = malloc(src->body_len);
+        if (!dst->body) return -1;
+        memcpy(dst->body, src->body, src->body_len);
+    }
+
+    dst->header_count = src->header_count;
+    for (int i = 0; i < src->header_count; i++) {
+        dst->headers[i].key = src->headers[i].key ? strdup(src->headers[i].key) : NULL;
+        dst->headers[i].value = src->headers[i].value ? strdup(src->headers[i].value) : NULL;
+        if (src->headers[i].key && !dst->headers[i].key) return -1;
+        if (src->headers[i].value && !dst->headers[i].value) return -1;
+    }
+    return 0;
+}
+
 void http_request_free(http_request_t *req) {
     if (!req) return;
     free(req->path);

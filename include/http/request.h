@@ -42,6 +42,7 @@ typedef struct {
 // (need more data). Does NOT modify the buffer — works on a copy internally.
 int  http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed);
 void http_request_free(http_request_t *req);
+int  http_request_clone(const http_request_t *src, http_request_t *dst);
 const char *http_request_get_header(const http_request_t *req, const char *key);
 const char *http_request_get_query(const http_request_t *req, const char *key);
 
