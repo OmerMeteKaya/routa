@@ -124,6 +124,9 @@ void lb_pool_config_init(lb_pool_config_t *pool) {
     pool->acl_enabled       = 0;
     pool->acl_default_allow = 1;
     pool->acl_rule_count    = 0;
+
+    pool->sticky_session_enabled = 0;
+    strncpy(pool->sticky_cookie_name, "routa_sticky", sizeof(pool->sticky_cookie_name) - 1);
 }
 
 /* ---- Simple line-based parser ---- */
@@ -356,6 +359,10 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                 pool->lb_retry_on_5xx = cfg_atoi(val, 0);
             } else if (strcmp(key, "lb_consistent_hash_vnodes") == 0) {
                 pool->lb_consistent_hash_vnodes = cfg_atoi(val, 150);
+            } else if (strcmp(key, "lb_sticky_session_enabled") == 0) {
+                pool->sticky_session_enabled = cfg_atoi(val, 0);
+            } else if (strcmp(key, "lb_sticky_cookie_name") == 0) {
+                strncpy(pool->sticky_cookie_name, val, sizeof(pool->sticky_cookie_name) - 1);
             } else {
                 LOG_WARN("config:%d: unknown lb_* key '%s'", lineno, key);
             }

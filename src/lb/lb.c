@@ -121,6 +121,14 @@ upstream_pool_t *lb_get_pool(lb_t *lb) {
     return lb ? lb->pool : NULL;
 }
 
+int lb_sticky_enabled(const lb_t *lb) {
+    return lb ? lb->cfg.sticky_session_enabled : 0;
+}
+
+const char *lb_sticky_cookie_name(const lb_t *lb) {
+    return (lb && lb->cfg.sticky_cookie_name[0]) ? lb->cfg.sticky_cookie_name : "routa_sticky";
+}
+
 void lb_get_upstream_timeouts(const lb_t *lb, int *read_timeout_ms, int *write_timeout_ms) {
     if (read_timeout_ms)  *read_timeout_ms  = lb ? lb->cfg.upstream_read_timeout_ms  : 30000;
     if (write_timeout_ms) *write_timeout_ms = lb ? lb->cfg.upstream_write_timeout_ms : 30000;
@@ -218,6 +226,51 @@ static upstream_node_t *pick_p2c(lb_t *lb) {
     uint32_t inf_a = __atomic_load_n(&up[a]->inflight, __ATOMIC_RELAXED);
     uint32_t inf_b = __atomic_load_n(&up[b]->inflight, __ATOMIC_RELAXED);
     return inf_a <= inf_b ? up[a] : up[b];
+}
+
+/* Sticky-session override, checked BEFORE the configured lb_algo when
+ * sticky sessions are enabled. sticky_cookie_value is the raw value of
+ * the client's sticky cookie (a stringified node index into pool->nodes[],
+ * as set by lb_sticky_cookie_value_for_node()), or NULL if the client
+ * sent no such cookie (first visit) -- in which case this falls through
+ * to the normal lb_pick_node() algorithm. If the cookie names a node that
+ * is no longer UP (removed from config, or currently marked DOWN by
+ * health checking), also falls through, rather than pinning the client
+ * to a dead backend. */
+upstream_node_t *lb_pick_node_sticky(lb_t *lb, const char *client_ip,
+                                     const char *sticky_cookie_value) {
+    if (lb->cfg.sticky_session_enabled && sticky_cookie_value && sticky_cookie_value[0]) {
+        char *end = NULL;
+        long idx = strtol(sticky_cookie_value, &end, 10);
+        if (end != sticky_cookie_value && *end == '\0' &&
+            idx >= 0 && idx < lb->pool->node_count) {
+            upstream_node_t *node = lb->pool->nodes[idx];
+            pthread_spin_lock(&node->state_lock);
+            node_state_t st = node->state;
+            pthread_spin_unlock(&node->state_lock);
+            if (st == NODE_UP) return node;
+        }
+        /* Cookie present but stale/invalid/node down -- fall through to
+         * the normal algorithm, which will pick a live node and (via the
+         * caller re-setting the Set-Cookie header) re-stick the client
+         * to whatever it picks. */
+    }
+    return lb_pick_node(lb, client_ip);
+}
+
+/* Returns the stringified pool index for node, for use as a sticky
+ * cookie value. Returns -1 (as a string via out_buf) if node is not
+ * found in lb's pool (shouldn't normally happen). out_buf must be at
+ * least 12 bytes. */
+void lb_sticky_cookie_value_for_node(lb_t *lb, const upstream_node_t *node,
+                                     char *out_buf, size_t out_buf_len) {
+    for (int i = 0; i < lb->pool->node_count; i++) {
+        if (lb->pool->nodes[i] == node) {
+            snprintf(out_buf, out_buf_len, "%d", i);
+            return;
+        }
+    }
+    snprintf(out_buf, out_buf_len, "-1");
 }
 
 upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
@@ -643,6 +696,9 @@ void lb_config_init(lb_config_t *cfg) {
     cfg->hc.timeout_ms           = 2000;
     cfg->hc.threshold_up         = 2;
     cfg->hc.threshold_down       = 3;
+
+    cfg->sticky_session_enabled = 0;
+    strncpy(cfg->sticky_cookie_name, "routa_sticky", sizeof(cfg->sticky_cookie_name) - 1);
 }
 
 lb_t *lb_new(const lb_config_t *cfg) {

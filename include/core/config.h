@@ -127,6 +127,10 @@ typedef struct {
     int  acl_default_allow;
     struct { char rule[128]; int action; } acl_rules[ROUTA_MAX_ACL_RULES];
     int  acl_rule_count;
+
+    /* Cookie-based sticky sessions -- see lb_config_t in lb.h. */
+    int  sticky_session_enabled;
+    char sticky_cookie_name[128];
 } lb_pool_config_t;
 
 /* ── HTTP/2 ──────────────────────────────────────────────────────────────── */

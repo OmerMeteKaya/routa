@@ -12,6 +12,7 @@
 #include "lb/lb.h"
 #include "util/logger.h"
 #include "util/metrics.h"
+#include "http/cookie.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -250,10 +251,22 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
      * A mixed pool (some H1, some TLS/H2 nodes) must not force every H1
      * node's traffic through the H2/TLS path just because SOME node in
      * the pool is TLS. */
-    upstream_node_t *unode = lb_pick_node(lb, conn->remote_ip);
+    /* Sticky session: if enabled, prefer the node named by the client's
+     * sticky cookie (if present and still UP) over the normal lb_algo. */
+    const char *sticky_val = NULL;
+    cookie_jar_t *sticky_jar = NULL;
+    if (lb_sticky_enabled(lb)) {
+        sticky_jar = cookie_jar_parse(req);
+        if (sticky_jar) sticky_val = cookie_jar_get(sticky_jar, lb_sticky_cookie_name(lb));
+    }
+    upstream_node_t *unode = lb_pick_node_sticky(lb, conn->remote_ip, sticky_val);
+    if (sticky_jar) cookie_jar_free(sticky_jar);
     if (!unode) {
         LOG_WARN("proxy: no upstream node for %s", conn->remote_ip);
         goto upstream_error;
+    }
+    if (lb_sticky_enabled(lb)) {
+        ctx->sticky_node_for_cookie = unode;
     }
 
     if (unode->use_tls) {
@@ -612,6 +625,30 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
                                   "Bad Gateway\n");
         if (conn->h2 && sid) proxy_stream_remove(conn, sid);
         return 0;
+    }
+
+    /* Sticky session: set the cookie identifying which node served this
+     * request, so subsequent requests from this client stick to it (as
+     * long as it stays UP -- see lb_pick_node_sticky()). Set on every
+     * response while sticky sessions are enabled, not just the first,
+     * so a client's cookie stays fresh/correct even if a prior sticky
+     * pin become stale (e.g. it fell back to a different node because
+     * the original went DOWN) -- this naturally "re-stickies" them. */
+    if (ctx->sticky_node_for_cookie && ctx->lb) {
+        char idx_buf[16];
+        lb_sticky_cookie_value_for_node(ctx->lb, ctx->sticky_node_for_cookie,
+                                        idx_buf, sizeof(idx_buf));
+        cookie_opts_t sticky_opts = {
+            .name      = lb_sticky_cookie_name(ctx->lb),
+            .value     = idx_buf,
+            .path      = "/",
+            .domain    = NULL,
+            .max_age   = -1,
+            .http_only = 1,
+            .secure    = 0,
+            .same_site = "Lax",
+        };
+        cookie_set(&resp, &sticky_opts);
     }
 
     if (conn->h2 && ctx->front_h2) {

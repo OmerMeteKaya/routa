@@ -43,6 +43,13 @@ typedef struct {
     int retry_on_connect_fail;  /* default: 1                               */
     int retry_on_5xx;           /* default: 0                               */
 
+    /* Cookie-based sticky sessions (override on top of the configured
+     * algo, checked first). When enabled, routa sets a cookie identifying
+     * which node served a request; subsequent requests carrying that
+     * cookie are pinned to the same node as long as it's still UP. */
+    int  sticky_session_enabled;   /* default: 0 */
+    char sticky_cookie_name[128];  /* default: "routa_sticky" */
+
     /* ── Header manipulation ──────────────────────────────────────────────
      * Applied on top of routa's own automatic headers (X-Forwarded-For,
      * X-Forwarded-Proto, Via, Host, Content-Length, Connection) -- these
@@ -72,6 +79,8 @@ typedef struct lb lb_t;
  * Used by proxy.c to call upstream_node_record_failure/success. */
 upstream_pool_t *lb_get_pool(lb_t *lb);
 void lb_get_upstream_timeouts(const lb_t *lb, int *read_timeout_ms, int *write_timeout_ms);
+int  lb_sticky_enabled(const lb_t *lb);
+const char *lb_sticky_cookie_name(const lb_t *lb);
 /* Create / destroy */
 lb_t *lb_new(const lb_config_t *cfg);
 void  lb_free(lb_t *lb);
@@ -108,6 +117,10 @@ int lb_forward(lb_t *lb,
 
 /* ── Node selection (exposed for testing / custom wrappers) ────────────────*/
 upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip);
+upstream_node_t *lb_pick_node_sticky(lb_t *lb, const char *client_ip,
+                                     const char *sticky_cookie_value);
+void lb_sticky_cookie_value_for_node(lb_t *lb, const upstream_node_t *node,
+                                     char *out_buf, size_t out_buf_len);
 
 /* ── Async forwarding API ───────────────────────────────────────────────────
  *

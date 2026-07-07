@@ -427,6 +427,8 @@ server_t *server_from_config(const routa_config_t *cfg) {
         lbc.pool_connect_timeout_ms   = pcfg->lb_pool_connect_timeout_ms;
         lbc.upstream_read_timeout_ms  = pcfg->lb_upstream_read_timeout_ms;
         lbc.upstream_write_timeout_ms = pcfg->lb_upstream_write_timeout_ms;
+        lbc.sticky_session_enabled    = pcfg->sticky_session_enabled;
+        strncpy(lbc.sticky_cookie_name, pcfg->sticky_cookie_name, sizeof(lbc.sticky_cookie_name) - 1);
         lbc.pool_idle_timeout_s       = pcfg->lb_pool_idle_timeout_s;
         lbc.passive_fail_threshold    = pcfg->lb_passive_fail_threshold;
         lbc.passive_recover_threshold = pcfg->lb_passive_recover_threshold;

@@ -72,6 +72,12 @@ typedef struct proxy_ctx {
      * instead of holding the connection/slot open indefinitely. Set at
      * ctx creation and refreshed on every successful upstream I/O. */
     uint64_t          last_upstream_io_ms;
+
+    /* Set when sticky sessions are enabled for this ctx's pool; the node
+     * lb_pick_node_sticky() chose for THIS request, used to set the
+     * sticky cookie on the response once it's ready (see
+     * deliver_response()-equivalent code paths in proxy.c/h2_client.c). */
+    upstream_node_t  *sticky_node_for_cookie;
 } proxy_ctx_t;
 
 /* Per-stream proxy context map for H2 — one ctx per concurrent stream.

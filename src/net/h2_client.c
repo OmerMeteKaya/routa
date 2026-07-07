@@ -10,6 +10,7 @@
 #include "http/h2.h"
 #include "lb/upstream.h"
 #include "util/logger.h"
+#include "http/cookie.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -644,6 +645,25 @@ static void deliver_response(h2up_conn_t *h2up, h2up_stream_t *s, worker_t *w)
     } else {
         /* reason may have been set as a literal; refresh with our static copy */
         s->resp.reason = (char *)status_reason(s->resp.status);
+    }
+
+    /* Sticky session: same rationale as the H1 upstream path in proxy.c --
+     * set on every response while enabled, not just the first. */
+    if (ctx->sticky_node_for_cookie && ctx->lb) {
+        char idx_buf[16];
+        lb_sticky_cookie_value_for_node(ctx->lb, ctx->sticky_node_for_cookie,
+                                        idx_buf, sizeof(idx_buf));
+        cookie_opts_t sticky_opts = {
+            .name      = lb_sticky_cookie_name(ctx->lb),
+            .value     = idx_buf,
+            .path      = "/",
+            .domain    = NULL,
+            .max_age   = -1,
+            .http_only = 1,
+            .secure    = 0,
+            .same_site = "Lax",
+        };
+        cookie_set(&s->resp, &sticky_opts);
     }
 
     /* Detach ctx from this h2up stream BEFORE proxy_stream_remove so that
