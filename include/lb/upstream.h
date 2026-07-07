@@ -130,9 +130,14 @@ struct upstream_node {
     /* Least-connections counter — updated atomically */
     volatile uint32_t inflight;
 
-    /* Resolved address (cached) */
-    struct sockaddr_in addr;
-    int                addr_resolved;
+    /* Resolved address (cached). sockaddr_storage holds either an IPv4
+     * (sockaddr_in) or IPv6 (sockaddr_in6) address -- addr_family says
+     * which, and callers doing raw connect()/socket() calls must use it
+     * instead of assuming AF_INET. */
+    struct sockaddr_storage addr;
+    socklen_t               addr_len;    /* actual size to pass to connect() */
+    int                     addr_family; /* AF_INET or AF_INET6 */
+    int                     addr_resolved;
 
     /* TLS upstream: 1 = connect with TLS, try ALPN h2 */
     int                use_tls;
@@ -141,11 +146,6 @@ struct upstream_node {
 /* ═══════════════════════════════════════════════════════════════════════════
  * Connection pool API
  * ═══════════════════════════════════════════════════════════════════════════*/
-
-/* Acquire an idle connection or open a new one.
- * Returns NULL if node is DOWN or pool exhausted.
- * timeout_ms: how long to wait for a slot (0 = non-blocking).             */
-upstream_conn_t *upstream_conn_acquire(upstream_node_t *node, int timeout_ms);
 
 /* Return a connection to the pool.
  * healthy=0 → connection is broken, will be closed instead of recycled.   */

@@ -18,119 +18,20 @@
 #include <openssl/err.h>
 
 #include "net/socket.h"
-
-/* ── Internal: open a new TCP connection to node ───────────────────────────*/
-static int node_connect(upstream_node_t *node, int timeout_ms) {
-    pthread_spin_lock(&node->state_lock);
-    if (!node->addr_resolved) {
-        memset(&node->addr, 0, sizeof(node->addr));
-        node->addr.sin_family = AF_INET;
-        node->addr.sin_port   = htons(node->port);
-        if (inet_pton(AF_INET, node->host, &node->addr.sin_addr) != 1) {
-            pthread_spin_unlock(&node->state_lock);
-            LOG_ERROR("upstream: cannot parse IP '%s'", node->host);
-            return -1;
-        }
-        node->addr_resolved = 1;
-    }
-    pthread_spin_unlock(&node->state_lock);
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd >= 0) {
-        net_set_nonblocking(fd);
-        fcntl(fd, F_SETFD, FD_CLOEXEC);
-    }
-    if (fd < 0) return -1;
-
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-    int ret = connect(fd, (struct sockaddr *)&node->addr, sizeof(node->addr));
-    if (ret < 0 && errno != EINPROGRESS) {
-        close(fd);
-        return -1;
-    }
-
-    if (ret == 0) return fd;   /* immediate connect (loopback) */
-
-    /* Wait for connect to complete */
-    struct timeval tv = {
-        .tv_sec  =  timeout_ms / 1000,
-        .tv_usec = (long)((timeout_ms % 1000) * 1000),
-    };
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-
-    ret = select(fd + 1, NULL, &wfds, NULL, &tv);
-    if (ret <= 0) {
-        close(fd);
-        return -1;
-    }
-
-    int err = 0;
-    socklen_t len = sizeof(err);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
-    if (err) { close(fd); return -1; }
-
-    return fd;
-}
+#include "net/poller.h"
 
 /* ── upstream_conn acquire/release ─────────────────────────────────────────*/
 
-upstream_conn_t *upstream_conn_acquire(upstream_node_t *node, int timeout_ms) {
-    pthread_spin_lock(&node->state_lock);
-    node_state_t st = node->state;
-    pthread_spin_unlock(&node->state_lock);
-
-    if (st == NODE_DOWN) return NULL;
-
-    pthread_mutex_lock(&node->pool_lock);
-
-    /* Pop from idle freelist */
-    upstream_conn_t *c = node->idle_conns;
-    if (c) {
-        node->idle_conns = c->next;
-        node->idle_count--;
-        c->next  = NULL;
-        c->state = UPSTREAM_CONN_IN_USE;
-        node->active_count++;
-        pthread_mutex_unlock(&node->pool_lock);
-        __atomic_fetch_add(&node->inflight, 1u, __ATOMIC_RELAXED);
-        return c;
-    }
-
-    /* Pool full? */
-    if (node->active_count >= node->pool_max) {
-        pthread_mutex_unlock(&node->pool_lock);
-        LOG_WARN("upstream %s:%d pool exhausted", node->host, node->port);
-        return NULL;
-    }
-
-    node->active_count++;
-    pthread_mutex_unlock(&node->pool_lock);
-
-    /* Open new connection outside the lock */
-    int fd = node_connect(node, timeout_ms > 0 ? timeout_ms : 2000);
-    if (fd < 0) {
-        pthread_mutex_lock(&node->pool_lock);
-        node->active_count--;
-        pthread_mutex_unlock(&node->pool_lock);
-        return NULL;
-    }
-
-    c = calloc(1, sizeof(upstream_conn_t));
-    if (!c) { close(fd); return NULL; }
-
-    c->fd         = fd;
-    c->state      = UPSTREAM_CONN_IN_USE;
-    c->node       = node;
-    c->created_at = time(NULL);
-    c->last_used  = c->created_at;
-    c->max_streams = 0;   /* HTTP/1.1 — HTTP/2 will set this after ALPN     */
-
-    __atomic_fetch_add(&node->inflight, 1u, __ATOMIC_RELAXED);
-    return c;
-}
+/* Bug fix / cleanup: node_connect() and upstream_conn_acquire() (the old
+ * blocking, synchronous connect-and-acquire path) were dead code -- no
+ * caller anywhere in the codebase used them. The real request-forwarding
+ * path (proxy.c / lb.c's begin_forward_on_node()) has always gone through
+ * upstream_conn_connect_async() + this same upstream_conn_release()
+ * instead. Removed rather than left to bit-rot silently; if a genuinely
+ * synchronous acquire is ever needed again, upstream_conn_connect_async()
+ * plus a short select()/poll() at the call site is the pattern to reach
+ * for (matching how hc_probe_start() in the health-check rewrite above
+ * does it), not reviving a static-linkage blocking helper. */
 
 void upstream_conn_release(upstream_conn_t *conn, int healthy) {
     upstream_node_t *node = conn->node;
@@ -205,22 +106,56 @@ void upstream_node_reap_idle(upstream_node_t *node, time_t max_age_s) {
 
 /* ── Async connect ──────────────────────────────────────────────────────────*/
 
-int upstream_conn_connect_async(upstream_node_t *node) {
+/* Resolves node->host into node->addr (IPv4 or IPv6, cached after the
+ * first call) and returns 0 on success, -1 if the host string is neither
+ * a valid IPv4 nor IPv6 literal. Bug fix / feature: previously hardcoded
+ * AF_INET + inet_pton(AF_INET, ...), silently rejecting (with a generic
+ * "cannot parse IP" error) any IPv6 upstream -- routa's config parser
+ * already accepts "[::1]:3000"-style upstream lines (see config.c), but
+ * they'd fail here at connect time. Tries IPv4 first (the common case),
+ * falls back to IPv6 only if that fails, so ordinary dotted-decimal
+ * addresses don't pay for a wasted IPv6 parse attempt. */
+static int resolve_node_addr(upstream_node_t *node) {
     pthread_spin_lock(&node->state_lock);
-    if (!node->addr_resolved) {
-        memset(&node->addr, 0, sizeof(node->addr));
-        node->addr.sin_family = AF_INET;
-        node->addr.sin_port   = htons(node->port);
-        if (inet_pton(AF_INET, node->host, &node->addr.sin_addr) != 1) {
-            pthread_spin_unlock(&node->state_lock);
-            LOG_ERROR("upstream: cannot parse IP '%s'", node->host);
-            return -1;
-        }
-        node->addr_resolved = 1;
+    if (node->addr_resolved) {
+        pthread_spin_unlock(&node->state_lock);
+        return 0;
     }
-    pthread_spin_unlock(&node->state_lock);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    memset(&node->addr, 0, sizeof(node->addr));
+
+    struct sockaddr_in *a4 = (struct sockaddr_in *)&node->addr;
+    if (inet_pton(AF_INET, node->host, &a4->sin_addr) == 1) {
+        a4->sin_family = AF_INET;
+        a4->sin_port   = htons(node->port);
+        node->addr_family = AF_INET;
+        node->addr_len     = sizeof(struct sockaddr_in);
+        node->addr_resolved = 1;
+        pthread_spin_unlock(&node->state_lock);
+        return 0;
+    }
+
+    struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&node->addr;
+    memset(a6, 0, sizeof(*a6));
+    if (inet_pton(AF_INET6, node->host, &a6->sin6_addr) == 1) {
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port   = htons(node->port);
+        node->addr_family = AF_INET6;
+        node->addr_len     = sizeof(struct sockaddr_in6);
+        node->addr_resolved = 1;
+        pthread_spin_unlock(&node->state_lock);
+        return 0;
+    }
+
+    pthread_spin_unlock(&node->state_lock);
+    LOG_ERROR("upstream: cannot parse IP '%s' as IPv4 or IPv6", node->host);
+    return -1;
+}
+
+int upstream_conn_connect_async(upstream_node_t *node) {
+    if (resolve_node_addr(node) < 0) return -1;
+
+    int fd = socket(node->addr_family, SOCK_STREAM, 0);
     if (fd >= 0) {
         net_set_nonblocking(fd);
         fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -230,7 +165,7 @@ int upstream_conn_connect_async(upstream_node_t *node) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    int ret = connect(fd, (struct sockaddr *)&node->addr, sizeof(node->addr));
+    int ret = connect(fd, (struct sockaddr *)&node->addr, node->addr_len);
     if (ret < 0 && errno != EINPROGRESS) {
         close(fd);
         return -1;
@@ -353,177 +288,375 @@ void upstream_node_record_failure(upstream_node_t *node,
 
 /* ── Active health check ────────────────────────────────────────────────────*/
 
-/* Returns 1 if probe succeeded, 0 if failed */
-/* Blocking TLS handshake on an already-connected fd, for TLS upstream
- * health probes. Verification is intentionally disabled (SSL_VERIFY_NONE)
- * -- the same trust model routa's proxy path already uses for upstream
- * connections (see h2_client.c), since upstreams are configured by the
- * operator, not arbitrary internet hosts. Returns a live SSL* on success
- * (caller must SSL_free it), or NULL on failure (fd is left open either
- * way -- caller is responsible for closing it in both cases). */
-static SSL *probe_tls_handshake(int fd, const char *hostname, int timeout_ms) {
-    SSL_CTX *sctx = SSL_CTX_new(TLS_client_method());
-    if (!sctx) return NULL;
-    SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, NULL);
-    SSL_CTX_set_mode(sctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
-                           SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+/* Bounded strstr -- strstr() itself requires a NUL-terminated haystack;
+ * this works directly on a [start,end) byte range, since HC probe
+ * response buffers aren't always NUL-terminated at the exact point
+ * that matters here. */
+static const char *strstr_bounded(const char *start, const char *end, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || (size_t)(end - start) < nlen) return NULL;
+    for (const char *p = start; p + nlen <= end; p++) {
+        if (memcmp(p, needle, nlen) == 0) return p;
+    }
+    return NULL;
+}
 
-    SSL *ssl = SSL_new(sctx);
-    SSL_CTX_free(sctx); /* SSL* keeps its own reference */
-    if (!ssl) return NULL;
-
-    SSL_set_fd(ssl, fd);
-    SSL_set_connect_state(ssl);
-    SSL_set_tlsext_host_name(ssl, hostname); /* SNI */
-
-    time_t deadline = time(NULL) + (timeout_ms > 0 ? (timeout_ms / 1000 + 1) : 3);
-    for (;;) {
-        int hret = SSL_do_handshake(ssl);
-        if (hret == 1) return ssl;
-
-        int err = SSL_get_error(ssl, hret);
-        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-            SSL_free(ssl);
-            return NULL;
+/* Minimal, dependency-free JSON scan for HC_CUSTOM: looks for a
+ * top-level "status" key (skipping whitespace-tolerant JSON) whose
+ * string value is exactly "ok" or "OK" -- NOT a full JSON parser (no
+ * nesting, no escapes, no other types), but a real key/value match
+ * instead of the previous naive strstr(body, "\"ok\"") anywhere-in-body
+ * search, which would false-positive on {"status":"not_ok"} (contains
+ * the substring "ok"), {"other_field":"ok"} (right value, wrong key),
+ * or {"message":"looks ok to me"} (neither field nor exact value).
+ * Returns 1 if a "status" key with value "ok"/"OK" is found, 0 otherwise
+ * (including on malformed input -- fails closed, matching the old
+ * function's behavior of treating "couldn't confirm ok" as a failure). */
+static int hc_json_status_ok(const char *body, size_t len) {
+    if (!body || len == 0) return 0;
+    const char *end = body + len;
+    const char *p = body;
+    while (p < end) {
+        const char *key = strstr_bounded(p, end, "\"status\"");
+        if (!key) return 0;
+        const char *q = key + 8; /* past "status" */
+        while (q < end && (*q == ' ' || *q == '\t')) q++;
+        if (q >= end || *q != ':') { p = key + 1; continue; }
+        q++;
+        while (q < end && (*q == ' ' || *q == '\t')) q++;
+        if (q + 1 >= end || *q != '"') { p = key + 1; continue; }
+        q++;
+        if (q + 1 < end &&
+            (q[0] == 'o' || q[0] == 'O') &&
+            (q[1] == 'k' || q[1] == 'K') &&
+            q + 2 < end && q[2] == '"') {
+            return 1;
         }
-        if (time(NULL) >= deadline) { SSL_free(ssl); return NULL; }
+        p = key + 1; /* keep scanning in case of multiple "status" occurrences */
+    }
+    return 0;
+}
 
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        int sel = (err == SSL_ERROR_WANT_WRITE)
-            ? select(fd + 1, NULL, &fds, NULL, &tv)
-            : select(fd + 1, &fds, NULL, NULL, &tv);
-        if (sel < 0) { SSL_free(ssl); return NULL; }
-        /* sel == 0 (timeout this iteration) just loops back and retries
-         * SSL_do_handshake, bounded by the deadline check above. */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Non-blocking, parallel health-check probes
+ *
+ * Bug fix / redesign: the previous implementation called blocking
+ * probe_node() on each node IN SEQUENCE inside a single loop. With N
+ * nodes and a per-probe timeout of T, a single slow or unresponsive node
+ * could stall the ENTIRE health-check pass for up to T ms before moving
+ * on to the next node -- with several slow nodes, or a large N, this
+ * could make the effective check interval for later nodes in the list
+ * far larger than their configured interval_ms, or even make the whole
+ * pool's health checking fall permanently behind. It also only used a
+ * single pool-wide interval (pool->nodes[0]->hc.interval_ms), ignoring
+ * whatever interval_ms other individual nodes had configured.
+ *
+ * This version runs all in-flight probes concurrently via a dedicated
+ * poller_t (independent of any worker's epoll instance -- this thread
+ * has its own event loop), advancing each probe's own connect/TLS-
+ * handshake/write/read state machine as its fd becomes ready, and
+ * honors each node's own interval_ms/timeout_ms independently. A slow
+ * node's probe no longer blocks any other node's probe from starting,
+ * progressing, or completing on schedule.
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
+typedef enum {
+    HC_PHASE_CONNECTING = 0,
+    HC_PHASE_TLS_HANDSHAKE,
+    HC_PHASE_WRITING,
+    HC_PHASE_READING,
+} hc_phase_t;
+
+typedef struct {
+    upstream_node_t *node;
+    int              fd;          /* -1 when this slot has no probe in flight */
+    hc_phase_t       phase;
+    SSL             *ssl;
+    time_t           deadline;    /* absolute wall-clock deadline for this probe */
+
+    char             req[512];
+    int              req_len;
+    int              req_sent;    /* bytes of req already written (non-TLS path) */
+
+    char             resp[256];
+    int              resp_len;    /* bytes of resp already read */
+} hc_probe_t;
+
+/* Called when a probe finishes (successfully or not) to update the
+ * node's consecutive ok/fail counters and, if a threshold is crossed,
+ * its state -- same logic the old blocking loop used inline. */
+static void hc_record_probe_result(upstream_node_t *node, int ok) {
+    if (ok) {
+        node->hc_consec_ok++;
+        node->hc_consec_fail = 0;
+        if (node->hc_consec_ok >= node->hc.threshold_up) {
+            pthread_spin_lock(&node->state_lock);
+            node_state_t st = node->state;
+            pthread_spin_unlock(&node->state_lock);
+            if (st == NODE_DOWN)
+                upstream_node_set_state(node, NODE_UP);
+        }
+    } else {
+        node->hc_consec_fail++;
+        node->hc_consec_ok = 0;
+        if (node->hc_consec_fail >= node->hc.threshold_down)
+            upstream_node_set_state(node, NODE_DOWN);
     }
 }
 
-static int probe_node(upstream_node_t *node) {
-    health_check_config_t *hc = &node->hc;
-
-    if (hc->type == HC_NONE) return 1;
-
-    int timeout_ms = hc->timeout_ms > 0 ? hc->timeout_ms : 2000;
-    int fd = node_connect(node, timeout_ms);
-    if (fd < 0) return 0;
-
-    /* TLS upstream: probes must speak TLS too, or a plaintext GET against
-     * a TLS-only port either hangs until timeout or gets a garbage/empty
-     * response, both of which look like -- and previously were
-     * mis-recorded as -- a failed health check even when the backend is
-     * perfectly healthy. */
-    SSL *ssl = NULL;
-    if (node->use_tls) {
-        ssl = probe_tls_handshake(fd, node->host, timeout_ms);
-        if (!ssl) { close(fd); return 0; }
+/* Tears down a probe's fd/SSL and marks the slot free, without touching
+ * hc_consec_ok/hc_consec_fail (caller decides via hc_record_probe_result,
+ * or skips it entirely for a probe that never really started). */
+static void hc_probe_reset(hc_probe_t *p, poller_t *poller) {
+    if (p->fd >= 0) {
+        poller_del(poller, p->fd);
+        close(p->fd);
     }
+    if (p->ssl) {
+        SSL_free(p->ssl);
+        p->ssl = NULL;
+    }
+    p->fd    = -1;
+    p->node  = NULL;
+}
 
-    if (hc->type == HC_TCP) {
-        /* For a TLS node, reaching here means the handshake above already
-         * completed -- that's a stronger, more meaningful liveness signal
-         * than a bare TCP connect would be, so no extra check is needed. */
-        if (ssl) SSL_free(ssl);
+/* Starts a new probe for node in the given slot. Returns 0 on success
+ * (slot now has an in-flight probe registered with poller), -1 if the
+ * probe couldn't even be started (e.g. connect() failed immediately) --
+ * caller should treat -1 as an immediate probe failure. */
+static int hc_probe_start(hc_probe_t *p, upstream_node_t *node, poller_t *poller) {
+    int timeout_ms = node->hc.timeout_ms > 0 ? node->hc.timeout_ms : 2000;
+
+    int fd = upstream_conn_connect_async(node);
+    if (fd < 0) return -1;
+
+    p->node     = node;
+    p->fd       = fd;
+    p->phase    = HC_PHASE_CONNECTING;
+    p->ssl      = NULL;
+    p->deadline = time(NULL) + (timeout_ms / 1000 + 1);
+    p->req_len  = 0;
+    p->req_sent = 0;
+    p->resp_len = 0;
+
+    if (poller_add(poller, fd, POLLER_WRITE | POLLER_ET, p) < 0) {
         close(fd);
-        return 1;
+        p->fd   = -1;
+        p->node = NULL;
+        return -1;
     }
+    return 0;
+}
 
-    /* HC_HTTP or HC_CUSTOM: send GET request */
-    const char *path = hc->path[0] ? hc->path : "/health";
-    char req[512];
-    int  req_len = snprintf(req, sizeof(req),
+/* Builds the HC_HTTP/HC_CUSTOM request line into p->req. Called once
+ * connect (and TLS handshake, if any) has completed. */
+static void hc_build_request(hc_probe_t *p) {
+    const char *path = p->node->hc.path[0] ? p->node->hc.path : "/health";
+    p->req_len = snprintf(p->req, sizeof(p->req),
         "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
-        path, node->host);
+        path, p->node->host);
+}
 
-    char resp[256];
-    memset(resp, 0, sizeof(resp));
-    ssize_t n;
-
-    if (ssl) {
-        /* Blocking TLS write/read -- the fd itself is still blocking
-         * (node_connect only uses non-blocking mode for the initial
-         * connect/select), so SSL_write/SSL_read here behave like their
-         * plaintext write()/read() counterparts below. */
-        int w = SSL_write(ssl, req, req_len);
-        if (w != req_len) { SSL_free(ssl); close(fd); return 0; }
-        n = SSL_read(ssl, resp, sizeof(resp) - 1);
-        SSL_free(ssl);
-    } else {
-        /* Blocking write — fd is open, timeout handled by select in connect */
-        ssize_t w = write(fd, req, (size_t)req_len);
-        if (w != req_len) { close(fd); return 0; }
-
-        /* Read response — we only need the status line */
-        struct timeval tv = {
-            .tv_sec  = timeout_ms / 1000,
-            .tv_usec = 0
-        };
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
-            close(fd); return 0;
-        }
-        n = read(fd, resp, sizeof(resp) - 1);
-    }
-    close(fd);
-    if (n <= 0) return 0;
-
-    /* Expect "HTTP/1.x 2xx" */
-    if (strncmp(resp, "HTTP/1.", 7) != 0) return 0;
-    int status = (int)strtol(resp + 9, NULL, 10);
+/* Validates a completed HC_HTTP/HC_CUSTOM response. Returns 1 (ok) or 0. */
+static int hc_validate_response(hc_probe_t *p) {
+    if (p->resp_len <= 0) return 0;
+    p->resp[p->resp_len] = '\0';
+    if (strncmp(p->resp, "HTTP/1.", 7) != 0) return 0;
+    int status = (int)strtol(p->resp + 9, NULL, 10);
     if (status < 200 || status >= 300) return 0;
+    if (p->node->hc.type == HC_CUSTOM) {
+        /* See hc_json_status_ok() below -- a real (tiny, single-field)
+         * JSON scan instead of a bare substring search, which used to
+         * accept any response containing the bytes "ok" ANYWHERE (e.g.
+         * in an unrelated field, or even inside "not_ok"). */
+        const char *body = strstr(p->resp, "\r\n\r\n");
+        if (!body) return 0;
+        body += 4;
+        return hc_json_status_ok(body, (size_t)(p->resp_len - (body - p->resp)));
+    }
+    return 1;
+}
 
-    if (hc->type == HC_CUSTOM) {
-        /* Look for {"status":"ok"} anywhere in the body */
-        if (!strstr(resp, "\"ok\"") && !strstr(resp, "\"OK\"")) return 0;
+/* Advances one probe's state machine by one step, in response to its fd
+ * becoming ready per revents (POLLER_READ/WRITE/HUP/ERR). Returns:
+ *   1  probe finished, *out_ok reflects the result
+ *   0  probe still in progress, nothing to report yet
+ *  -1  probe failed outright (fatal I/O error) -- *out_ok is always 0 in
+ *      this case too, but distinguished for clarity at the call site
+ */
+static int hc_probe_advance(hc_probe_t *p, uint32_t revents, int *out_ok) {
+    *out_ok = 0;
+
+    if (revents & (POLLER_HUP | POLLER_ERR)) return -1;
+
+    switch (p->phase) {
+    case HC_PHASE_CONNECTING: {
+        if (upstream_conn_check_connected(p->fd) < 0) return -1;
+
+        if (p->node->use_tls) {
+            SSL_CTX *sctx = SSL_CTX_new(TLS_client_method());
+            if (!sctx) return -1;
+            SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, NULL);
+            SSL_CTX_set_mode(sctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                                   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+            p->ssl = SSL_new(sctx);
+            SSL_CTX_free(sctx);
+            if (!p->ssl) return -1;
+            SSL_set_fd(p->ssl, p->fd);
+            SSL_set_connect_state(p->ssl);
+            SSL_set_tlsext_host_name(p->ssl, p->node->host);
+            p->phase = HC_PHASE_TLS_HANDSHAKE;
+            return 0; /* re-enter on next readiness event */
+        }
+
+        if (p->node->hc.type == HC_TCP) { *out_ok = 1; return 1; }
+        hc_build_request(p);
+        p->phase = HC_PHASE_WRITING;
+        return 0;
     }
 
-    return 1;
+    case HC_PHASE_TLS_HANDSHAKE: {
+        int hret = SSL_do_handshake(p->ssl);
+        if (hret == 1) {
+            if (p->node->hc.type == HC_TCP) { *out_ok = 1; return 1; }
+            hc_build_request(p);
+            p->phase = HC_PHASE_WRITING;
+            return 0;
+        }
+        int err = SSL_get_error(p->ssl, hret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return 0; /* still handshaking, wait for the next event */
+        return -1;
+    }
+
+    case HC_PHASE_WRITING: {
+        int w;
+        if (p->ssl) w = SSL_write(p->ssl, p->req + p->req_sent, p->req_len - p->req_sent);
+        else        w = (int)write(p->fd, p->req + p->req_sent, (size_t)(p->req_len - p->req_sent));
+        if (w <= 0) {
+            if (!p->ssl && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+            if (p->ssl) {
+                int err = SSL_get_error(p->ssl, w);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
+            }
+            return -1;
+        }
+        p->req_sent += w;
+        if (p->req_sent < p->req_len) return 0; /* partial write, wait for more */
+        p->phase = HC_PHASE_READING;
+        return 0;
+    }
+
+    case HC_PHASE_READING: {
+        int r;
+        if (p->ssl) r = SSL_read(p->ssl, p->resp + p->resp_len,
+                                 (int)(sizeof(p->resp) - 1 - (size_t)p->resp_len));
+        else        r = (int)read(p->fd, p->resp + p->resp_len,
+                                  sizeof(p->resp) - 1 - (size_t)p->resp_len);
+        if (r < 0) {
+            if (!p->ssl && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+            if (p->ssl) {
+                int err = SSL_get_error(p->ssl, r);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
+            }
+            return -1;
+        }
+        if (r == 0) {
+            /* EOF -- validate whatever we've accumulated so far */
+            *out_ok = hc_validate_response(p);
+            return 1;
+        }
+        p->resp_len += r;
+        if ((size_t)p->resp_len >= sizeof(p->resp) - 1) {
+            *out_ok = hc_validate_response(p);
+            return 1;
+        }
+        return 0; /* keep reading */
+    }
+    }
+    return -1;
 }
 
 static void *hc_thread_fn(void *arg) {
     upstream_pool_t *pool = (upstream_pool_t *)arg;
+    if (pool->node_count == 0) return NULL;
+
+    poller_t *poller = poller_new();
+    if (!poller) {
+        LOG_ERROR("hc: failed to create poller, health checks disabled for this pool");
+        return NULL;
+    }
+
+    hc_probe_t *probes = calloc((size_t)pool->node_count, sizeof(hc_probe_t));
+    if (!probes) { poller_free(poller); return NULL; }
+    for (int i = 0; i < pool->node_count; i++) probes[i].fd = -1;
+
+    /* last_probe_start[i]: wall-clock time the last probe for node i was
+     * kicked off (0 = never), used to honor each node's own interval_ms
+     * independently instead of a single pool-wide interval. */
+    time_t *last_probe_start = calloc((size_t)pool->node_count, sizeof(time_t));
+    if (!last_probe_start) { free(probes); poller_free(poller); return NULL; }
+
+    poller_event_t events[64];
 
     while (!pool->hc_stop) {
+        time_t now = time(NULL);
+
+        /* Start any due, not-currently-in-flight probes. */
         for (int i = 0; i < pool->node_count; i++) {
             upstream_node_t *node = pool->nodes[i];
             if (node->hc.type == HC_NONE) continue;
+            if (probes[i].fd >= 0) continue; /* already in flight */
 
-            int ok = probe_node(node);
+            int interval_ms = node->hc.interval_ms > 0 ? node->hc.interval_ms : 5000;
+            if (last_probe_start[i] != 0 &&
+                (long)(now - last_probe_start[i]) * 1000L < interval_ms)
+                continue;
 
-            if (ok) {
-                node->hc_consec_ok++;
-                node->hc_consec_fail = 0;
-                if (node->hc_consec_ok >= node->hc.threshold_up) {
-                    pthread_spin_lock(&node->state_lock);
-                    node_state_t st = node->state;
-                    pthread_spin_unlock(&node->state_lock);
-                    if (st == NODE_DOWN)
-                        upstream_node_set_state(node, NODE_UP);
-                }
-            } else {
-                node->hc_consec_fail++;
-                node->hc_consec_ok = 0;
-                if (node->hc_consec_fail >= node->hc.threshold_down)
-                    upstream_node_set_state(node, NODE_DOWN);
+            last_probe_start[i] = now;
+            if (hc_probe_start(&probes[i], node, poller) < 0) {
+                hc_record_probe_result(node, 0);
             }
         }
 
-        /* Sleep until next probe interval.
-         * Use the first node's interval or 5 s default.                    */
-        int interval_ms = 5000;
-        if (pool->node_count > 0 && pool->nodes[0]->hc.interval_ms > 0)
-            interval_ms = pool->nodes[0]->hc.interval_ms;
+        /* Wait briefly for progress on any in-flight probe -- a short,
+         * fixed poll timeout (rather than computing the exact next-due
+         * time across all nodes) keeps this loop simple and is cheap
+         * enough given health checks run at most a few times a second. */
+        int nfds = poller_wait(poller, events, 64, 200);
+        for (int e = 0; e < nfds; e++) {
+            hc_probe_t *p = (hc_probe_t *)events[e].ptr;
+            if (!p || p->fd < 0) continue;
 
-        struct timespec ts = {
-            .tv_sec  = interval_ms / 1000,
-            .tv_nsec = (long)(interval_ms % 1000) * 1000000L
-        };
-        nanosleep(&ts, NULL);
+            int ok = 0;
+            int rc = hc_probe_advance(p, events[e].events, &ok);
+            if (rc != 0) {
+                upstream_node_t *node = p->node;
+                hc_probe_reset(p, poller);
+                hc_record_probe_result(node, ok);
+            }
+            /* rc == 0: still in progress, leave it registered. */
+        }
+
+        /* Reap any probe that's been running past its own deadline --
+         * poller_wait() alone won't catch this (a connect() that never
+         * completes produces no event at all, for instance). */
+        now = time(NULL);
+        for (int i = 0; i < pool->node_count; i++) {
+            if (probes[i].fd < 0) continue;
+            if (now < probes[i].deadline) continue;
+            upstream_node_t *node = probes[i].node;
+            hc_probe_reset(&probes[i], poller);
+            hc_record_probe_result(node, 0);
+        }
     }
+
+    for (int i = 0; i < pool->node_count; i++) {
+        if (probes[i].fd >= 0) hc_probe_reset(&probes[i], poller);
+    }
+    free(last_probe_start);
+    free(probes);
+    poller_free(poller);
     return NULL;
 }
 

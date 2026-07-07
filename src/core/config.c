@@ -417,6 +417,17 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             }
             *colon = '\0';
             char *host = hostport;
+            /* IPv6 literal: "[::1]" -- strrchr() above already found the
+             * right ':' (the one separating the bracketed address from
+             * the port, not one of the address's own colons, since it's
+             * the LAST colon in the string and IPv6 literals in this
+             * syntax are always bracketed). Strip the brackets here so
+             * inet_pton(AF_INET6, ...) receives a bare address. */
+            size_t host_len = strlen(host);
+            if (host_len >= 2 && host[0] == '[' && host[host_len - 1] == ']') {
+                host[host_len - 1] = '\0';
+                host++;
+            }
             int   port = cfg_atoi(colon + 1, 0);
             if (port <= 0 || port > 65535) {
                 LOG_WARN("config:%d: upstream invalid port: %s", lineno, colon + 1);

@@ -107,20 +107,6 @@ int lb_is_tls_upstream(lb_t *lb);
 int lb_start(lb_t *lb);
 void lb_stop(lb_t *lb);
 
-/* ── Request forwarding ────────────────────────────────────────────────────
- *
- * lb_forward() picks an upstream, borrows a pooled connection, forwards the
- * serialized request, reads the response, and fills *resp.
- *
- * client_ip  — used by IP_HASH and CONSISTENT_HASH algorithms.
- * Returns  0  on success (resp filled).
- *         -1  on failure (all upstreams down, pool exhausted, timeout).
- * -------------------------------------------------------------------------*/
-int lb_forward(lb_t *lb,
-               const http_request_t *req,
-               http_response_t      *resp,
-               const char           *client_ip);
-
 /* ── Node selection (exposed for testing / custom wrappers) ────────────────*/
 upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip);
 upstream_node_t *lb_pick_node_sticky(lb_t *lb, const char *client_ip,
