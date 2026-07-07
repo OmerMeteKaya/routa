@@ -320,6 +320,9 @@ server_t *server_from_config(const routa_config_t *cfg) {
                                   cfg->socket_recv_buf_size, cfg->socket_send_buf_size);
     event_loop_set_cpu_affinity((event_loop_t *)s->loop,
                                 cfg->cpu_affinity_enabled, cfg->cpu_affinity_start_core);
+    event_loop_set_memory_limits((event_loop_t *)s->loop,
+                                 cfg->memory_soft_limit_mb, cfg->memory_hard_limit_mb);
+    event_loop_set_numa_aware((event_loop_t *)s->loop, cfg->numa_aware_enabled);
 
     if (cfg->tls_enabled) {
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);

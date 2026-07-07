@@ -129,6 +129,22 @@ void          event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_
                                       int request_timeout_ms);
 void          event_loop_set_socket_buffers(event_loop_t *loop, int recv_buf_size, int send_buf_size);
 void          event_loop_set_cpu_affinity(event_loop_t *loop, int enabled, int start_core);
+/* Opt into NUMA-aware core selection on top of cpu_affinity_enabled (has
+ * no effect if cpu_affinity_enabled is 0, or if routa wasn't built with
+ * ROUTA_NUMA, or if the running system turns out to be single-node --
+ * all three fall back silently to the existing plain round-robin core
+ * assignment). */
+void          event_loop_set_numa_aware(event_loop_t *loop, int enabled);
+/* Process-wide memory limits (both in MB, 0 = disabled). soft_limit_mb:
+ * once RSS exceeds this, new connections are rejected (existing ones are
+ * unaffected) until RSS drops back below it. hard_limit_mb: once RSS
+ * exceeds this, a graceful shutdown is triggered (same path as SIGTERM),
+ * expecting a supervisor (systemd, etc.) to restart the process. Checked
+ * periodically (see ROUTA_MEMORY_CHECK_INTERVAL_MS in event_loop.c) by a
+ * single worker, not on every request -- getting RSS requires a
+ * /proc/self/status read on Linux, too expensive for the hot path. */
+void          event_loop_set_memory_limits(event_loop_t *loop,
+                                          int soft_limit_mb, int hard_limit_mb);
 /* add_rules_v: array of { char name[128]; char value[256]; } (passed as
  * void* to avoid a header dependency on config.h's rule struct type). */
 void          event_loop_set_global_response_headers(

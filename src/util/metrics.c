@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 /* ── Global instance ────────────────────────────────────────────────────── */
 routa_metrics_t g_metrics;
@@ -18,6 +19,42 @@ const uint32_t routa_hist_bounds_ms[ROUTA_HIST_BUCKET_COUNT] = {
 void routa_metrics_init(void) {
     memset(&g_metrics, 0, sizeof(g_metrics));
 }
+
+/* ── Process RSS ────────────────────────────────────────────────────────────────────────── */
+#ifdef __linux__
+void routa_metrics_update_rss(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+
+    char line[256];
+    uint64_t rss_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            /* Format: "VmRSS:      12345 kB" */
+            (void)sscanf(line + 6, "%" SCNu64, &rss_kb);
+            break;
+        }
+    }
+    (void)fclose(f);
+
+    if (rss_kb > 0) {
+        atomic_store_explicit(&g_metrics.process_rss_bytes,
+                              rss_kb * 1024ULL, memory_order_relaxed);
+    }
+}
+#else
+#include <sys/resource.h>
+void routa_metrics_update_rss(void) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return;
+    /* ru_maxrss is peak, not current, and its unit is platform-specific
+     * (bytes on Darwin historically; POSIX doesn't standardize it) -- a
+     * best-effort fallback. Linux (the primary target platform) uses the
+     * precise /proc/self/status path above instead. */
+    atomic_store_explicit(&g_metrics.process_rss_bytes,
+                          (uint64_t)ru.ru_maxrss, memory_order_relaxed);
+}
+#endif
 
 /* ── Method string → index ──────────────────────────────────────────────── */
 static routa_method_idx_t method_to_idx(const char *m) {
@@ -240,5 +277,22 @@ int routa_metrics_prometheus(char *buf, size_t buf_sz) {
         (unsigned long long)ROUTA_METRIC_GET(h2_goaway_sent_total),
         (unsigned long long)ROUTA_METRIC_GET(h2_flow_control_stalls_total)
     );
+
+    /* ── Process memory ── */
+    PROM_APPEND(
+        "# HELP routa_process_rss_bytes Current process resident set size\n"
+        "# TYPE routa_process_rss_bytes gauge\n"
+        "routa_process_rss_bytes %llu\n"
+        "# HELP routa_memory_soft_limit_exceeded_total Times new connections were rejected due to the soft memory limit\n"
+        "# TYPE routa_memory_soft_limit_exceeded_total counter\n"
+        "routa_memory_soft_limit_exceeded_total %llu\n"
+        "# HELP routa_memory_hard_limit_exceeded_total Times a graceful shutdown was triggered by the hard memory limit\n"
+        "# TYPE routa_memory_hard_limit_exceeded_total counter\n"
+        "routa_memory_hard_limit_exceeded_total %llu\n",
+        (unsigned long long)ROUTA_METRIC_GET(process_rss_bytes),
+        (unsigned long long)ROUTA_METRIC_GET(memory_soft_limit_exceeded_total),
+        (unsigned long long)ROUTA_METRIC_GET(memory_hard_limit_exceeded_total)
+    );
+
     return (int)(p - buf);
 }

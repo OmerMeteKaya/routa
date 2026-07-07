@@ -78,6 +78,11 @@ typedef struct {
     _Atomic uint64_t h2_flow_control_stalls_total;
     _Atomic int64_t  h2_active_streams;
 
+    /* ── Process memory (updated periodically, see routa_metrics_update_rss) ── */
+    _Atomic uint64_t process_rss_bytes;
+    _Atomic uint64_t memory_soft_limit_exceeded_total; /* count of times we tripped into reject-new-conns */
+    _Atomic uint64_t memory_hard_limit_exceeded_total; /* count of times we triggered a graceful shutdown */
+
 } routa_metrics_t;
 
 /* Single global instance — defined in metrics.c */
@@ -137,6 +142,15 @@ void routa_metrics_record(const char *method_str,
 /* Connection lifecycle helpers */
 void routa_metrics_conn_open(void);
 void routa_metrics_conn_close(void);
+
+/* Reads current process RSS (Linux: /proc/self/status VmRSS; falls back to
+ * getrusage(RUSAGE_SELF) ru_maxrss on other platforms, which is peak
+ * rather than current RSS -- close enough for a soft/hard limit trigger,
+ * and the only portable option without platform-specific APIs) and
+ * stores it in g_metrics.process_rss_bytes. Cheap enough to call every
+ * couple of seconds from a single worker's sweep loop; not needed (and
+ * not safe to assume free of contention) from a hot request path. */
+void routa_metrics_update_rss(void);
 
 /* Render Prometheus text format into buf (NUL-terminated).
  * Returns bytes written (excluding NUL), -1 if buf too small.             */

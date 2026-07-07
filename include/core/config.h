@@ -322,6 +322,24 @@ typedef struct {
     int cpu_affinity_enabled;      /* default: 0 (disabled) */
     int cpu_affinity_start_core;   /* worker 0 -> this core, worker N -> this+N, wraps. default: 0 */
 
+    /* Process-wide memory limits (MB, 0 = disabled). Checked periodically
+     * (not per-request) against RSS. soft: reject new connections once
+     * exceeded, resume once back under it. hard: trigger a graceful
+     * shutdown (same path as SIGTERM), expecting a process supervisor to
+     * restart routa afterward -- routa does not restart itself in-process.
+     * These are process-wide, not truly per-worker, since worker threads
+     * share one address space/RSS -- see routa_metrics_update_rss(). */
+    int memory_soft_limit_mb;   /* default: 0 (disabled) */
+    int memory_hard_limit_mb;   /* default: 0 (disabled) */
+
+    /* NUMA-aware worker placement, layered on top of cpu_affinity_enabled.
+     * No effect unless cpu_affinity_enabled is also 1, routa was built
+     * with -DROUTA_NUMA (see CMakeLists.txt's ROUTA_NUMA option), and the
+     * running system actually has more than one NUMA node -- all three
+     * fall back silently to the existing plain round-robin core
+     * assignment otherwise. default: 0 (disabled) */
+    int numa_aware_enabled;
+
     /* Global IP-based ACL (mw_acl.c), applied to every request before any
      * pool-specific ACL. If both deny, the request is blocked at whichever
      * layer runs first (global runs first, being registered earlier). */

@@ -2,7 +2,9 @@
 #define _GNU_SOURCE
 #endif
 #include "core/event_loop.h"
+#include "core/numa.h"
 #include <sched.h>
+#include <stdatomic.h>
 #include "core/conn.h"
 #include "util/metrics.h"
 #include "net/poller.h"
@@ -92,6 +94,9 @@ struct event_loop {
     int            socket_send_buf_size;
     int            cpu_affinity_enabled;
     int            cpu_affinity_start_core;
+    int            numa_aware_enabled;   /* only meaningful when built with
+                                          * ROUTA_NUMA and cpu_affinity_enabled
+                                          * is also set -- see worker startup */
     int            keepalive_timeout_ms;
     int            request_timeout_ms;
     worker_t      *workers;
@@ -113,6 +118,17 @@ struct event_loop {
     /* Protects tls_ctx pointer during hot reload: readers (accept path)
      * hold rdlock; reloader (worker 0) holds wrlock while swapping.        */
     pthread_rwlock_t tls_reload_lock;
+
+    /* ── Process-wide memory limits (0 = disabled) ──────────────────────
+     * Checked periodically by a single worker (see worker 0's sweep-loop
+     * branch); memory_reject_new_conns is then read by every worker's
+     * accept path, which is why it's a plain atomic int rather than
+     * anything requiring the tls_reload_lock-style rwlock -- it's a
+     * simple boolean gate, not a pointer swap. */
+    int          memory_soft_limit_mb;
+    int          memory_hard_limit_mb;
+    volatile int memory_reject_new_conns; /* 1 = soft limit currently tripped, read/written via __atomic_* like `draining` above */
+    uint64_t     last_memory_check_ms;    /* routa_now_ms() of last RSS read  */
 };
 static inline void conn_poller_mod(worker_t *w, conn_t *conn, uint32_t mask) {
     if ((uint32_t)conn->poller_mask == mask) return;
@@ -434,6 +450,12 @@ static void handle_events_worker(worker_t *w) {
         /* ── Accept ── */
         if (events[i].ptr == NULL) {
             if (__atomic_load_n(&w->draining, __ATOMIC_RELAXED)) continue;
+            /* Soft memory limit tripped: decline new connections (existing
+             * ones are untouched) until RSS drops back down -- see the
+             * periodic check in worker 0's sweep-loop branch below, which
+             * is what sets/clears this flag for every worker to read. */
+            if (w->loop && __atomic_load_n(&w->loop->memory_reject_new_conns, __ATOMIC_RELAXED))
+                continue;
             for (;;) {
                 struct sockaddr_in client_addr = {0};
                 socklen_t client_len = sizeof(client_addr);
@@ -1544,6 +1566,50 @@ static void *worker_run(void *arg) {
             worker_apply_reload(w);
             }
 
+        /* ── Process memory limits (~2 s, worker 0 only) ──────────────────
+         * Reads RSS from /proc/self/status (cheap, but still not something
+         * every worker needs to do every tick), updates the metrics gauge,
+         * and:
+         *   - soft limit exceeded: sets memory_reject_new_conns so every
+         *     worker's accept path (not just worker 0's) starts declining
+         *     new connections. Cleared again once RSS drops back below the
+         *     soft limit -- this is a level-triggered gate, not a one-shot.
+         *   - hard limit exceeded: triggers the same graceful-drain path
+         *     as SIGTERM/SIGINT (g_drain_flag), expecting a process
+         *     supervisor to restart routa afterward. Only fires once per
+         *     process lifetime in practice, since drain leads to exit. */
+        if (w->worker_id == 0 && w->loop &&
+            (w->loop->memory_soft_limit_mb > 0 || w->loop->memory_hard_limit_mb > 0) &&
+            now_ms - w->loop->last_memory_check_ms >= 2000) {
+            w->loop->last_memory_check_ms = now_ms;
+            routa_metrics_update_rss();
+            uint64_t rss_mb = ROUTA_METRIC_GET(process_rss_bytes) / (1024ULL * 1024ULL);
+
+            if (w->loop->memory_hard_limit_mb > 0 &&
+                rss_mb >= (uint64_t)w->loop->memory_hard_limit_mb) {
+                LOG_WARN("Memory hard limit exceeded (%llu MB >= %d MB), "
+                         "triggering graceful shutdown",
+                         (unsigned long long)rss_mb, w->loop->memory_hard_limit_mb);
+                ROUTA_METRIC_INC(memory_hard_limit_exceeded_total);
+                extern atomic_int g_drain_flag;
+                atomic_store_explicit(&g_drain_flag, 1, memory_order_relaxed);
+            } else if (w->loop->memory_soft_limit_mb > 0) {
+                int was_rejecting = __atomic_load_n(&w->loop->memory_reject_new_conns, __ATOMIC_RELAXED);
+                int should_reject = rss_mb >= (uint64_t)w->loop->memory_soft_limit_mb;
+                if (should_reject && !was_rejecting) {
+                    LOG_WARN("Memory soft limit exceeded (%llu MB >= %d MB), "
+                             "rejecting new connections until it clears",
+                             (unsigned long long)rss_mb, w->loop->memory_soft_limit_mb);
+                    ROUTA_METRIC_INC(memory_soft_limit_exceeded_total);
+                } else if (!should_reject && was_rejecting) {
+                    LOG_INFO("Memory back under soft limit (%llu MB < %d MB), "
+                             "accepting new connections again",
+                             (unsigned long long)rss_mb, w->loop->memory_soft_limit_mb);
+                }
+                __atomic_store_n(&w->loop->memory_reject_new_conns, should_reject, __ATOMIC_RELAXED);
+            }
+        }
+
         /* ── Upstream idle connection reaper (~30 s, worker 0 only) ── */
         if (w->worker_id == 0 && w->lb &&
             now_ms - last_idle_reap_ms >= 30000) {
@@ -1927,9 +1993,23 @@ void event_loop_run(event_loop_t *loop) {
          * low-core-count machines this is a no-op in practice (every
          * worker ends up sharing the same small set of cores anyway). */
         if (loop->cpu_affinity_enabled) {
-            long n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-            if (n_cpus > 0) {
-                int target_core = (loop->cpu_affinity_start_core + i) % (int)n_cpus;
+            int target_core = -1;
+#ifdef ROUTA_NUMA
+            if (loop->numa_aware_enabled && numa_is_available()) {
+                target_core = numa_pick_core_for_worker(i, loop->n_workers,
+                                                        loop->cpu_affinity_start_core);
+            }
+#endif
+            if (target_core < 0) {
+                /* Plain round-robin fallback: NUMA disabled, unavailable
+                 * (single-node system, or not built with ROUTA_NUMA), or
+                 * numa_pick_core_for_worker() itself declined (returned
+                 * -1). Same behavior as before NUMA support existed. */
+                long n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+                if (n_cpus > 0)
+                    target_core = (loop->cpu_affinity_start_core + i) % (int)n_cpus;
+            }
+            if (target_core >= 0) {
                 cpu_set_t cpuset;
                 CPU_ZERO(&cpuset);
                 CPU_SET(target_core, &cpuset);
@@ -2021,6 +2101,17 @@ void event_loop_set_cpu_affinity(event_loop_t *loop, int enabled, int start_core
     if (!loop) return;
     loop->cpu_affinity_enabled   = enabled;
     loop->cpu_affinity_start_core = start_core;
+}
+
+void event_loop_set_numa_aware(event_loop_t *loop, int enabled) {
+    if (!loop) return;
+    loop->numa_aware_enabled = enabled;
+}
+
+void event_loop_set_memory_limits(event_loop_t *loop, int soft_limit_mb, int hard_limit_mb) {
+    if (!loop) return;
+    loop->memory_soft_limit_mb = soft_limit_mb;
+    loop->memory_hard_limit_mb = hard_limit_mb;
 }
 
 void event_loop_free(event_loop_t *loop) {

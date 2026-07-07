@@ -8,6 +8,7 @@ include(cmake/CompileFlags.cmake)
 
 # ── Options ──────────────────────────────────────────────────────────────────
 option(ROUTA_IO_URING "Use io_uring I/O backend (Linux only)" OFF)
+option(ROUTA_NUMA "Enable NUMA-aware worker placement (requires libnuma, Linux only)" OFF)
 option(ACCESS_LOG "Enable JSON access logging" OFF)
 if(ACCESS_LOG)
   target_compile_definitions(routa_core PRIVATE ROUTA_ACCESS_LOG)
@@ -68,6 +69,21 @@ target_link_libraries(routa_core PUBLIC
         ZLIB::ZLIB
 )
 target_link_libraries(routa_core PRIVATE z)
+
+# ── NUMA (Linux only, opt-in) ─────────────────────────────────────────────────
+if(ROUTA_NUMA)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "NUMA awareness is Linux-only")
+    endif()
+    find_library(LIBNUMA_LIB numa REQUIRED)
+    find_path(LIBNUMA_INCLUDE_DIR numa.h REQUIRED)
+    target_sources(routa_core PRIVATE src/core/numa.c)
+    target_link_libraries(routa_core PRIVATE ${LIBNUMA_LIB})
+    target_compile_definitions(routa_core PUBLIC ROUTA_NUMA)
+    message(STATUS "NUMA awareness: enabled")
+else()
+    message(STATUS "NUMA awareness: disabled")
+endif()
 
 # ── io_uring (Linux only, opt-in) ────────────────────────────────────────────
 if(ROUTA_IO_URING)
