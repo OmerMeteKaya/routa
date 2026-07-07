@@ -69,6 +69,31 @@ void routa_config_init(routa_config_t *cfg) {
      * line -- see routa_config_load(). */
     lb_pool_config_init(&cfg->pools[0]);
     cfg->pool_count = 0;   /* becomes 1 as soon as anything targets pools[0] */
+
+    /* ── Middleware defaults ── */
+    cfg->logger_enabled   = 1;
+    cfg->compress_enabled = 1;
+    cfg->compress_min_size = 256;
+    cfg->compress_level    = 6;
+
+    cfg->cors_enabled = 0;
+    strncpy(cfg->cors_origin,  "*", sizeof(cfg->cors_origin) - 1);
+    strncpy(cfg->cors_methods, "GET,POST,PUT,DELETE,OPTIONS", sizeof(cfg->cors_methods) - 1);
+    strncpy(cfg->cors_headers, "Content-Type,Authorization", sizeof(cfg->cors_headers) - 1);
+
+    cfg->auth_basic_enabled = 0;
+    strncpy(cfg->auth_basic_realm, "Restricted", sizeof(cfg->auth_basic_realm) - 1);
+    cfg->auth_basic_user_count = 0;
+
+    cfg->auth_jwt_enabled     = 0;
+    cfg->auth_jwt_verify_exp  = 1;
+
+    cfg->rate_limit_enabled            = 0;
+    cfg->rate_limit_requests_per_second = 100;
+    cfg->rate_limit_burst              = 200;
+
+    cfg->metrics_enabled = 1;
+    strncpy(cfg->metrics_path, "/metrics", sizeof(cfg->metrics_path) - 1);
 }
 
 void lb_pool_config_init(lb_pool_config_t *pool) {
@@ -421,6 +446,65 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             if (strcasecmp(val, "linear") == 0)       cfg->h2.stream_lookup = H2_STREAM_LOOKUP_LINEAR;
             else if (strcasecmp(val, "hashmap") == 0) cfg->h2.stream_lookup = H2_STREAM_LOOKUP_HASHMAP;
             else cfg->h2.stream_lookup = (h2_stream_lookup_t)cfg_atoi(val, H2_STREAM_LOOKUP_LINEAR);
+
+        /* ── Middleware ── */
+        } else if (strcmp(key, "logger_enabled") == 0) {
+            cfg->logger_enabled = cfg_atoi(val, 1);
+        } else if (strcmp(key, "compress_enabled") == 0) {
+            cfg->compress_enabled = cfg_atoi(val, 1);
+        } else if (strcmp(key, "compress_min_size") == 0) {
+            cfg->compress_min_size = (size_t)cfg_atoi(val, 256);
+        } else if (strcmp(key, "compress_level") == 0) {
+            cfg->compress_level = cfg_atoi(val, 6);
+        } else if (strcmp(key, "cors_enabled") == 0) {
+            cfg->cors_enabled = cfg_atoi(val, 0);
+        } else if (strcmp(key, "cors_origin") == 0) {
+            strncpy(cfg->cors_origin, val, sizeof(cfg->cors_origin) - 1);
+        } else if (strcmp(key, "cors_methods") == 0) {
+            strncpy(cfg->cors_methods, val, sizeof(cfg->cors_methods) - 1);
+        } else if (strcmp(key, "cors_headers") == 0) {
+            strncpy(cfg->cors_headers, val, sizeof(cfg->cors_headers) - 1);
+        } else if (strcmp(key, "auth_basic_enabled") == 0) {
+            cfg->auth_basic_enabled = cfg_atoi(val, 0);
+        } else if (strcmp(key, "auth_basic_realm") == 0) {
+            strncpy(cfg->auth_basic_realm, val, sizeof(cfg->auth_basic_realm) - 1);
+        } else if (strcmp(key, "auth_basic_user") == 0) {
+            /* Format: username:password */
+            char *colon = strchr(val, ':');
+            if (!colon) {
+                LOG_WARN("config:%d: auth_basic_user missing ':password': %s", lineno, val);
+            } else if (cfg->auth_basic_user_count >= 32) {
+                LOG_ERROR("config:%d: max 32 auth_basic_user entries exceeded", lineno);
+            } else {
+                *colon = '\0';
+                int ui = cfg->auth_basic_user_count++;
+                strncpy(cfg->auth_basic_users[ui].username, val,
+                       sizeof(cfg->auth_basic_users[ui].username) - 1);
+                strncpy(cfg->auth_basic_users[ui].password, colon + 1,
+                       sizeof(cfg->auth_basic_users[ui].password) - 1);
+            }
+        } else if (strcmp(key, "auth_jwt_enabled") == 0) {
+            cfg->auth_jwt_enabled = cfg_atoi(val, 0);
+        } else if (strcmp(key, "auth_jwt_secret") == 0) {
+            strncpy(cfg->auth_jwt_secret, val, sizeof(cfg->auth_jwt_secret) - 1);
+        } else if (strcmp(key, "auth_jwt_pubkey_path") == 0) {
+            strncpy(cfg->auth_jwt_pubkey_path, val, sizeof(cfg->auth_jwt_pubkey_path) - 1);
+        } else if (strcmp(key, "auth_jwt_verify_exp") == 0) {
+            cfg->auth_jwt_verify_exp = cfg_atoi(val, 1);
+        } else if (strcmp(key, "auth_jwt_issuer") == 0) {
+            strncpy(cfg->auth_jwt_issuer, val, sizeof(cfg->auth_jwt_issuer) - 1);
+        } else if (strcmp(key, "auth_jwt_audience") == 0) {
+            strncpy(cfg->auth_jwt_audience, val, sizeof(cfg->auth_jwt_audience) - 1);
+        } else if (strcmp(key, "rate_limit_enabled") == 0) {
+            cfg->rate_limit_enabled = cfg_atoi(val, 0);
+        } else if (strcmp(key, "rate_limit_requests_per_second") == 0) {
+            cfg->rate_limit_requests_per_second = cfg_atoi(val, 100);
+        } else if (strcmp(key, "rate_limit_burst") == 0) {
+            cfg->rate_limit_burst = cfg_atoi(val, 200);
+        } else if (strcmp(key, "metrics_enabled") == 0) {
+            cfg->metrics_enabled = cfg_atoi(val, 1);
+        } else if (strcmp(key, "metrics_path") == 0) {
+            strncpy(cfg->metrics_path, val, sizeof(cfg->metrics_path) - 1);
         } else {
             LOG_WARN("config:%d: unknown key '%s'", lineno, key);
         }

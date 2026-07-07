@@ -209,6 +209,57 @@ typedef struct {
 
     lb_pool_config_t pools[ROUTA_MAX_LB_POOLS];
     int              pool_count;
+    /* ── Middleware ────────────────────────────────────────────────────────
+     * Each of these enables and configures a built-in middleware
+     * (src/http/mw_*.c). All are opt-in (disabled by default) except
+     * logger and compress, which default to enabled since they have no
+     * meaningful "off" behavior difference for most deployments; disable
+     * them explicitly if not wanted. Order of application (outermost to
+     * innermost): logger -> cors -> auth (basic or jwt) -> ratelimit ->
+     * compress -> route handler. */
+
+    /* Access logging (mw_logger.c) */
+    int logger_enabled;             /* default: 1 */
+
+    /* Response compression (mw_compress.c) */
+    int    compress_enabled;        /* default: 1 */
+    size_t compress_min_size;       /* bytes, default: 256 */
+    int    compress_level;          /* zlib level 1-9, default: 6 */
+
+    /* CORS (mw_cors.c) */
+    int  cors_enabled;              /* default: 0 */
+    char cors_origin[256];          /* default: "*" */
+    char cors_methods[256];         /* default: "GET,POST,PUT,DELETE,OPTIONS" */
+    char cors_headers[256];         /* default: "Content-Type,Authorization" */
+
+    /* Basic Auth (mw_auth.c) -- users added via repeatable auth_basic_user lines */
+    int  auth_basic_enabled;        /* default: 0 */
+    char auth_basic_realm[256];     /* default: "Restricted" */
+    struct {
+        char username[256];
+        char password[256];
+    } auth_basic_users[32];
+    int auth_basic_user_count;
+
+    /* JWT Auth (mw_auth.c) -- mutually exclusive with basic auth in the
+     * default chain (both can technically be enabled, but only makes
+     * sense if applied to different routes -- not yet supported by this
+     * flat config, see roadmap). */
+    int  auth_jwt_enabled;          /* default: 0 */
+    char auth_jwt_secret[512];      /* HS256 shared secret */
+    char auth_jwt_pubkey_path[512]; /* RS256 public key PEM file path */
+    int  auth_jwt_verify_exp;       /* default: 1 */
+    char auth_jwt_issuer[256];      /* optional */
+    char auth_jwt_audience[256];    /* optional */
+
+    /* Rate limiting (mw_ratelimit.c) */
+    int rate_limit_enabled;         /* default: 0 */
+    int rate_limit_requests_per_second; /* default: 100 */
+    int rate_limit_burst;           /* default: 200 */
+
+    /* Metrics endpoint (mw_metrics.c) */
+    int  metrics_enabled;           /* default: 1 */
+    char metrics_path[256];         /* default: "/metrics" */
 } routa_config_t;
 
 /* Initialize config with sensible defaults */

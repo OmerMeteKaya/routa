@@ -45,6 +45,13 @@ typedef struct {
 
     lb_pool_entry_t     lb_pools[ROUTA_MAX_LB_POOLS];
     int                 lb_pool_count;
+    /* Metrics endpoint, set by server_from_config(); server_run() reads
+     * these to decide whether/where to register the /metrics route.
+     * Defaults (metrics_enabled=1, metrics_path="/metrics") match the
+     * previous hardcoded behavior for servers built with server_new()
+     * directly instead of server_from_config(). */
+    int  metrics_enabled;
+    char metrics_path[256];
 } server_t;
 
 server_t *server_new(int port, int n_threads);

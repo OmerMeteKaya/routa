@@ -13,6 +13,11 @@
 #include <string.h>
 #include "util/metrics.h"
 #include "http/mw_metrics.h"
+#include "http/mw_cors.h"
+#include "http/mw_auth.h"
+#include "http/mw_compress.h"
+#include "http/mw_logger.h"
+#include "http/mw_ratelimit.h"
 
 #include <stdatomic.h>
 atomic_int g_drain_flag = 0;
@@ -45,6 +50,11 @@ server_t *server_new(int port, int n_threads) {
 
     event_loop_set_max_connections((event_loop_t *)s->loop, 10000);
     g_loop = s->loop;
+
+    /* Metrics defaults, overridden by server_from_config() if used */
+    s->metrics_enabled = 1;
+    strncpy(s->metrics_path, "/metrics", sizeof(s->metrics_path) - 1);
+
     return s;
 }
 
@@ -243,8 +253,11 @@ void server_run(server_t *s) {
 
     /* ── Observability ── */
     routa_metrics_init();
-    event_loop_add_route((event_loop_t *)s->loop, "/metrics",
-                         1 << HTTP_GET, routa_metrics_handler, NULL);
+    if (s->metrics_enabled) {
+        const char *mpath = s->metrics_path[0] ? s->metrics_path : "/metrics";
+        event_loop_add_route((event_loop_t *)s->loop, mpath,
+                             1 << HTTP_GET, routa_metrics_handler, NULL);
+    }
     
     event_loop_run((event_loop_t *)s->loop);
 }
@@ -263,6 +276,79 @@ server_t *server_from_config(const routa_config_t *cfg) {
 
     if (cfg->tls_enabled)
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);
+
+    s->metrics_enabled = cfg->metrics_enabled;
+    if (cfg->metrics_path[0])
+        strncpy(s->metrics_path, cfg->metrics_path, sizeof(s->metrics_path) - 1);
+
+    /* ── Middleware, applied in the order registered (outermost first):
+     * logger -> cors -> auth (basic or jwt) -> ratelimit -> compress ──── */
+    if (cfg->logger_enabled) {
+        server_use(s, mw_logger, NULL);
+    }
+    if (cfg->cors_enabled) {
+        cors_config_t *cors_cfg = mw_cors_config_new(
+            cfg->cors_origin, cfg->cors_methods, cfg->cors_headers);
+        if (cors_cfg) server_use(s, mw_cors, cors_cfg);
+        /* Note: cors_cfg is intentionally leaked for the process lifetime
+         * (freed at exit) -- mirrors the existing lifetime pattern for
+         * static_configs[] in this same function; server_free() doesn't
+         * currently track middleware ctx pointers for cleanup. */
+    }
+    if (cfg->auth_basic_enabled) {
+        basic_auth_config_t *auth_cfg = basic_auth_config_new(cfg->auth_basic_realm);
+        if (auth_cfg) {
+            for (int i = 0; i < cfg->auth_basic_user_count; i++) {
+                basic_auth_config_add_user(auth_cfg,
+                    cfg->auth_basic_users[i].username,
+                    cfg->auth_basic_users[i].password);
+            }
+            server_use(s, mw_basic_auth, auth_cfg);
+        }
+    }
+    if (cfg->auth_jwt_enabled) {
+        jwt_config_t *jwt_cfg = NULL;
+        if (cfg->auth_jwt_secret[0]) {
+            jwt_cfg = jwt_config_new_hs256(cfg->auth_jwt_secret);
+        } else if (cfg->auth_jwt_pubkey_path[0]) {
+            FILE *pkf = fopen(cfg->auth_jwt_pubkey_path, "r");
+            if (pkf) {
+                char pembuf[8192];
+                size_t n = fread(pembuf, 1, sizeof(pembuf) - 1, pkf);
+                pembuf[n] = '\0';
+                fclose(pkf);
+                jwt_cfg = jwt_config_new_rs256(pembuf);
+            } else {
+                LOG_ERROR("server_from_config: cannot open auth_jwt_pubkey_path '%s'",
+                          cfg->auth_jwt_pubkey_path);
+            }
+        } else {
+            LOG_ERROR("server_from_config: auth_jwt_enabled but neither "
+                      "auth_jwt_secret nor auth_jwt_pubkey_path set");
+        }
+        if (jwt_cfg) {
+            jwt_cfg->verify_exp = cfg->auth_jwt_verify_exp;
+            if (cfg->auth_jwt_issuer[0])
+                strncpy(jwt_cfg->issuer, cfg->auth_jwt_issuer, sizeof(jwt_cfg->issuer) - 1);
+            if (cfg->auth_jwt_audience[0])
+                strncpy(jwt_cfg->audience, cfg->auth_jwt_audience, sizeof(jwt_cfg->audience) - 1);
+            server_use(s, mw_jwt_auth, jwt_cfg);
+        }
+    }
+    if (cfg->rate_limit_enabled) {
+        rate_limit_config_t *rl_cfg = mw_rate_limit_config_new(
+            cfg->rate_limit_requests_per_second, cfg->rate_limit_burst);
+        if (rl_cfg) server_use(s, mw_rate_limit, rl_cfg);
+    }
+    if (cfg->compress_enabled) {
+        compress_config_t *cc = calloc(1, sizeof(compress_config_t));
+        if (cc) {
+            cc->min_size = cfg->compress_min_size;
+            cc->level    = cfg->compress_level;
+            cc->prefer   = COMPRESS_PREFER_GZIP;
+            server_use(s, mw_compress, cc);
+        }
+    }
 
     for (int i = 0; i < cfg->static_count; i++)
         server_static(s, cfg->static_dirs[i].url_prefix,
