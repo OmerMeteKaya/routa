@@ -26,6 +26,8 @@ struct worker {
     conn_t        **active_conns;
     int             active_conn_count;
     int             max_connections;
+    int             socket_recv_buf_size;   /* 0 = OS default, from config */
+    int             socket_send_buf_size;   /* 0 = OS default, from config */
     int             keepalive_timeout_ms;  /* default: 30000, from config */
     int             request_timeout_ms;    /* default: 10000, from config */
     int             should_stop;
@@ -123,6 +125,7 @@ void          event_loop_set_max_connections(event_loop_t *loop,
                                              int max_connections);
 void          event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
                                       int request_timeout_ms);
+void          event_loop_set_socket_buffers(event_loop_t *loop, int recv_buf_size, int send_buf_size);
 /* add_rules_v: array of { char name[128]; char value[256]; } (passed as
  * void* to avoid a header dependency on config.h's rule struct type). */
 void          event_loop_set_global_response_headers(

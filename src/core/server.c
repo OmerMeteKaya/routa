@@ -18,6 +18,7 @@
 #include "http/mw_compress.h"
 #include "http/mw_logger.h"
 #include "http/mw_ratelimit.h"
+#include "http/mw_acl.h"
 
 #include <stdatomic.h>
 atomic_int g_drain_flag = 0;
@@ -141,7 +142,22 @@ void server_use(server_t *s, middleware_fn_t fn, void *ctx) {
 
 static int lb_route_handler(const http_request_t *req,
                              http_response_t *resp, void *ctx) {
-    (void)req; (void)resp; (void)ctx;
+    lb_handler_ctx_t *hctx = (lb_handler_ctx_t *)ctx;
+    /* Pool-scoped ACL check. Runs in addition to (after) any global ACL
+     * middleware -- a request that passed the global ACL can still be
+     * blocked here by a pool-specific rule. resp->status is left at 0
+     * (its initialized default) on success -- the event loop's
+     * dispatch code (see handle_events_worker()) interprets
+     * resp.status == 0 plus a matched route with an lb bound to it as
+     * "hand this off to the proxy", so leaving it untouched here is
+     * what allows the request to actually reach the upstream. */
+    if (hctx && hctx->acl) {
+        if (!acl_check((const acl_config_t *)hctx->acl, req->remote_ip)) {
+            http_response_set_status(resp, 403, "Forbidden");
+            http_response_set_header(resp, "Content-Type", "text/plain");
+            http_response_set_body(resp, "Forbidden\n", 10);
+        }
+    }
     return 0;
 }
 
@@ -214,9 +230,31 @@ int server_lb_route(server_t *s, const char *path, int methods) {
     ctx->lb = s->lb;
     s->lb_route_ctx = ctx;
 
+    /* Record which pool entry this ctx belongs to, so
+     * server_lb_set_acl() (called after this, for the same pool) can
+     * find and update it. */
+    for (int i = 0; i < s->lb_pool_count; i++) {
+        if (s->lb_pools[i].lb == s->lb && s->lb_pools[i].route_ctx == NULL) {
+            s->lb_pools[i].route_ctx = ctx;
+            break;
+        }
+    }
+
     event_loop_add_route((event_loop_t *)s->loop,
                          path, methods, lb_route_handler, ctx);
     return 0;
+}
+
+/* Attaches an ACL to the most recently routed pool (the one from the
+ * immediately preceding server_lb_route() call). Must be called AFTER
+ * server_lb_route() for that pool, since the route_ctx it updates is
+ * only created there. Ownership of acl passes to the server; it is not
+ * currently freed by server_free() (mirrors the existing leak-until-exit
+ * pattern for other middleware configs in this file). */
+void server_lb_set_acl(server_t *s, void *acl) {
+    if (!s || s->lb_pool_count == 0) return;
+    lb_handler_ctx_t *ctx = (lb_handler_ctx_t *)s->lb_pools[s->lb_pool_count - 1].route_ctx;
+    if (ctx) ctx->acl = acl;
 }
 
 /* ── server_run ─────────────────────────────────────────────────────────────*/
@@ -278,6 +316,8 @@ server_t *server_from_config(const routa_config_t *cfg) {
     event_loop_set_global_response_headers(
         cfg->response_header_add, cfg->response_header_add_count,
         cfg->response_header_remove, cfg->response_header_remove_count);
+    event_loop_set_socket_buffers((event_loop_t *)s->loop,
+                                  cfg->socket_recv_buf_size, cfg->socket_send_buf_size);
 
     if (cfg->tls_enabled)
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);
@@ -290,6 +330,16 @@ server_t *server_from_config(const routa_config_t *cfg) {
      * logger -> cors -> auth (basic or jwt) -> ratelimit -> compress ──── */
     if (cfg->logger_enabled) {
         server_use(s, mw_logger, NULL);
+    }
+    if (cfg->acl_enabled) {
+        acl_config_t *acl_cfg = acl_config_new(cfg->acl_default_allow);
+        if (acl_cfg) {
+            for (int i = 0; i < cfg->acl_rule_count; i++) {
+                acl_config_add_rule(acl_cfg, cfg->acl_rules[i].rule,
+                                    cfg->acl_rules[i].action == 0 ? ACL_ACTION_ALLOW : ACL_ACTION_DENY);
+            }
+            server_use(s, mw_acl, acl_cfg);
+        }
     }
     if (cfg->cors_enabled) {
         cors_config_t *cors_cfg = mw_cors_config_new(
@@ -408,6 +458,17 @@ server_t *server_from_config(const routa_config_t *cfg) {
         }
         const char *route = pcfg->route[0] ? pcfg->route : "/*";
         server_lb_route(s, route, 0xFF);
+
+        if (pcfg->acl_enabled) {
+            acl_config_t *pool_acl = acl_config_new(pcfg->acl_default_allow);
+            if (pool_acl) {
+                for (int i = 0; i < pcfg->acl_rule_count; i++) {
+                    acl_config_add_rule(pool_acl, pcfg->acl_rules[i].rule,
+                                        pcfg->acl_rules[i].action == 0 ? ACL_ACTION_ALLOW : ACL_ACTION_DENY);
+                }
+                server_lb_set_acl(s, pool_acl);
+            }
+        }
     }
 
     return s;

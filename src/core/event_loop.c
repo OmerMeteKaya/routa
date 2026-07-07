@@ -87,6 +87,8 @@ struct event_loop {
     int            port;
     int            n_workers;
     int            max_connections;
+    int            socket_recv_buf_size;
+    int            socket_send_buf_size;
     int            keepalive_timeout_ms;
     int            request_timeout_ms;
     worker_t      *workers;
@@ -448,6 +450,12 @@ static void handle_events_worker(worker_t *w) {
                 int qa = 1;
                 setsockopt(client_fd, IPPROTO_TCP, TCP_QUICKACK, &qa, sizeof(qa));
 #endif
+                if (w->socket_recv_buf_size > 0)
+                    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF,
+                              &w->socket_recv_buf_size, sizeof(w->socket_recv_buf_size));
+                if (w->socket_send_buf_size > 0)
+                    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF,
+                              &w->socket_send_buf_size, sizeof(w->socket_send_buf_size));
                 char client_ip[INET_ADDRSTRLEN] = {0};
                 inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
@@ -1888,6 +1896,8 @@ void event_loop_run(event_loop_t *loop) {
         w->max_connections    = loop->max_connections;
         w->keepalive_timeout_ms = loop->keepalive_timeout_ms > 0 ? loop->keepalive_timeout_ms : 30000;
         w->request_timeout_ms   = loop->request_timeout_ms   > 0 ? loop->request_timeout_ms   : 10000;
+        w->socket_recv_buf_size  = loop->socket_recv_buf_size;
+        w->socket_send_buf_size  = loop->socket_send_buf_size;
         w->tls_ctx            = loop->tls_ctx;
         w->router             = g_router;
         w->chain              = g_chain;
@@ -1973,6 +1983,12 @@ void event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
     if (!loop) return;
     loop->keepalive_timeout_ms = keepalive_timeout_ms > 0 ? keepalive_timeout_ms : 30000;
     loop->request_timeout_ms   = request_timeout_ms   > 0 ? request_timeout_ms   : 10000;
+}
+
+void event_loop_set_socket_buffers(event_loop_t *loop, int recv_buf_size, int send_buf_size) {
+    if (!loop) return;
+    loop->socket_recv_buf_size = recv_buf_size;
+    loop->socket_send_buf_size = send_buf_size;
 }
 
 void event_loop_free(event_loop_t *loop) {

@@ -94,6 +94,10 @@ void routa_config_init(routa_config_t *cfg) {
 
     cfg->metrics_enabled = 1;
     strncpy(cfg->metrics_path, "/metrics", sizeof(cfg->metrics_path) - 1);
+
+    cfg->acl_enabled       = 0;
+    cfg->acl_default_allow = 1;
+    cfg->acl_rule_count    = 0;
 }
 
 void lb_pool_config_init(lb_pool_config_t *pool) {
@@ -116,6 +120,10 @@ void lb_pool_config_init(lb_pool_config_t *pool) {
     pool->lb_hc_timeout_ms            = 2000;
     pool->lb_hc_threshold_up          = 2;
     pool->lb_hc_threshold_down        = 3;
+
+    pool->acl_enabled       = 0;
+    pool->acl_default_allow = 1;
+    pool->acl_rule_count    = 0;
 }
 
 /* ---- Simple line-based parser ---- */
@@ -352,6 +360,48 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                 LOG_WARN("config:%d: unknown lb_* key '%s'", lineno, key);
             }
             continue;
+        }
+
+        /* Pool-scoped ACL. Same active-pool targeting rule as headers. */
+        if (strcmp(key, "acl_default") == 0 ||
+            strcmp(key, "acl_allow") == 0 ||
+            strcmp(key, "acl_deny") == 0) {
+            /* Only treat these as pool-scoped when inside a [pool ...]
+             * section -- otherwise they were already handled by the
+             * global acl_* branch above (which runs earlier in this
+             * if/else chain and does NOT continue into this block,
+             * since it's a separate top-level if). We only get here at
+             * all when active_pool >= 0, guarded below. */
+            if (active_pool >= 0) {
+                lb_pool_config_t *pool = &cfg->pools[active_pool];
+                if (strcmp(key, "acl_default") == 0) {
+                    pool->acl_enabled = 1;
+                    pool->acl_default_allow = (strcasecmp(val, "allow") == 0) ? 1 : 0;
+                } else if (strcmp(key, "acl_allow") == 0) {
+                    pool->acl_enabled = 1;
+                    if (pool->acl_rule_count < ROUTA_MAX_ACL_RULES) {
+                        int ai = pool->acl_rule_count++;
+                        strncpy(pool->acl_rules[ai].rule, val, sizeof(pool->acl_rules[ai].rule) - 1);
+                        pool->acl_rules[ai].action = 0;
+                    } else {
+                        LOG_ERROR("config:%d: max %d acl rules exceeded for pool",
+                                  lineno, ROUTA_MAX_ACL_RULES);
+                    }
+                } else { /* acl_deny */
+                    pool->acl_enabled = 1;
+                    if (pool->acl_rule_count < ROUTA_MAX_ACL_RULES) {
+                        int ai = pool->acl_rule_count++;
+                        strncpy(pool->acl_rules[ai].rule, val, sizeof(pool->acl_rules[ai].rule) - 1);
+                        pool->acl_rules[ai].action = 1;
+                    } else {
+                        LOG_ERROR("config:%d: max %d acl rules exceeded for pool",
+                                  lineno, ROUTA_MAX_ACL_RULES);
+                    }
+                }
+                continue;
+            }
+            /* active_pool < 0: fall through to the global acl_* handling
+             * further down in this function (do NOT continue here). */
         }
 
         /* Pool-scoped header manipulation. Uses the same "applies to the
@@ -593,6 +643,33 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                        sizeof(cfg->response_header_add[ri].name) - 1);
                 strncpy(cfg->response_header_add[ri].value, trim(colon + 1),
                        sizeof(cfg->response_header_add[ri].value) - 1);
+            }
+        } else if (strcmp(key, "socket_recv_buf_size") == 0) {
+            cfg->socket_recv_buf_size = cfg_atoi(val, 0);
+        } else if (strcmp(key, "socket_send_buf_size") == 0) {
+            cfg->socket_send_buf_size = cfg_atoi(val, 0);
+        } else if (strcmp(key, "acl_default") == 0) {
+            cfg->acl_enabled = 1;
+            cfg->acl_default_allow = (strcasecmp(val, "allow") == 0) ? 1 : 0;
+        } else if (strcmp(key, "acl_allow") == 0) {
+            cfg->acl_enabled = 1;
+            if (cfg->acl_rule_count < ROUTA_MAX_ACL_RULES) {
+                int ai = cfg->acl_rule_count++;
+                strncpy(cfg->acl_rules[ai].rule, val, sizeof(cfg->acl_rules[ai].rule) - 1);
+                cfg->acl_rules[ai].action = 0;   /* allow */
+            } else {
+                LOG_ERROR("config:%d: max %d acl_allow/acl_deny rules exceeded",
+                          lineno, ROUTA_MAX_ACL_RULES);
+            }
+        } else if (strcmp(key, "acl_deny") == 0) {
+            cfg->acl_enabled = 1;
+            if (cfg->acl_rule_count < ROUTA_MAX_ACL_RULES) {
+                int ai = cfg->acl_rule_count++;
+                strncpy(cfg->acl_rules[ai].rule, val, sizeof(cfg->acl_rules[ai].rule) - 1);
+                cfg->acl_rules[ai].action = 1;   /* deny */
+            } else {
+                LOG_ERROR("config:%d: max %d acl_allow/acl_deny rules exceeded",
+                          lineno, ROUTA_MAX_ACL_RULES);
             }
         } else if (strcmp(key, "global_response_header_remove") == 0) {
             if (cfg->response_header_remove_count >= ROUTA_MAX_GLOBAL_HEADER_RULES) {

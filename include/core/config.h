@@ -61,6 +61,7 @@ typedef enum {
 } cfg_hc_type_t;
 
 #define ROUTA_MAX_LB_POOLS 16
+#define ROUTA_MAX_ACL_RULES 64
 
 /* One independently-configured upstream pool: its own upstream list, LB
  * algorithm, health-check settings, retry policy, and the path pattern
@@ -118,6 +119,14 @@ typedef struct {
     int      response_header_add_count;
     char     response_header_remove[LB_MAX_HEADER_RULES][128];
     int      response_header_remove_count;
+
+    /* Pool-scoped IP-based ACL, applied in addition to (after) any global
+     * ACL rules -- a request that passes the global ACL can still be
+     * blocked by a pool-specific one. */
+    int  acl_enabled;
+    int  acl_default_allow;
+    struct { char rule[128]; int action; } acl_rules[ROUTA_MAX_ACL_RULES];
+    int  acl_rule_count;
 } lb_pool_config_t;
 
 /* ── HTTP/2 ──────────────────────────────────────────────────────────────── */
@@ -275,6 +284,22 @@ typedef struct {
     /* Metrics endpoint (mw_metrics.c) */
     int  metrics_enabled;           /* default: 1 */
     char metrics_path[256];         /* default: "/metrics" */
+
+    /* Socket buffer sizes (SO_RCVBUF/SO_SNDBUF on accepted client sockets).
+     * 0 = leave at OS default. Tuning these up can meaningfully improve
+     * throughput on high-bandwidth-delay-product links (e.g. serving
+     * large responses to distant clients); tuning down reduces per-
+     * connection memory footprint on memory-constrained deployments. */
+    int socket_recv_buf_size;   /* bytes, default: 0 (OS default) */
+    int socket_send_buf_size;   /* bytes, default: 0 (OS default) */
+
+    /* Global IP-based ACL (mw_acl.c), applied to every request before any
+     * pool-specific ACL. If both deny, the request is blocked at whichever
+     * layer runs first (global runs first, being registered earlier). */
+    int  acl_enabled;
+    int  acl_default_allow;   /* default: 1 (allow) */
+    struct { char rule[128]; int action; } acl_rules[ROUTA_MAX_ACL_RULES];  /* action: 0=allow,1=deny */
+    int  acl_rule_count;
 
     /* Global header manipulation, applied to EVERY response (proxy,
      * static file, custom route handler alike) in addition to any

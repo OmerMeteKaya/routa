@@ -51,6 +51,7 @@ add_library(routa_core STATIC ${ROUTA_SOURCES}
         src/http/cookie.c
         include/http/mw_auth.h
         src/http/mw_auth.c
+        src/http/mw_acl.c
         src/util/metrics.c
         src/http/mw_metrics.c
         include/util/metrics.h

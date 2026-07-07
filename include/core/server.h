@@ -26,7 +26,12 @@ typedef struct {
  * Public so event_loop.c's request-dispatch loop can read ctx->lb to
  * find the correct pool for a matched route, instead of assuming a
  * single server-wide lb_t. */
-typedef struct { lb_t *lb; } lb_handler_ctx_t;
+typedef struct {
+    lb_t *lb;
+    void *acl;   /* acl_config_t*, or NULL if this pool has no ACL rules.
+                 * Declared void* to avoid a header dependency on
+                 * mw_acl.h from server.h. */
+} lb_handler_ctx_t;
 
 typedef struct {
     struct event_loop  *loop;
@@ -77,6 +82,7 @@ int  server_lb_add_upstream_tls(server_t *s,
 server_t *server_from_config(const routa_config_t *cfg);
 server_t *server_from_config_file(const char *path);
 int server_lb_route(server_t *s, const char *path, int methods);
+void server_lb_set_acl(server_t *s, void *acl);
 
 #define HTTP_GET_M     (1 << HTTP_GET)
 #define HTTP_POST_M    (1 << HTTP_POST)
