@@ -14,6 +14,8 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "net/socket.h"
 
@@ -352,15 +354,78 @@ void upstream_node_record_failure(upstream_node_t *node,
 /* ── Active health check ────────────────────────────────────────────────────*/
 
 /* Returns 1 if probe succeeded, 0 if failed */
+/* Blocking TLS handshake on an already-connected fd, for TLS upstream
+ * health probes. Verification is intentionally disabled (SSL_VERIFY_NONE)
+ * -- the same trust model routa's proxy path already uses for upstream
+ * connections (see h2_client.c), since upstreams are configured by the
+ * operator, not arbitrary internet hosts. Returns a live SSL* on success
+ * (caller must SSL_free it), or NULL on failure (fd is left open either
+ * way -- caller is responsible for closing it in both cases). */
+static SSL *probe_tls_handshake(int fd, const char *hostname, int timeout_ms) {
+    SSL_CTX *sctx = SSL_CTX_new(TLS_client_method());
+    if (!sctx) return NULL;
+    SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, NULL);
+    SSL_CTX_set_mode(sctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                           SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
+    SSL *ssl = SSL_new(sctx);
+    SSL_CTX_free(sctx); /* SSL* keeps its own reference */
+    if (!ssl) return NULL;
+
+    SSL_set_fd(ssl, fd);
+    SSL_set_connect_state(ssl);
+    SSL_set_tlsext_host_name(ssl, hostname); /* SNI */
+
+    time_t deadline = time(NULL) + (timeout_ms > 0 ? (timeout_ms / 1000 + 1) : 3);
+    for (;;) {
+        int hret = SSL_do_handshake(ssl);
+        if (hret == 1) return ssl;
+
+        int err = SSL_get_error(ssl, hret);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            SSL_free(ssl);
+            return NULL;
+        }
+        if (time(NULL) >= deadline) { SSL_free(ssl); return NULL; }
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        int sel = (err == SSL_ERROR_WANT_WRITE)
+            ? select(fd + 1, NULL, &fds, NULL, &tv)
+            : select(fd + 1, &fds, NULL, NULL, &tv);
+        if (sel < 0) { SSL_free(ssl); return NULL; }
+        /* sel == 0 (timeout this iteration) just loops back and retries
+         * SSL_do_handshake, bounded by the deadline check above. */
+    }
+}
+
 static int probe_node(upstream_node_t *node) {
     health_check_config_t *hc = &node->hc;
 
     if (hc->type == HC_NONE) return 1;
 
-    int fd = node_connect(node, hc->timeout_ms > 0 ? hc->timeout_ms : 2000);
+    int timeout_ms = hc->timeout_ms > 0 ? hc->timeout_ms : 2000;
+    int fd = node_connect(node, timeout_ms);
     if (fd < 0) return 0;
 
+    /* TLS upstream: probes must speak TLS too, or a plaintext GET against
+     * a TLS-only port either hangs until timeout or gets a garbage/empty
+     * response, both of which look like -- and previously were
+     * mis-recorded as -- a failed health check even when the backend is
+     * perfectly healthy. */
+    SSL *ssl = NULL;
+    if (node->use_tls) {
+        ssl = probe_tls_handshake(fd, node->host, timeout_ms);
+        if (!ssl) { close(fd); return 0; }
+    }
+
     if (hc->type == HC_TCP) {
+        /* For a TLS node, reaching here means the handshake above already
+         * completed -- that's a stronger, more meaningful liveness signal
+         * than a bare TCP connect would be, so no extra check is needed. */
+        if (ssl) SSL_free(ssl);
         close(fd);
         return 1;
     }
@@ -372,26 +437,37 @@ static int probe_node(upstream_node_t *node) {
         "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
         path, node->host);
 
-    /* Blocking write — fd is open, timeout handled by select in connect */
-    ssize_t w = write(fd, req, (size_t)req_len);
-    if (w != req_len) { close(fd); return 0; }
-
-    /* Read response — we only need the status line */
     char resp[256];
     memset(resp, 0, sizeof(resp));
+    ssize_t n;
 
-    struct timeval tv = {
-        .tv_sec  = (hc->timeout_ms > 0 ? hc->timeout_ms : 2000) / 1000,
-        .tv_usec = 0
-    };
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
-        close(fd); return 0;
+    if (ssl) {
+        /* Blocking TLS write/read -- the fd itself is still blocking
+         * (node_connect only uses non-blocking mode for the initial
+         * connect/select), so SSL_write/SSL_read here behave like their
+         * plaintext write()/read() counterparts below. */
+        int w = SSL_write(ssl, req, req_len);
+        if (w != req_len) { SSL_free(ssl); close(fd); return 0; }
+        n = SSL_read(ssl, resp, sizeof(resp) - 1);
+        SSL_free(ssl);
+    } else {
+        /* Blocking write — fd is open, timeout handled by select in connect */
+        ssize_t w = write(fd, req, (size_t)req_len);
+        if (w != req_len) { close(fd); return 0; }
+
+        /* Read response — we only need the status line */
+        struct timeval tv = {
+            .tv_sec  = timeout_ms / 1000,
+            .tv_usec = 0
+        };
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        if (select(fd + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            close(fd); return 0;
+        }
+        n = read(fd, resp, sizeof(resp) - 1);
     }
-
-    ssize_t n = read(fd, resp, sizeof(resp) - 1);
     close(fd);
     if (n <= 0) return 0;
 

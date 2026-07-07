@@ -85,6 +85,12 @@ struct upstream_node {
     char     host[256];
     uint16_t port;
     int      weight;          /* for Weighted RR and P2C                    */
+    int      current_weight;  /* Smooth WRR dynamic state, guarded by the
+                                * owning lb_t's wrr_lock (see pick_wrr() in
+                                * lb.c) -- nginx-style: incremented by weight
+                                * each pick, winner decremented by total
+                                * weight, so bursts of the same high-weight
+                                * node get spread out rather than clustered. */
 
     node_state_t       state;
     pthread_spinlock_t state_lock;

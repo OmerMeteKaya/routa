@@ -142,32 +142,53 @@ static upstream_node_t *pick_up_node(upstream_pool_t *pool) {
     return NULL;
 }
 
-/* Smooth Weighted Round Robin (Nginx-style) */
+/* Smooth Weighted Round Robin, nginx-style
+ * (ngx_http_upstream_get_peer / ngx_http_upstream_round_robin.c algorithm):
+ *
+ *   for each UP node n:  n.current_weight += n.weight
+ *   pick the node with the highest current_weight
+ *   winner.current_weight -= total_weight_of_all_UP_nodes
+ *
+ * This is a single O(n) pass (accumulate total weight and track the
+ * running max in the same loop) and spreads repeated picks of a
+ * high-weight node out evenly instead of clustering them -- e.g. weights
+ * {5,1,1} produces a sequence like A A B A C A A rather than A A A A A B C,
+ * which matters for real traffic smoothing (avoids bursts hitting one
+ * backend back-to-back) even though both sequences have the same 5:1:1
+ * long-run ratio. current_weight lives on each upstream_node_t and is
+ * only ever touched under wrr_lock, so no atomics are needed for it. */
 static upstream_node_t *pick_wrr(lb_t *lb) {
     upstream_pool_t *pool = lb->pool;
     if (pool->node_count == 0) return NULL;
 
     pthread_mutex_lock(&lb->wrr_lock);
 
-    /* Find max weight among UP nodes. Intentionally UP-only (not
-     * is_selectable) -- the weighted math below assumes stable
-     * membership for the duration of this call, which a half-open trial
-     * (won via a one-shot CAS) can't provide across two loop passes
-     * without either double-counting it or racing another caller for
-     * the same slot. A half-open trial for this pool is instead given a
-     * chance via the dedicated check below, before falling into the
-     * weighted-only path. */
-    int max_w = 0;
+    /* Single pass: accumulate total weight of UP nodes, bump each UP
+     * node's current_weight, and track the running best candidate.
+     * Intentionally UP-only (not is_selectable) -- the weighted math
+     * assumes stable pool membership for the duration of this call, which
+     * a half-open trial (won via a one-shot CAS) can't provide. A
+     * half-open trial for this pool is instead given a dedicated chance
+     * below, only when no UP node exists at all. */
+    int total_w = 0;
+    upstream_node_t *best = NULL;
+    int best_cw = 0;
     for (int i = 0; i < pool->node_count; i++) {
         upstream_node_t *n = pool->nodes[i];
         pthread_spin_lock(&n->state_lock);
         node_state_t st = n->state;
         pthread_spin_unlock(&n->state_lock);
-        if (st == NODE_UP && n->weight > max_w) max_w = n->weight;
+        if (st != NODE_UP || n->weight <= 0) continue;
+
+        total_w += n->weight;
+        n->current_weight += n->weight;
+        if (!best || n->current_weight > best_cw) {
+            best = n;
+            best_cw = n->current_weight;
+        }
     }
 
-    upstream_node_t *best = NULL;
-    if (max_w == 0) {
+    if (!best) {
         /* No UP nodes at all -- this is exactly the situation half-open
          * exists for. Give one DOWN node (if its trial window has
          * elapsed) a chance to prove it's back. */
@@ -175,37 +196,12 @@ static upstream_node_t *pick_wrr(lb_t *lb) {
             upstream_node_t *n = pool->nodes[i];
             if (upstream_node_is_selectable(n, pool)) { best = n; break; }
         }
-        goto done;
+        pthread_mutex_unlock(&lb->wrr_lock);
+        return best;
     }
 
-    /* Smooth WRR: pick node with highest (effective_weight - current_weight) */
-    int total_w = 0;
-    for (int i = 0; i < pool->node_count; i++) {
-        upstream_node_t *n = pool->nodes[i];
-        pthread_spin_lock(&n->state_lock);
-        node_state_t st = n->state;
-        pthread_spin_unlock(&n->state_lock);
-        if (st != NODE_UP) continue;
-        total_w += n->weight;
-        /* reuse inflight as running current_weight — harmless for WRR */
-    }
-    /* Simple WRR fallback when weights equal */
-    if (total_w == 0) goto done;
+    best->current_weight -= total_w;
 
-    uint32_t rr = __atomic_fetch_add(&pool->rr_counter, 1u, __ATOMIC_RELAXED);
-    int target = (int)(rr % (uint32_t)total_w);
-    int acc = 0;
-    for (int i = 0; i < pool->node_count; i++) {
-        upstream_node_t *n = pool->nodes[i];
-        pthread_spin_lock(&n->state_lock);
-        node_state_t st = n->state;
-        pthread_spin_unlock(&n->state_lock);
-        if (st != NODE_UP) continue;
-        acc += n->weight;
-        if (target < acc) { best = n; break; }
-    }
-
-done:
     pthread_mutex_unlock(&lb->wrr_lock);
     return best;
 }
