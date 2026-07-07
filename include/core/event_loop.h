@@ -123,6 +123,11 @@ void          event_loop_set_max_connections(event_loop_t *loop,
                                              int max_connections);
 void          event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
                                       int request_timeout_ms);
+/* add_rules_v: array of { char name[128]; char value[256]; } (passed as
+ * void* to avoid a header dependency on config.h's rule struct type). */
+void          event_loop_set_global_response_headers(
+                  const void *add_rules_v, int add_count,
+                  const char remove_rules[][128], int remove_count);
 void          event_loop_set_lb(event_loop_t *loop, lb_t *lb);
 tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop);
 

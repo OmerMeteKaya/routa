@@ -27,6 +27,7 @@ typedef struct {
 void http_response_init(http_response_t *r);
 void http_response_set_status(http_response_t *r, int status, const char *reason);
 void http_response_set_header(http_response_t *r, const char *key, const char *val);
+void http_response_remove_header(http_response_t *r, const char *name);
 void http_response_set_body(http_response_t *r, const char *data, size_t len);
     // copies data into heap; sets Content-Length automatically
 void http_response_set_body_fd(http_response_t *r, int fd, off_t offset, size_t len);

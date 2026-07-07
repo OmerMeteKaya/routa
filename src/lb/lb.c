@@ -329,6 +329,7 @@ static int build_forward_request(const http_request_t *req,
                                  const char *client_ip,
                                  const char *proto,
                                  const upstream_node_t *node,
+                                 const lb_config_t *cfg,
                                  buf_t *out)
 {
 #define BFR_PUT(s)            do { if (buf_append_str(out, (s)) < 0) return -1; } while (0)
@@ -377,10 +378,25 @@ static int build_forward_request(const http_request_t *req,
             had_content_length = 1;   /* re-emitted from body_len below */
             continue;
         }
+        if (cfg) {
+            int removed = 0;
+            for (int r = 0; r < cfg->request_header_remove_count; r++) {
+                if (strcasecmp(k, cfg->request_header_remove[r]) == 0) { removed = 1; break; }
+            }
+            if (removed) continue;
+        }
         BFR_PUT(k);
         BFR_PUT(": ");
         BFR_PUT(v);
         BFR_PUT("\r\n");
+    }
+    if (cfg) {
+        for (int a = 0; a < cfg->request_header_add_count; a++) {
+            BFR_PUT(cfg->request_header_add[a].name);
+            BFR_PUT(": ");
+            BFR_PUT(cfg->request_header_add[a].value);
+            BFR_PUT("\r\n");
+        }
     }
 
     /* X-Forwarded-For: append this client to any existing chain */
@@ -551,7 +567,7 @@ int lb_forward(lb_t *lb,
         /* Build and send request (heap buf — large bodies not truncated) */
         buf_t req_buf;
         buf_init(&req_buf);
-        if (build_forward_request(req, client_ip, NULL, node, &req_buf) < 0) {
+        if (build_forward_request(req, client_ip, NULL, node, &lb->cfg, &req_buf) < 0) {
             buf_free(&req_buf);
             upstream_conn_release(conn, 0);
             continue;
@@ -817,7 +833,7 @@ static int begin_forward_on_node(lb_t *lb,
     }
 
     /* Serialize request straight into the caller's buffer */
-    if (build_forward_request(req, client_ip, proto, node, req_buf) < 0) {
+    if (build_forward_request(req, client_ip, proto, node, lb ? &lb->cfg : NULL, req_buf) < 0) {
         upstream_conn_release(uconn, 0);
         return -1;
     }

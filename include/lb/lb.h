@@ -42,6 +42,26 @@ typedef struct {
     int max_retries;            /* 0 = no retry, default: 1                 */
     int retry_on_connect_fail;  /* default: 1                               */
     int retry_on_5xx;           /* default: 0                               */
+
+    /* ── Header manipulation ──────────────────────────────────────────────
+     * Applied on top of routa's own automatic headers (X-Forwarded-For,
+     * X-Forwarded-Proto, Via, Host, Content-Length, Connection) -- these
+     * are always added/removed in addition to that base behavior, never
+     * instead of it. request_header_* affects what's sent to the
+     * upstream; response_header_* affects what's sent back to the
+     * client. "Remove" is checked case-insensitively and happens before
+     * "add" for the same header name, so an add of a header also present
+     * in the remove list still ends up present exactly once. */
+#define LB_MAX_HEADER_RULES 16
+    struct { char name[128]; char value[256]; } request_header_add[LB_MAX_HEADER_RULES];
+    int      request_header_add_count;
+    char     request_header_remove[LB_MAX_HEADER_RULES][128];
+    int      request_header_remove_count;
+
+    struct { char name[128]; char value[256]; } response_header_add[LB_MAX_HEADER_RULES];
+    int      response_header_add_count;
+    char     response_header_remove[LB_MAX_HEADER_RULES][128];
+    int      response_header_remove_count;
 } lb_config_t;
 
 #define ROUTA_MAX_LB_POOLS 16

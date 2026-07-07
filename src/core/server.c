@@ -275,6 +275,9 @@ server_t *server_from_config(const routa_config_t *cfg) {
                                    cfg->max_connections);
     event_loop_set_timeouts((event_loop_t *)s->loop,
                             cfg->keepalive_timeout_ms, cfg->request_timeout_ms);
+    event_loop_set_global_response_headers(
+        cfg->response_header_add, cfg->response_header_add_count,
+        cfg->response_header_remove, cfg->response_header_remove_count);
 
     if (cfg->tls_enabled)
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);

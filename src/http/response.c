@@ -46,6 +46,27 @@ void http_response_set_header(http_response_t *r, const char *key, const char *v
     r->header_count++;
 }
 
+/* Removes ALL headers matching name (case-insensitive), compacting the
+ * array. Used for config-driven response_header_remove / global
+ * response_header_remove rules. */
+void http_response_remove_header(http_response_t *r, const char *name) {
+    if (!r || !name) return;
+    int w = 0;
+    for (int i = 0; i < r->header_count; i++) {
+        if (r->headers[i][0] && strcasecmp(r->headers[i][0], name) == 0) {
+            free((char *)r->headers[i][0]);
+            free((char *)r->headers[i][1]);
+            continue;   /* drop this entry */
+        }
+        if (w != i) {
+            r->headers[w][0] = r->headers[i][0];
+            r->headers[w][1] = r->headers[i][1];
+        }
+        w++;
+    }
+    r->header_count = w;
+}
+
 void http_response_set_body(http_response_t *r, const char *data, size_t len) {
     if (!r) return;
 

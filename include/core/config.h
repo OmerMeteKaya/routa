@@ -105,6 +105,19 @@ typedef struct {
 
     /* Consistent hash */
     int lb_consistent_hash_vnodes;
+    /* Header manipulation, applied on top of routa's own automatic
+     * headers -- see lb_config_t in lb.h for full semantics (mirrored
+     * here 1:1 for the file-config layer). */
+#define LB_MAX_HEADER_RULES 16
+    struct { char name[128]; char value[256]; } request_header_add[LB_MAX_HEADER_RULES];
+    int      request_header_add_count;
+    char     request_header_remove[LB_MAX_HEADER_RULES][128];
+    int      request_header_remove_count;
+
+    struct { char name[128]; char value[256]; } response_header_add[LB_MAX_HEADER_RULES];
+    int      response_header_add_count;
+    char     response_header_remove[LB_MAX_HEADER_RULES][128];
+    int      response_header_remove_count;
 } lb_pool_config_t;
 
 /* ── HTTP/2 ──────────────────────────────────────────────────────────────── */
@@ -262,6 +275,16 @@ typedef struct {
     /* Metrics endpoint (mw_metrics.c) */
     int  metrics_enabled;           /* default: 1 */
     char metrics_path[256];         /* default: "/metrics" */
+
+    /* Global header manipulation, applied to EVERY response (proxy,
+     * static file, custom route handler alike) in addition to any
+     * pool-specific request_header_* / response_header_* rules (which only
+     * apply to that pool's proxied requests/responses). */
+#define ROUTA_MAX_GLOBAL_HEADER_RULES 16
+    struct { char name[128]; char value[256]; } response_header_add[ROUTA_MAX_GLOBAL_HEADER_RULES];
+    int  response_header_add_count;
+    char response_header_remove[ROUTA_MAX_GLOBAL_HEADER_RULES][128];
+    int  response_header_remove_count;
 } routa_config_t;
 
 /* Initialize config with sensible defaults */

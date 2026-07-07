@@ -53,6 +53,32 @@
 
 static router_t           *g_router = NULL;
 static middleware_chain_t *g_chain  = NULL;
+
+/* Global response header manipulation, set once via
+ * event_loop_set_global_response_headers() (called from
+ * server_from_config()) and applied to EVERY response in
+ * conn_prepare_writev() -- proxy, static file, or custom route handler
+ * alike. Mirrors the g_router/g_chain "single server instance" pattern
+ * already used in this file. */
+typedef struct { char name[128]; char value[256]; } global_hdr_rule_t;
+static global_hdr_rule_t g_resp_header_add[ROUTA_MAX_GLOBAL_HEADER_RULES];
+static int               g_resp_header_add_count = 0;
+static char              g_resp_header_remove[ROUTA_MAX_GLOBAL_HEADER_RULES][128];
+static int               g_resp_header_remove_count = 0;
+
+void event_loop_set_global_response_headers(
+    const void *add_rules_v, int add_count,
+    const char remove_rules[][128], int remove_count)
+{
+    const struct { char name[128]; char value[256]; } *add_rules = add_rules_v;
+    if (add_count > ROUTA_MAX_GLOBAL_HEADER_RULES) add_count = ROUTA_MAX_GLOBAL_HEADER_RULES;
+    if (remove_count > ROUTA_MAX_GLOBAL_HEADER_RULES) remove_count = ROUTA_MAX_GLOBAL_HEADER_RULES;
+    g_resp_header_add_count = add_count;
+    for (int i = 0; i < add_count; i++) memcpy(&g_resp_header_add[i], &add_rules[i], sizeof(global_hdr_rule_t));
+    g_resp_header_remove_count = remove_count;
+    for (int i = 0; i < remove_count; i++)
+        strncpy(g_resp_header_remove[i], remove_rules[i], sizeof(g_resp_header_remove[i]) - 1);
+}
 static ws_handler_t  *g_ws_handlers      = NULL;
 static int            g_ws_handler_count = 0;
 
@@ -325,6 +351,15 @@ static void conn_close_and_free(worker_t *w, conn_t *conn) {
  */
 void conn_prepare_writev(conn_t *conn, http_response_t *resp) {
     conn_reset_write_state(conn);
+
+    /* Global response header manipulation, applied to every response
+     * before serialization -- see event_loop_set_global_response_headers(). */
+    for (int i = 0; i < g_resp_header_remove_count; i++) {
+        http_response_remove_header(resp, g_resp_header_remove[i]);
+    }
+    for (int i = 0; i < g_resp_header_add_count; i++) {
+        http_response_set_header(resp, g_resp_header_add[i].name, g_resp_header_add[i].value);
+    }
 
     /* Serialize headers now, while resp is still fully populated */
     /* We reuse the existing serialize path via http_response_serialize

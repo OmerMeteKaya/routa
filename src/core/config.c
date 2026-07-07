@@ -354,6 +354,73 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             continue;
         }
 
+        /* Pool-scoped header manipulation. Uses the same "applies to the
+         * active pool, or pools[0] if none yet" rule as lb_* keys, but
+         * these key names don't start with lb_ so they need their own
+         * branch here. */
+        if (strcmp(key, "request_header_add") == 0 ||
+            strcmp(key, "request_header_remove") == 0 ||
+            strcmp(key, "response_header_add") == 0 ||
+            strcmp(key, "response_header_remove") == 0) {
+            int pool_idx = (active_pool >= 0) ? active_pool : 0;
+            if (active_pool < 0 && cfg->pool_count == 0) {
+                cfg->pools[0].lb_enabled = 1;
+                cfg->pool_count = 1;
+            }
+            lb_pool_config_t *pool = &cfg->pools[pool_idx];
+
+            if (strcmp(key, "request_header_add") == 0) {
+                char *colon = strchr(val, ':');
+                if (!colon) {
+                    LOG_WARN("config:%d: request_header_add missing ':': %s", lineno, val);
+                } else if (pool->request_header_add_count >= LB_MAX_HEADER_RULES) {
+                    LOG_ERROR("config:%d: max %d request_header_add rules exceeded per pool",
+                              lineno, LB_MAX_HEADER_RULES);
+                } else {
+                    *colon = '\0';
+                    int ri = pool->request_header_add_count++;
+                    strncpy(pool->request_header_add[ri].name, trim(val),
+                           sizeof(pool->request_header_add[ri].name) - 1);
+                    strncpy(pool->request_header_add[ri].value, trim(colon + 1),
+                           sizeof(pool->request_header_add[ri].value) - 1);
+                }
+            } else if (strcmp(key, "request_header_remove") == 0) {
+                if (pool->request_header_remove_count >= LB_MAX_HEADER_RULES) {
+                    LOG_ERROR("config:%d: max %d request_header_remove rules exceeded per pool",
+                              lineno, LB_MAX_HEADER_RULES);
+                } else {
+                    int ri = pool->request_header_remove_count++;
+                    strncpy(pool->request_header_remove[ri], val,
+                           sizeof(pool->request_header_remove[ri]) - 1);
+                }
+            } else if (strcmp(key, "response_header_add") == 0) {
+                char *colon = strchr(val, ':');
+                if (!colon) {
+                    LOG_WARN("config:%d: response_header_add missing ':': %s", lineno, val);
+                } else if (pool->response_header_add_count >= LB_MAX_HEADER_RULES) {
+                    LOG_ERROR("config:%d: max %d response_header_add rules exceeded per pool",
+                              lineno, LB_MAX_HEADER_RULES);
+                } else {
+                    *colon = '\0';
+                    int ri = pool->response_header_add_count++;
+                    strncpy(pool->response_header_add[ri].name, trim(val),
+                           sizeof(pool->response_header_add[ri].name) - 1);
+                    strncpy(pool->response_header_add[ri].value, trim(colon + 1),
+                           sizeof(pool->response_header_add[ri].value) - 1);
+                }
+            } else { /* response_header_remove */
+                if (pool->response_header_remove_count >= LB_MAX_HEADER_RULES) {
+                    LOG_ERROR("config:%d: max %d response_header_remove rules exceeded per pool",
+                              lineno, LB_MAX_HEADER_RULES);
+                } else {
+                    int ri = pool->response_header_remove_count++;
+                    strncpy(pool->response_header_remove[ri], val,
+                           sizeof(pool->response_header_remove[ri]) - 1);
+                }
+            }
+            continue;
+        }
+
         if (strcmp(key, "port") == 0) {
             cfg->port =cfg_atoi(val, 8080);
         } else if (strcmp(key, "workers") == 0) {
@@ -511,6 +578,31 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             cfg->metrics_enabled = cfg_atoi(val, 1);
         } else if (strcmp(key, "metrics_path") == 0) {
             strncpy(cfg->metrics_path, val, sizeof(cfg->metrics_path) - 1);
+        } else if (strcmp(key, "global_response_header_add") == 0) {
+            /* Format: Header-Name: value */
+            char *colon = strchr(val, ':');
+            if (!colon) {
+                LOG_WARN("config:%d: global_response_header_add missing ':': %s", lineno, val);
+            } else if (cfg->response_header_add_count >= ROUTA_MAX_GLOBAL_HEADER_RULES) {
+                LOG_ERROR("config:%d: max %d global_response_header_add rules exceeded",
+                          lineno, ROUTA_MAX_GLOBAL_HEADER_RULES);
+            } else {
+                *colon = '\0';
+                int ri = cfg->response_header_add_count++;
+                strncpy(cfg->response_header_add[ri].name, trim(val),
+                       sizeof(cfg->response_header_add[ri].name) - 1);
+                strncpy(cfg->response_header_add[ri].value, trim(colon + 1),
+                       sizeof(cfg->response_header_add[ri].value) - 1);
+            }
+        } else if (strcmp(key, "global_response_header_remove") == 0) {
+            if (cfg->response_header_remove_count >= ROUTA_MAX_GLOBAL_HEADER_RULES) {
+                LOG_ERROR("config:%d: max %d global_response_header_remove rules exceeded",
+                          lineno, ROUTA_MAX_GLOBAL_HEADER_RULES);
+            } else {
+                int ri = cfg->response_header_remove_count++;
+                strncpy(cfg->response_header_remove[ri], val,
+                       sizeof(cfg->response_header_remove[ri]) - 1);
+            }
         } else {
             LOG_WARN("config:%d: unknown key '%s'", lineno, key);
         }
