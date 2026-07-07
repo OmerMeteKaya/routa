@@ -193,6 +193,7 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
     char line[1024];
     int lineno = 0;
     int active_pool = -1;   /* index into cfg->pools[], -1 = none yet */
+    int active_sni_cert = -1; /* index into cfg->sni_certs[], -1 = none yet */
 
     while (fgets(line, sizeof(line), f)) {
         lineno++;
@@ -210,6 +211,7 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             }
             *close = '\0';
             char *inner = trim(s + 1);
+            active_sni_cert = -1; /* any new section header clears this */
             if (strncmp(inner, "pool", 4) == 0 &&
                 (inner[4] == '\0' || isspace((unsigned char)inner[4]))) {
                 char *name = trim(inner + 4);
@@ -224,6 +226,24 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                 strncpy(cfg->pools[active_pool].name, name,
                        sizeof(cfg->pools[active_pool].name) - 1);
                 cfg->pools[active_pool].lb_enabled = 1;
+            } else if (strncmp(inner, "tls_cert", 8) == 0 &&
+                       (inner[8] == '\0' || isspace((unsigned char)inner[8]))) {
+                active_pool = -1;
+                char *hostname = trim(inner + 8);
+                if (*hostname == '\0') {
+                    LOG_WARN("config:%d: [tls_cert] section missing hostname", lineno);
+                    continue;
+                }
+                if (cfg->sni_cert_count >= ROUTA_MAX_SNI_CERTS) {
+                    LOG_ERROR("config:%d: max %d [tls_cert] sections exceeded, ignoring '%s'",
+                              lineno, ROUTA_MAX_SNI_CERTS, hostname);
+                    continue;
+                }
+                active_sni_cert = cfg->sni_cert_count++;
+                memset(&cfg->sni_certs[active_sni_cert], 0,
+                      sizeof(cfg->sni_certs[active_sni_cert]));
+                strncpy(cfg->sni_certs[active_sni_cert].hostname, hostname,
+                       sizeof(cfg->sni_certs[active_sni_cert].hostname) - 1);
             } else {
                 LOG_WARN("config:%d: unknown section '[%s]'", lineno, inner);
                 active_pool = -1;
@@ -301,6 +321,28 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
         char *key = trim(s);
         char *val = trim(eq + 1);
         strip_quotes(val);
+
+        /* Inside a [tls_cert HOSTNAME] section: only "cert"/"key" belong to
+         * it. Unlike [pool ...] (which spans truly pool-scoped keys only,
+         * e.g. lb_*), [tls_cert ...] sits among general top-level keys in
+         * a typical config file, so it must implicitly end the moment a
+         * non-cert/key line appears -- otherwise every line for the rest
+         * of the file would be silently swallowed as "unknown key in
+         * [tls_cert] section" until the next [...] header. */
+        if (active_sni_cert >= 0) {
+            if (strcmp(key, "cert") == 0) {
+                strncpy(cfg->sni_certs[active_sni_cert].cert, val,
+                       sizeof(cfg->sni_certs[active_sni_cert].cert) - 1);
+                continue;
+            } else if (strcmp(key, "key") == 0) {
+                strncpy(cfg->sni_certs[active_sni_cert].key, val,
+                       sizeof(cfg->sni_certs[active_sni_cert].key) - 1);
+                continue;
+            }
+            /* Not a cert/key line: implicitly close the section and fall
+             * through to normal top-level key handling below. */
+            active_sni_cert = -1;
+        }
 
         /* lb_* keys apply to the active pool, or the implicit legacy pool
          * (pools[0]) if no [pool ...] section has been seen yet. */
@@ -713,6 +755,17 @@ int routa_config_validate(const routa_config_t *cfg) {
     if (cfg->tls_enabled) {
         if (cfg->tls_cert[0] == '\0' || cfg->tls_key[0] == '\0') {
             LOG_ERROR("TLS enabled but cert/key not set");
+            return -1;
+        }
+    }
+    for (int i = 0; i < cfg->sni_cert_count; i++) {
+        if (cfg->sni_certs[i].cert[0] == '\0' || cfg->sni_certs[i].key[0] == '\0') {
+            LOG_ERROR("[tls_cert %s] missing cert/key", cfg->sni_certs[i].hostname);
+            return -1;
+        }
+        if (!cfg->tls_enabled) {
+            LOG_ERROR("[tls_cert %s] defined but top-level TLS is not enabled",
+                      cfg->sni_certs[i].hostname);
             return -1;
         }
     }

@@ -62,6 +62,7 @@ typedef enum {
 
 #define ROUTA_MAX_LB_POOLS 16
 #define ROUTA_MAX_ACL_RULES 64
+#define ROUTA_MAX_SNI_CERTS 32
 
 /* One independently-configured upstream pool: its own upstream list, LB
  * algorithm, health-check settings, retry policy, and the path pattern
@@ -178,6 +179,23 @@ typedef struct {
     char  tls_key[512];
     int   tls_session_timeout;      /* seconds, default: 3600          */
     char  tls_ocsp_response[512];   /* path to DER file, empty=disabled */
+
+    /* SNI: additional certificates selected by hostname at handshake time.
+     * Config file syntax (one section per extra cert, hostname may be a
+     * single-label wildcard like "*.api.example.com"):
+     *
+     *   [tls_cert example.com]
+     *   cert = /etc/routa/certs/example.com.pem
+     *   key  = /etc/routa/certs/example.com.key
+     *
+     * The top-level tls_cert/tls_key above remain the default certificate,
+     * used when the client sends no SNI or an unmatched hostname. */
+    struct {
+        char hostname[256];
+        char cert[512];
+        char key[512];
+    } sni_certs[ROUTA_MAX_SNI_CERTS];
+    int sni_cert_count;
 
     /* Static file serving */
     struct {

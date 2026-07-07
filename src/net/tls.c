@@ -54,6 +54,60 @@ static int alpn_select_cb(SSL *ssl,
     return SSL_TLSEXT_ERR_NOACK;
 }
 
+/* ── SNI servername callback ───────────────────────────────────────────────
+ * Called during ClientHello parsing, before the rest of the handshake
+ * proceeds. Looks up the requested hostname against tls_ctx->sni_entries
+ * (exact match first, then single-label wildcard match per RFC 6125) and
+ * swaps in the matching SSL_CTX via SSL_set_SSL_CTX. If no SNI was sent,
+ * or the hostname doesn't match any registered entry, the connection
+ * keeps using whatever SSL_CTX it was created with (the default). */
+static int sni_matches_wildcard(const char *pattern, const char *host) {
+    /* pattern is like "*.example.com". Match host against ".example.com"
+     * suffix, but only when host has exactly one label before that
+     * suffix (i.e. host itself is not just "example.com" and does not
+     * have extra dots before the suffix starts). */
+    const char *suffix = pattern + 1; /* skip '*', keep leading '.' */
+    size_t suffix_len = strlen(suffix);
+    size_t host_len   = strlen(host);
+    if (host_len <= suffix_len) return 0;
+    const char *host_suffix = host + (host_len - suffix_len);
+    if (strcasecmp(host_suffix, suffix) != 0) return 0;
+    /* Everything before host_suffix must be a single label: no dots. */
+    size_t label_len = host_len - suffix_len;
+    for (size_t i = 0; i < label_len; i++) {
+        if (host[i] == '.') return 0;
+    }
+    return label_len > 0;
+}
+
+static int sni_select_cb(SSL *ssl, int *al, void *arg) {
+    (void)al;
+    tls_context_t *tls_ctx = (tls_context_t *)arg;
+    if (!tls_ctx || tls_ctx->sni_entry_count == 0) return SSL_TLSEXT_ERR_OK;
+
+    const char *host = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (!host || !*host) return SSL_TLSEXT_ERR_OK; /* no SNI: use default */
+
+    /* Exact match first */
+    for (int i = 0; i < tls_ctx->sni_entry_count; i++) {
+        if (!tls_ctx->sni_entries[i].is_wildcard &&
+            strcasecmp(tls_ctx->sni_entries[i].hostname, host) == 0) {
+            SSL_set_SSL_CTX(ssl, tls_ctx->sni_entries[i].ctx);
+            return SSL_TLSEXT_ERR_OK;
+        }
+    }
+    /* Wildcard match second */
+    for (int i = 0; i < tls_ctx->sni_entry_count; i++) {
+        if (tls_ctx->sni_entries[i].is_wildcard &&
+            sni_matches_wildcard(tls_ctx->sni_entries[i].hostname, host)) {
+            SSL_set_SSL_CTX(ssl, tls_ctx->sni_entries[i].ctx);
+            return SSL_TLSEXT_ERR_OK;
+        }
+    }
+    /* No match: keep the default SSL_CTX this SSL object already has. */
+    return SSL_TLSEXT_ERR_OK;
+}
+
 /* ── OCSP stapling callback ────────────────────────────────────────────────*/
 
 static int ocsp_stapling_cb(SSL *ssl, void *arg) {
@@ -164,6 +218,13 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
     /* ── ALPN: prefer h2, fall back to http/1.1 ── */
     SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
 
+    /* ── SNI: dispatch to a per-hostname SSL_CTX if one was registered via
+     * tls_context_add_sni_cert. Installed unconditionally (cheap no-op via
+     * sni_entry_count == 0 check) so certs can be added any time after
+     * context creation without re-installing the callback. ── */
+    SSL_CTX_set_tlsext_servername_callback(ctx, sni_select_cb);
+    SSL_CTX_set_tlsext_servername_arg(ctx, tls_ctx);
+
     return tls_ctx;
 }
 
@@ -171,6 +232,10 @@ tls_context_t *tls_context_new(const char *cert_file, const char *key_file) {
 
 void tls_context_free(tls_context_t *ctx) {
     if (!ctx) return;
+
+    for (int i = 0; i < ctx->sni_entry_count; i++) {
+        SSL_CTX_free(ctx->sni_entries[i].ctx);
+    }
 
     SSL_CTX_free(ctx->ctx);
 
@@ -319,6 +384,69 @@ int tls_context_enable_ocsp_stapling(tls_context_t *ctx, const char *ocsp_file) 
     SSL_CTX_set_tlsext_status_arg(ctx->ctx, ctx);   /* pass tls_context_t* */
 
     LOG_INFO("OCSP stapling loaded, response=%ld bytes", len);
+    return 0;
+}
+
+/* ── SNI: add a per-hostname certificate ──────────────────────────────────*/
+
+int tls_context_add_sni_cert(tls_context_t *tls_ctx, const char *hostname,
+                             const char *cert_file, const char *key_file) {
+    if (!tls_ctx || !hostname || !*hostname || !cert_file || !key_file) return -1;
+
+    if (tls_ctx->sni_entry_count >= TLS_MAX_SNI_CERTS) {
+        LOG_ERROR("SNI: max %d certs exceeded, ignoring '%s'",
+                  TLS_MAX_SNI_CERTS, hostname);
+        return -1;
+    }
+
+    SSL_CTX *sni_ctx = SSL_CTX_new(TLS_server_method());
+    if (!sni_ctx) { log_ssl_error("SNI: SSL_CTX_new"); return -1; }
+
+    if (!SSL_CTX_set_min_proto_version(sni_ctx, TLS1_3_VERSION) ||
+        !SSL_CTX_set_max_proto_version(sni_ctx, TLS1_3_VERSION)) {
+        log_ssl_error("SNI: set TLS version");
+        SSL_CTX_free(sni_ctx);
+        return -1;
+    }
+    SSL_CTX_set_mode(sni_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                             SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_session_cache_mode(sni_ctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_num_tickets(sni_ctx, 0);
+    SSL_CTX_set_session_id_context(sni_ctx, (const unsigned char *)"routa", 5);
+    SSL_CTX_set_max_early_data(sni_ctx, 16384);
+    SSL_CTX_set_post_handshake_auth(sni_ctx, 0);
+    SSL_CTX_set_timeout(sni_ctx, 14400);
+
+    if (SSL_CTX_use_certificate_file(sni_ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
+        log_ssl_error("SNI: load certificate");
+        SSL_CTX_free(sni_ctx);
+        return -1;
+    }
+    if (SSL_CTX_use_PrivateKey_file(sni_ctx, key_file, SSL_FILETYPE_PEM) <= 0) {
+        log_ssl_error("SNI: load private key");
+        SSL_CTX_free(sni_ctx);
+        return -1;
+    }
+    if (!SSL_CTX_check_private_key(sni_ctx)) {
+        log_ssl_error("SNI: check private key");
+        SSL_CTX_free(sni_ctx);
+        return -1;
+    }
+
+    /* ALPN must be re-selected on the SNI ctx too -- SSL_set_SSL_CTX swaps
+     * which ctx's callbacks/config apply mid-handshake, so if this ctx
+     * lacks its own ALPN callback, ALPN negotiation for SNI-matched
+     * connections would silently stop working. */
+    SSL_CTX_set_alpn_select_cb(sni_ctx, alpn_select_cb, NULL);
+
+    int idx = tls_ctx->sni_entry_count++;
+    strncpy(tls_ctx->sni_entries[idx].hostname, hostname,
+           sizeof(tls_ctx->sni_entries[idx].hostname) - 1);
+    tls_ctx->sni_entries[idx].is_wildcard =
+        (strncmp(hostname, "*.", 2) == 0) ? 1 : 0;
+    tls_ctx->sni_entries[idx].ctx = sni_ctx;
+
+    LOG_INFO("SNI cert registered for '%s'", hostname);
     return 0;
 }
 

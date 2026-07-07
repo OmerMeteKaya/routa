@@ -92,7 +92,7 @@ foreach(example hello_world config_example chunked_example ws_echo_server h2_tes
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_config_multipool test_h2_hpack test_h2 test_auth test_metrics test_proxy_lb)
+foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_config test_h2_hpack test_h2 test_auth test_metrics test_proxy_lb)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
     add_executable(${test} tests/${test}.c)
     target_link_libraries(${test} PRIVATE routa_core)
@@ -127,4 +127,4 @@ add_test(NAME test_h2    COMMAND test_h2)
 add_test(NAME test_auth    COMMAND test_auth)
 add_test(NAME test_metrics   COMMAND test_metrics)
 add_test(NAME test_proxy_lb   COMMAND test_proxy_lb)
-add_test(NAME test_config_multipool   COMMAND test_config_multipool WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME test_config   COMMAND test_config WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

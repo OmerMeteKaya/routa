@@ -321,8 +321,22 @@ server_t *server_from_config(const routa_config_t *cfg) {
     event_loop_set_cpu_affinity((event_loop_t *)s->loop,
                                 cfg->cpu_affinity_enabled, cfg->cpu_affinity_start_core);
 
-    if (cfg->tls_enabled)
+    if (cfg->tls_enabled) {
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);
+        if (cfg->sni_cert_count > 0) {
+            tls_context_t *tls_ctx = event_loop_get_tls_ctx((event_loop_t *)s->loop);
+            if (!tls_ctx) {
+                LOG_ERROR("server_from_config: TLS context missing, cannot register SNI certs");
+            } else {
+                for (int i = 0; i < cfg->sni_cert_count; i++) {
+                    tls_context_add_sni_cert(tls_ctx,
+                        cfg->sni_certs[i].hostname,
+                        cfg->sni_certs[i].cert,
+                        cfg->sni_certs[i].key);
+                }
+            }
+        }
+    }
 
     s->metrics_enabled = cfg->metrics_enabled;
     if (cfg->metrics_path[0])
