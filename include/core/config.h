@@ -293,6 +293,11 @@ typedef struct {
     int socket_recv_buf_size;   /* bytes, default: 0 (OS default) */
     int socket_send_buf_size;   /* bytes, default: 0 (OS default) */
 
+    /* CPU affinity: pin worker threads to specific cores (Linux only).
+     * Improves cache locality on multi-core machines. */
+    int cpu_affinity_enabled;      /* default: 0 (disabled) */
+    int cpu_affinity_start_core;   /* worker 0 -> this core, worker N -> this+N, wraps. default: 0 */
+
     /* Global IP-based ACL (mw_acl.c), applied to every request before any
      * pool-specific ACL. If both deny, the request is blocked at whichever
      * layer runs first (global runs first, being registered earlier). */

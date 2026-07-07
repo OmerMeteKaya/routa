@@ -28,6 +28,8 @@ struct worker {
     int             max_connections;
     int             socket_recv_buf_size;   /* 0 = OS default, from config */
     int             socket_send_buf_size;   /* 0 = OS default, from config */
+    int             cpu_affinity_enabled;
+    int             cpu_affinity_start_core;
     int             keepalive_timeout_ms;  /* default: 30000, from config */
     int             request_timeout_ms;    /* default: 10000, from config */
     int             should_stop;
@@ -126,6 +128,7 @@ void          event_loop_set_max_connections(event_loop_t *loop,
 void          event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
                                       int request_timeout_ms);
 void          event_loop_set_socket_buffers(event_loop_t *loop, int recv_buf_size, int send_buf_size);
+void          event_loop_set_cpu_affinity(event_loop_t *loop, int enabled, int start_core);
 /* add_rules_v: array of { char name[128]; char value[256]; } (passed as
  * void* to avoid a header dependency on config.h's rule struct type). */
 void          event_loop_set_global_response_headers(

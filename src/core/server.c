@@ -318,6 +318,8 @@ server_t *server_from_config(const routa_config_t *cfg) {
         cfg->response_header_remove, cfg->response_header_remove_count);
     event_loop_set_socket_buffers((event_loop_t *)s->loop,
                                   cfg->socket_recv_buf_size, cfg->socket_send_buf_size);
+    event_loop_set_cpu_affinity((event_loop_t *)s->loop,
+                                cfg->cpu_affinity_enabled, cfg->cpu_affinity_start_core);
 
     if (cfg->tls_enabled)
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "core/event_loop.h"
+#include <sched.h>
 #include "core/conn.h"
 #include "util/metrics.h"
 #include "net/poller.h"
@@ -89,6 +90,8 @@ struct event_loop {
     int            max_connections;
     int            socket_recv_buf_size;
     int            socket_send_buf_size;
+    int            cpu_affinity_enabled;
+    int            cpu_affinity_start_core;
     int            keepalive_timeout_ms;
     int            request_timeout_ms;
     worker_t      *workers;
@@ -1915,6 +1918,29 @@ void event_loop_run(event_loop_t *loop) {
 #else
         pthread_create(&w->thread, NULL, worker_run, w);
 #endif
+
+#ifdef __linux__
+        /* CPU affinity: pin worker i to core (start_core + i), wrapping
+         * around the number of online CPUs if there are more workers
+         * than cores. Improves cache locality and reduces cross-core
+         * migration jitter on multi-core machines; on single-core or
+         * low-core-count machines this is a no-op in practice (every
+         * worker ends up sharing the same small set of cores anyway). */
+        if (loop->cpu_affinity_enabled) {
+            long n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+            if (n_cpus > 0) {
+                int target_core = (loop->cpu_affinity_start_core + i) % (int)n_cpus;
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                CPU_SET(target_core, &cpuset);
+                int rc = pthread_setaffinity_np(w->thread, sizeof(cpu_set_t), &cpuset);
+                if (rc != 0) {
+                    LOG_WARN("worker %d: pthread_setaffinity_np failed (core %d): %s",
+                             i, target_core, strerror(rc));
+                }
+            }
+        }
+#endif
     }
     for (int i = 0; i < loop->n_workers; i++)
         pthread_join(loop->workers[i].thread, NULL);
@@ -1989,6 +2015,12 @@ void event_loop_set_socket_buffers(event_loop_t *loop, int recv_buf_size, int se
     if (!loop) return;
     loop->socket_recv_buf_size = recv_buf_size;
     loop->socket_send_buf_size = send_buf_size;
+}
+
+void event_loop_set_cpu_affinity(event_loop_t *loop, int enabled, int start_core) {
+    if (!loop) return;
+    loop->cpu_affinity_enabled   = enabled;
+    loop->cpu_affinity_start_core = start_core;
 }
 
 void event_loop_free(event_loop_t *loop) {

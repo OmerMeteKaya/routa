@@ -648,6 +648,10 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             cfg->socket_recv_buf_size = cfg_atoi(val, 0);
         } else if (strcmp(key, "socket_send_buf_size") == 0) {
             cfg->socket_send_buf_size = cfg_atoi(val, 0);
+        } else if (strcmp(key, "cpu_affinity_enabled") == 0) {
+            cfg->cpu_affinity_enabled = cfg_atoi(val, 0);
+        } else if (strcmp(key, "cpu_affinity_start_core") == 0) {
+            cfg->cpu_affinity_start_core = cfg_atoi(val, 0);
         } else if (strcmp(key, "acl_default") == 0) {
             cfg->acl_enabled = 1;
             cfg->acl_default_allow = (strcasecmp(val, "allow") == 0) ? 1 : 0;
