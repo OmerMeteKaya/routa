@@ -445,7 +445,6 @@ static void handle_events_worker(worker_t *w) {
 
     int i;
     for (i = 0; i < nfds; i++) {
-
         // Broadcast notification from ws_broadcast()
         if (events[i].ptr == (void *)(uintptr_t)w->ws_notify_fd) {
             ws_notify_fd_drain(w->ws_notify_fd);
@@ -716,10 +715,23 @@ static void handle_events_worker(worker_t *w) {
                     }
                     continue;
                 }
-                // Flush any responses (pong, close echo) that ws_recv wrote
+                // Flush any responses (pong, close echo, or an
+                // application on_message handler's own ws_send/echo) that
+                // ws_recv wrote to conn->write_buf. Bug fix: this used to
+                // only call conn_poller_mod() to re-arm POLLER_WRITE,
+                // never attempting an actual write() first -- in ET mode,
+                // re-arming when the client fd is already writable (very
+                // likely on loopback / a fast client) does not reliably
+                // produce a fresh edge, so the response could sit in
+                // write_buf forever with the client seeing no reply at
+                // all. worker_conn_flush() does the same eager-flush-then-
+                // re-arm-only-if-needed dance already used for H1/H2
+                // responses (see its own doc comment) -- it correctly
+                // falls into the plain write_buf branch here since WS
+                // connections have conn->h2 == NULL and no hdr_buf/
+                // resp_body_ptr in play.
                 if (conn->write_buf.len > 0) {
-                    conn_poller_mod(w, conn,
-                               POLLER_READ | POLLER_WRITE | POLLER_ET);
+                    worker_conn_flush(w, conn);
                 }
                 continue;
             }
@@ -1300,14 +1312,53 @@ static void handle_events_worker(worker_t *w) {
                             conn->ws_handler->on_open(conn, conn->ws_handler->ctx);
 
                         conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
+                        /* Bug fix: previously only checked conn->read_buf
+                         * for data the H1 parser might have over-read
+                         * during the handshake request itself. But a
+                         * client that pipelines its first WS frame right
+                         * after the handshake request (i.e. doesn't wait
+                         * for the 101 before sending) can have that frame
+                         * sitting in the kernel's socket receive buffer
+                         * BEFORE this epoll_ctl(MOD) call runs -- and in
+                         * ET mode, arming POLLER_READ via MOD on an fd
+                         * that was already readable before the call does
+                         * not reliably produce a fresh edge (the "became
+                         * readable" transition already happened in the
+                         * past, from the kernel's point of view, while we
+                         * were still in POLLER_WRITE-only mode watching
+                         * for the handshake response to flush). Without an
+                         * eager read attempt here, that frame can sit
+                         * unread in the kernel buffer indefinitely, and
+                         * the client sees no response to it at all -- this
+                         * was the root cause of test_ws's echo/ping/close/
+                         * fragmented test failures (all "no response"),
+                         * every one of which sends its first frame
+                         * immediately after receiving the 101, before
+                         * waiting for any further server event. */
+                        {
+                            ssize_t rn = io_read_into_buf(conn->fd, &conn->read_buf, conn->tls);
+                            if (rn == 0) {
+                                ws_registry_remove(&w->ws_registry, conn);
+                                ROUTA_METRIC_INC(ws_disconnects_total);
+                                ws_frame_state_free(&conn->ws_fs);
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                            /* rn < 0 (EAGAIN, nothing pending yet) is fine
+                             * -- just fall through to the existing
+                             * read_buf.len check below, which will find
+                             * nothing new and skip handle_ws_read(), same
+                             * as before this fix. */
+                        }
                         if (conn->read_buf.len > 0) {
                             if (handle_ws_read(w, conn) < 0) {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
                             }
+                            /* Same eager-flush bug fix as the main WS read
+                             * loop above -- see the comment there. */
                             if (conn->write_buf.len > 0) {
-                                conn_poller_mod(w, conn,
-                                           POLLER_READ | POLLER_WRITE | POLLER_ET);
+                                worker_conn_flush(w, conn);
                             }
                         }
                         continue;
@@ -1374,6 +1425,76 @@ static void handle_events_worker(worker_t *w) {
                                 conn->state = CONN_CLOSING;
                                 goto handle_state;
                             }
+                        }
+                        /* Bug fix: a WebSocket handshake response reaches
+                         * CONN_WRITING via `conn->state = CONN_WRITING;
+                         * goto handle_state;` (see the WS upgrade branch
+                         * in the POLLER_READ handling above), NOT via a
+                         * real epoll POLLER_WRITE event -- so it lands
+                         * HERE, in this switch case, not in the
+                         * `if (events[i].events & POLLER_WRITE)` block
+                         * above (which has its own, separate copy of the
+                         * write-complete-triggers-WS-transition logic).
+                         * If the 101 response is small enough to write in
+                         * full on this very first attempt (the overwhelmingly
+                         * common case -- it's ~127 bytes), write_buf.len
+                         * drops to 0 right here and this case used to just
+                         * re-arm POLLER_WRITE and return, NEVER transitioning
+                         * the connection to CONN_WEBSOCKET. Since write_buf
+                         * was already empty, no further POLLER_WRITE event
+                         * would ever fire to reach the other copy of this
+                         * logic either -- the connection was stuck in
+                         * CONN_WRITING forever, and any WS frame the client
+                         * sent afterward just sat unread until some
+                         * unrelated timeout/teardown closed the socket.
+                         * This was the root cause of every "no response"
+                         * failure in test_ws (echo/ping/close/fragmented) --
+                         * all of them send their first frame immediately
+                         * after the 101, and none of them ever got a
+                         * genuine POLLER_WRITE epoll event because the
+                         * handshake response had already fully drained on
+                         * this first synchronous attempt. */
+                        if (conn->write_buf.len == 0 &&
+                            conn->ws_state == WS_STATE_HANDSHAKING) {
+                            conn->ws_state = WS_STATE_OPEN;
+                            conn->state    = CONN_WEBSOCKET;
+                            conn_reset_write_state(conn);
+
+                            buf_consume(&conn->read_buf, conn->consumed);
+                            conn->consumed = 0;
+
+                            if (ws_registry_add(&w->ws_registry, conn) < 0) {
+                                LOG_ERROR("ws: failed to add to registry fd=%d", conn->fd);
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+
+                            if (conn->ws_handler && conn->ws_handler->on_open)
+                                conn->ws_handler->on_open(conn, conn->ws_handler->ctx);
+
+                            conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
+
+                            /* Same "data pipelined right after the
+                             * handshake request" eager-read handling as
+                             * the other WS-transition copy above. */
+                            ssize_t rn = io_read_into_buf(conn->fd, &conn->read_buf, conn->tls);
+                            if (rn == 0) {
+                                ws_registry_remove(&w->ws_registry, conn);
+                                ROUTA_METRIC_INC(ws_disconnects_total);
+                                ws_frame_state_free(&conn->ws_fs);
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                            if (conn->read_buf.len > 0) {
+                                if (handle_ws_read(w, conn) < 0) {
+                                    conn->state = CONN_CLOSING;
+                                    goto handle_state;
+                                }
+                                if (conn->write_buf.len > 0) {
+                                    worker_conn_flush(w, conn);
+                                }
+                            }
+                            break;
                         }
                         conn_poller_mod(w, conn, POLLER_WRITE | POLLER_ET);
                         break;
