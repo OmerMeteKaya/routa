@@ -24,6 +24,8 @@ typedef struct {
     /* Connection pool per node */
     int pool_max_per_node;      /* default: 64                              */
     int pool_connect_timeout_ms;/* default: 2000                            */
+    int upstream_read_timeout_ms;  /* max time between reads on an active upstream conn, default: 30000 */
+    int upstream_write_timeout_ms; /* max time between writes on an active upstream conn, default: 30000 */
     int pool_idle_timeout_s;    /* close idle conns after N seconds, def 60 */
 
     /* Passive health */
@@ -49,6 +51,7 @@ typedef struct lb lb_t;
 /* Returns the upstream pool for direct node state recording.
  * Used by proxy.c to call upstream_node_record_failure/success. */
 upstream_pool_t *lb_get_pool(lb_t *lb);
+void lb_get_upstream_timeouts(const lb_t *lb, int *read_timeout_ms, int *write_timeout_ms);
 /* Create / destroy */
 lb_t *lb_new(const lb_config_t *cfg);
 void  lb_free(lb_t *lb);

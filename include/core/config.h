@@ -83,6 +83,8 @@ typedef struct {
     /* Connection pool */
     int lb_pool_max_per_node;
     int lb_pool_connect_timeout_ms;
+    int lb_upstream_read_timeout_ms;
+    int lb_upstream_write_timeout_ms;
     int lb_pool_idle_timeout_s;
 
     /* Passive health */

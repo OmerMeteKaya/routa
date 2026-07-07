@@ -91,6 +91,9 @@ typedef struct conn {
     uint64_t     id;
     uint64_t     last_active_ms;
     time_t       keepalive_deadline;
+    uint64_t     request_start_ms;    /* set when request parsing begins;
+                                        * 0 = no request in flight (used
+                                        * for request_timeout_ms enforcement) */
     char         remote_ip[46];
     char         _pad4[2];
     struct h2_conn *h2;   /* NULL if HTTP/1.1                         */

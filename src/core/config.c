@@ -102,6 +102,8 @@ void lb_pool_config_init(lb_pool_config_t *pool) {
     strncpy(pool->route, "/*", sizeof(pool->route) - 1);
     pool->lb_pool_max_per_node        = 64;
     pool->lb_pool_connect_timeout_ms  = 2000;
+    pool->lb_upstream_read_timeout_ms  = 30000;
+    pool->lb_upstream_write_timeout_ms = 30000;
     pool->lb_pool_idle_timeout_s      = 60;
     pool->lb_passive_fail_threshold   = 3;
     pool->lb_passive_recover_threshold = 2;
@@ -314,6 +316,10 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                 pool->lb_pool_max_per_node = cfg_atoi(val, 64);
             } else if (strcmp(key, "lb_pool_connect_timeout_ms") == 0) {
                 pool->lb_pool_connect_timeout_ms = cfg_atoi(val, 2000);
+            } else if (strcmp(key, "lb_upstream_read_timeout_ms") == 0) {
+                pool->lb_upstream_read_timeout_ms = cfg_atoi(val, 30000);
+            } else if (strcmp(key, "lb_upstream_write_timeout_ms") == 0) {
+                pool->lb_upstream_write_timeout_ms = cfg_atoi(val, 30000);
             } else if (strcmp(key, "lb_pool_idle_timeout_s") == 0) {
                 pool->lb_pool_idle_timeout_s = cfg_atoi(val, 60);
             } else if (strcmp(key, "lb_passive_fail_threshold") == 0) {

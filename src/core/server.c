@@ -273,6 +273,8 @@ server_t *server_from_config(const routa_config_t *cfg) {
 
     event_loop_set_max_connections((event_loop_t *)s->loop,
                                    cfg->max_connections);
+    event_loop_set_timeouts((event_loop_t *)s->loop,
+                            cfg->keepalive_timeout_ms, cfg->request_timeout_ms);
 
     if (cfg->tls_enabled)
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);
@@ -368,6 +370,8 @@ server_t *server_from_config(const routa_config_t *cfg) {
         lbc.algo                      = (lb_algo_t)pcfg->lb_algo;
         lbc.pool_max_per_node         = pcfg->lb_pool_max_per_node;
         lbc.pool_connect_timeout_ms   = pcfg->lb_pool_connect_timeout_ms;
+        lbc.upstream_read_timeout_ms  = pcfg->lb_upstream_read_timeout_ms;
+        lbc.upstream_write_timeout_ms = pcfg->lb_upstream_write_timeout_ms;
         lbc.pool_idle_timeout_s       = pcfg->lb_pool_idle_timeout_s;
         lbc.passive_fail_threshold    = pcfg->lb_passive_fail_threshold;
         lbc.passive_recover_threshold = pcfg->lb_passive_recover_threshold;

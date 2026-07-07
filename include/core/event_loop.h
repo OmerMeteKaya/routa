@@ -26,6 +26,8 @@ struct worker {
     conn_t        **active_conns;
     int             active_conn_count;
     int             max_connections;
+    int             keepalive_timeout_ms;  /* default: 30000, from config */
+    int             request_timeout_ms;    /* default: 10000, from config */
     int             should_stop;
     int             port;
     tls_context_t  *tls_ctx;
@@ -119,6 +121,8 @@ void          event_loop_set_chain(event_loop_t *loop,
                                    middleware_chain_t *chain);
 void          event_loop_set_max_connections(event_loop_t *loop,
                                              int max_connections);
+void          event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
+                                      int request_timeout_ms);
 void          event_loop_set_lb(event_loop_t *loop, lb_t *lb);
 tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop);
 

@@ -64,6 +64,14 @@ typedef struct proxy_ctx {
      * has_retry_req guards whether retry_req needs http_request_free(). */
     http_request_t   retry_req;
     int               has_retry_req;
+
+    /* Last successful read or write on the upstream connection, ms
+     * (routa_now_us()/1000). Used to enforce
+     * lb_upstream_read_timeout_ms/lb_upstream_write_timeout_ms -- an
+     * upstream that stops responding mid-stream (hangs) is force-closed
+     * instead of holding the connection/slot open indefinitely. Set at
+     * ctx creation and refreshed on every successful upstream I/O. */
+    uint64_t          last_upstream_io_ms;
 } proxy_ctx_t;
 
 /* Per-stream proxy context map for H2 — one ctx per concurrent stream.
@@ -98,5 +106,14 @@ int proxy_on_upstream_writable(struct worker *w, struct conn *conn,
                                proxy_ctx_t *ctx);
 int proxy_on_upstream_readable(struct worker *w, struct conn *conn,
                                proxy_ctx_t *ctx);
+
+/* Checks conn's H1 upstream proxy_ctx_t (if any) against
+ * lb_upstream_read_timeout_ms/lb_upstream_write_timeout_ms and force-closes
+ * it with a 504 if it's exceeded the limit for its current direction
+ * (PROXY_STATE_READING vs PROXY_STATE_WRITING). H2 upstreams (shared
+ * h2up_conn_t) are not covered -- see roadmap.
+ * Returns 1 if conn was closed (caller must not touch it further), 0
+ * otherwise. Intended to be called from the event loop's periodic sweep. */
+int proxy_check_upstream_timeout(struct worker *w, struct conn *conn, uint64_t now_ms);
 
 #endif /* ROUTA_CORE_PROXY_H */

@@ -61,6 +61,8 @@ struct event_loop {
     int            port;
     int            n_workers;
     int            max_connections;
+    int            keepalive_timeout_ms;
+    int            request_timeout_ms;
     worker_t      *workers;
     tls_context_t *tls_ctx;
     lb_t          *lb;              /* legacy: == lbs[0] when lb_count > 0 */
@@ -1155,7 +1157,7 @@ static void handle_events_worker(worker_t *w) {
                                 conn->consumed = 0;
                                 conn_reset_write_state(conn);
                                 conn->state = CONN_READING;
-                                conn->keepalive_deadline = time(NULL) + 30;
+                                conn->keepalive_deadline = time(NULL) + (w->keepalive_timeout_ms / 1000);
                                 conn_poller_mod(w, conn, POLLER_READ|POLLER_ET);
                             } else {
                                 conn->state = CONN_CLOSING;
@@ -1260,7 +1262,7 @@ static void handle_events_worker(worker_t *w) {
                         conn_reset_write_state(conn);
                         buf_reset(&conn->write_buf);
                         conn->state = CONN_READING;
-                        conn->keepalive_deadline = time(NULL) + 30;
+                        conn->keepalive_deadline = time(NULL) + (w->keepalive_timeout_ms / 1000);
                         conn_poller_mod(w, conn, POLLER_READ|POLLER_ET);
                     } else {
                         conn->state = CONN_CLOSING;
@@ -1538,6 +1540,51 @@ static void *worker_run(void *arg) {
                 ci++;
             }
 
+            /* H1 request_timeout_ms sweep: caps how long a request may
+             * take from the moment its headers finished parsing
+             * (conn->last_start_us) until a response is fully sent. Only
+             * applies while actively processing a request -- CONN_READING
+             * (idle, waiting for the next request on a keep-alive conn)
+             * is governed by keepalive_deadline above, not this. Without
+             * this, a handler or upstream that never completes (e.g. a
+             * hung proxy_ctx) can hold a connection/slot open forever. */
+            if (w->request_timeout_ms > 0) {
+                int ri = 0;
+                while (ri < w->active_conn_count) {
+                    conn_t *_c = w->active_conns[ri];
+                    int in_flight = (_c->state == CONN_WRITING ||
+                                     _c->state == CONN_SENDFILE ||
+                                     _c->state == CONN_UPSTREAM_CONNECTING ||
+                                     _c->state == CONN_UPSTREAM_WRITING);
+                    if (in_flight && _c->last_start_us > 0) {
+                        uint64_t elapsed_ms = (now_ms > _c->last_start_us / 1000)
+                            ? (now_ms - _c->last_start_us / 1000) : 0;
+                        if (elapsed_ms > (uint64_t)w->request_timeout_ms) {
+                            LOG_WARN("request_timeout: fd=%d elapsed=%lums (limit=%dms)",
+                                     _c->fd, (unsigned long)elapsed_ms, w->request_timeout_ms);
+                            conn_close_and_free(w, _c);
+                            continue;
+                        }
+                    }
+                    ri++;
+                }
+            }
+
+            /* Upstream (H1) read/write timeout sweep -- see
+             * proxy_check_upstream_timeouts() in proxy.c for the full
+             * rationale. H2 upstream connections (shared h2up_conn_t, not
+             * per-request) are not covered here yet -- see roadmap. */
+            {
+                int wi = 0;
+                while (wi < w->active_conn_count) {
+                    conn_t *_c = w->active_conns[wi];
+                    if (proxy_check_upstream_timeout(w, _c, now_ms)) {
+                        continue;   /* _c was closed; don't advance wi */
+                    }
+                    wi++;
+                }
+            }
+
             last_ping_sweep_ms = now_ms;
         }
     }
@@ -1804,6 +1851,8 @@ void event_loop_run(event_loop_t *loop) {
         worker_t *w           = &loop->workers[i];
         w->port               = loop->port;
         w->max_connections    = loop->max_connections;
+        w->keepalive_timeout_ms = loop->keepalive_timeout_ms > 0 ? loop->keepalive_timeout_ms : 30000;
+        w->request_timeout_ms   = loop->request_timeout_ms   > 0 ? loop->request_timeout_ms   : 10000;
         w->tls_ctx            = loop->tls_ctx;
         w->router             = g_router;
         w->chain              = g_chain;
@@ -1882,6 +1931,13 @@ void event_loop_set_chain(event_loop_t *loop, middleware_chain_t *chain) {
 
 void event_loop_set_max_connections(event_loop_t *loop, int max_connections) {
     if (loop) loop->max_connections = max_connections;
+}
+
+void event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
+                             int request_timeout_ms) {
+    if (!loop) return;
+    loop->keepalive_timeout_ms = keepalive_timeout_ms > 0 ? keepalive_timeout_ms : 30000;
+    loop->request_timeout_ms   = request_timeout_ms   > 0 ? request_timeout_ms   : 10000;
 }
 
 void event_loop_free(event_loop_t *loop) {

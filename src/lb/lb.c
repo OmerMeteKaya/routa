@@ -121,6 +121,11 @@ upstream_pool_t *lb_get_pool(lb_t *lb) {
     return lb ? lb->pool : NULL;
 }
 
+void lb_get_upstream_timeouts(const lb_t *lb, int *read_timeout_ms, int *write_timeout_ms) {
+    if (read_timeout_ms)  *read_timeout_ms  = lb ? lb->cfg.upstream_read_timeout_ms  : 30000;
+    if (write_timeout_ms) *write_timeout_ms = lb ? lb->cfg.upstream_write_timeout_ms : 30000;
+}
+
 /* ── Node selection ─────────────────────────────────────────────────────────*/
 
 static upstream_node_t *pick_up_node(upstream_pool_t *pool) {
@@ -607,6 +612,8 @@ void lb_config_init(lb_config_t *cfg) {
     cfg->algo                    = LB_ROUND_ROBIN;
     cfg->pool_max_per_node       = 64;
     cfg->pool_connect_timeout_ms = 2000;
+    cfg->upstream_read_timeout_ms = 30000;
+    cfg->upstream_write_timeout_ms = 30000;
     cfg->pool_idle_timeout_s     = 60;
     cfg->passive_fail_threshold  = 3;
     cfg->passive_recover_threshold = 2;

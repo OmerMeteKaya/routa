@@ -11,6 +11,7 @@
 #include "http/h2.h"
 #include "lb/lb.h"
 #include "util/logger.h"
+#include "util/metrics.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -28,6 +29,7 @@ proxy_ctx_t *proxy_ctx_new(lb_t *lb, struct conn *conn) {
     ctx->pool                = lb_get_pool(lb);
     ctx->resp_content_length = -1;
     ctx->upstream_state      = PROXY_STATE_CONNECTING;
+    ctx->last_upstream_io_ms = routa_now_ms();
     buf_init(&ctx->req_buf);
     buf_init(&ctx->resp_buf);
     return ctx;
@@ -474,6 +476,7 @@ int proxy_on_upstream_writable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
                 return 0;
             }
             ctx->req_sent += (size_t)n;
+            ctx->last_upstream_io_ms = routa_now_ms();
         }
 
         if (ctx->req_sent >= rb->len) {
@@ -513,8 +516,10 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
 
     if (n < 0) return 0;  /* EAGAIN — wait for more data */
 
-    if (n > 0)
+    if (n > 0) {
+        ctx->last_upstream_io_ms = routa_now_ms();
         buf_append(&ctx->resp_buf, tmp, (size_t)n);
+    }
 
     /* Parse response headers once (bounded within the header section) */
     if (!ctx->resp_head_done && ctx->resp_buf.len > 0) {
@@ -626,4 +631,31 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
         conn->state = CONN_WRITING;
     }
     return 0;
+}
+/* ── proxy_check_upstream_timeout ────────────────────────────────────────── */
+int proxy_check_upstream_timeout(struct worker *w, conn_t *conn, uint64_t now_ms) {
+    proxy_ctx_t *ctx = conn ? conn->proxy : NULL;
+    if (!ctx || !ctx->lb || ctx->up_h2up) return 0;
+    if (ctx->upstream_state != PROXY_STATE_WRITING &&
+        ctx->upstream_state != PROXY_STATE_READING) return 0;
+    if (ctx->last_upstream_io_ms == 0) return 0;
+
+    int read_to = 30000, write_to = 30000;
+    lb_get_upstream_timeouts(ctx->lb, &read_to, &write_to);
+    int limit_ms = (ctx->upstream_state == PROXY_STATE_READING) ? read_to : write_to;
+    if (limit_ms <= 0) return 0;
+
+    uint64_t elapsed = (now_ms > ctx->last_upstream_io_ms)
+                      ? (now_ms - ctx->last_upstream_io_ms) : 0;
+    if (elapsed <= (uint64_t)limit_ms) return 0;
+
+    LOG_WARN("upstream_%s_timeout: fd=%d elapsed=%llums (limit=%dms)",
+             ctx->upstream_state == PROXY_STATE_READING ? "read" : "write",
+             conn->fd, (unsigned long long)elapsed, limit_ms);
+    if (ctx->node && ctx->pool)
+        upstream_node_record_failure(ctx->node, ctx->pool);
+    poller_del(w->poller, ctx->upstream_fd);
+    proxy_drop_upstream(ctx);
+    proxy_send_upstream_error(conn, ctx, 504, "Gateway Timeout", "Gateway Timeout\n");
+    return 1;
 }
