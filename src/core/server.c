@@ -323,6 +323,15 @@ server_t *server_from_config(const routa_config_t *cfg) {
     event_loop_set_memory_limits((event_loop_t *)s->loop,
                                  cfg->memory_soft_limit_mb, cfg->memory_hard_limit_mb);
     event_loop_set_numa_aware((event_loop_t *)s->loop, cfg->numa_aware_enabled);
+    /* Bug fix: this was previously never called from server_from_config(),
+     * meaning every h2_* key in the config file was parsed into
+     * routa_config_t.h2 but had zero effect on actual runtime behavior --
+     * event_loop_t always ran with h2_cfg's zero-initialized (all-default)
+     * values instead. */
+    event_loop_set_h2_config((event_loop_t *)s->loop, &cfg->h2);
+    /* Same bug as h2 above: previously never wired up, so every ws_* key
+     * in the config file had zero effect on actual runtime behavior. */
+    event_loop_set_ws_config((event_loop_t *)s->loop, &cfg->ws);
 
     if (cfg->tls_enabled) {
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);

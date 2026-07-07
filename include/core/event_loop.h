@@ -80,6 +80,9 @@ struct worker {
     /* h2 */
     routa_h2_config_t h2_cfg;
 
+    /* WebSocket config (see event_loop_set_ws_config) */
+    ws_config_t       ws_cfg;
+
     conn_slab_t    *slab;
 
     /* Per-worker H2 upstream connection pool (no cross-thread sharing) */
@@ -155,6 +158,11 @@ tls_context_t *event_loop_get_tls_ctx(event_loop_t *loop);
 
 void event_loop_set_h2_config(event_loop_t *loop,
                                const routa_h2_config_t *cfg);
+/* Sets the WebSocket config every worker's w->ws_cfg is initialized from
+ * (copied at worker startup, same pattern as h2_cfg). Call before
+ * server_run() / event_loop_run(); has no effect on already-running
+ * workers. */
+void event_loop_set_ws_config(event_loop_t *loop, const ws_config_t *cfg);
 /* ── Write path helpers (also used by proxy.c and h2_client.c) ─────────── */
 void conn_reset_write_state(conn_t *conn);
 void conn_prepare_writev(conn_t *conn, http_response_t *resp);

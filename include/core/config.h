@@ -8,6 +8,30 @@
 #define ROUTA_MAX_STATIC      16
 #define ROUTA_MAX_MIDDLEWARES 32
 
+/* ── Resource profile (config file: resource_profile = light|balanced|performance)
+ *
+ * A profile only supplies DEFAULT values for a curated set of resource-
+ * related settings -- it is applied once, right after routa_config_init(),
+ * before the rest of the file is parsed. Any explicit key the operator
+ * writes anywhere in the file (before or after the resource_profile line)
+ * always wins over the profile's value, since normal parsing simply
+ * overwrites whatever the profile pre-filled. This means an operator can
+ * write `resource_profile = performance` and then override just
+ * `workers = 4` without the profile fighting back -- the profile is a
+ * starting point, never a hard override. See apply_resource_profile()
+ * in config.c for the exact per-field values each profile sets.
+ *
+ * balanced reproduces routa_config_init()'s pre-existing hardcoded
+ * defaults exactly (so a config with no resource_profile line at all, or
+ * resource_profile = balanced, behaves identically to before this
+ * feature existed). light targets weak/resource-constrained machines
+ * (e.g. laptops); performance targets large multi-core servers. */
+typedef enum {
+    RESOURCE_PROFILE_BALANCED    = 0,   /* default, matches pre-existing hardcoded defaults */
+    RESOURCE_PROFILE_LIGHT       = 1,
+    RESOURCE_PROFILE_PERFORMANCE = 2,
+} resource_profile_t;
+
 /* ── Load balancer algorithm (mirrors lb_algo_t) ───────────────────────────*/
 typedef enum {
     CFG_LB_ROUND_ROBIN     = 0,
@@ -170,6 +194,13 @@ typedef struct {
 } routa_h2_config_t;
 
 typedef struct {
+    /* Resource profile: applied once, right after routa_config_init(),
+     * before the rest of the file is parsed -- see resource_profile_t's
+     * doc comment above. This field just records which profile was
+     * requested (for routa_config_dump() and reference); the actual
+     * effect already happened by the time parsing finishes. */
+    resource_profile_t resource_profile;
+
     /* Network */
     int   port;           /* default: 8080         */
     int   n_workers;      /* default: CPU count     */
@@ -252,6 +283,13 @@ typedef struct {
      * (pools[0]), routed to "/*" by default -- see routa_config_load(). */
     h2_stream_lookup_t stream_lookup;        /* default: H2_STREAM_LOOKUP_LINEAR  */
     routa_h2_config_t h2;
+
+    /* ── WebSocket (ws_config_t, from ws.h -- included via lb/lb.h's
+     * transitive chain isn't guaranteed, so ws_config_t itself is defined
+     * earlier in *this* file, see top). Config file syntax: ws_* prefix,
+     * e.g. ws_enabled, ws_max_connections, ws_ping_interval_ms, etc. ── */
+    ws_config_t ws;
+
     /* Graceful shutdown */
     int shutdown_timeout_ms;     /* drain timeout before force-close, default: 30000 */
 
@@ -367,6 +405,15 @@ void routa_config_init(routa_config_t *cfg);
  * kept in sync manually since these are separate structs in separate
  * layers (file-config vs. runtime). */
 void lb_pool_config_init(lb_pool_config_t *pool);
+
+/* Applies a resource profile's defaults to cfg. Call after
+* routa_config_init() and before parsing the config file (or anywhere
+* later, if you want to force a profile's values regardless of what a
+* file set -- but routa_config_load() itself only calls this BEFORE
+* parsing, preserving the "explicit config always wins" rule described
+* on resource_profile_t). balanced is a no-op (routa_config_init()'s
+* defaults already match it). */
+void apply_resource_profile(routa_config_t *cfg, resource_profile_t profile);
 
 /* Parse routa.conf file. Returns 0 on success, -1 on error. */
 int routa_config_load(routa_config_t *cfg, const char *path);

@@ -3,6 +3,7 @@
 #endif
 #include "../include/core/config.h"
 #include "util/logger.h"
+#include "http/ws.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -60,6 +61,9 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->h2.max_concurrent_streams_hard_cap = 256;
     cfg->h2.server_push_enabled  = 1;
     cfg->h2.h2c_upgrade_enabled  = 1;
+
+    ws_config_init(&cfg->ws);
+
     cfg->shutdown_timeout_ms     = 30000;
 
     /* pools[0] starts pre-initialized so a config with no [pool ...]
@@ -98,6 +102,59 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->acl_enabled       = 0;
     cfg->acl_default_allow = 1;
     cfg->acl_rule_count    = 0;
+}
+
+void apply_resource_profile(routa_config_t *cfg, resource_profile_t profile) {
+    cfg->resource_profile = profile;
+
+    if (profile == RESOURCE_PROFILE_BALANCED) {
+        /* No-op: routa_config_init()'s hardcoded defaults already ARE
+         * the balanced profile -- nothing to override. */
+        return;
+    }
+
+    int cpu_count = GET_CPU_COUNT();
+    if (cpu_count < 1) cpu_count = 1;
+
+    if (profile == RESOURCE_PROFILE_LIGHT) {
+        /* Weak/resource-constrained machines (e.g. laptops): fewer
+         * workers, smaller caches, tighter connection limits, and
+         * memory guard-rails enabled by default since such machines are
+         * the most likely to actually run out of memory under load. */
+        int workers = cpu_count / 2;
+        if (workers < 1) workers = 1;
+        cfg->n_workers                    = workers;
+        cfg->cache_memory_mb              = 16;
+        cfg->max_connections              = 1000;
+        cfg->file_cache_max_entries       = 128;
+        cfg->socket_recv_buf_size         = 0;   /* OS default */
+        cfg->socket_send_buf_size         = 0;   /* OS default */
+        cfg->cpu_affinity_enabled         = 0;   /* not worth it on few cores */
+        cfg->numa_aware_enabled           = 0;
+        cfg->memory_soft_limit_mb         = 512;
+        cfg->memory_hard_limit_mb         = 1024;
+        cfg->compress_level               = 3;   /* less CPU per request */
+        cfg->keepalive_timeout_ms         = 15000;
+    } else if (profile == RESOURCE_PROFILE_PERFORMANCE) {
+        /* Large multi-core servers: many workers, big caches, high
+         * connection ceiling, CPU/NUMA pinning on, memory limits left
+         * disabled (operators at this scale typically already have
+         * cgroups/systemd limits in place -- see the roadmap note on
+         * per-worker memory limits being deferred for the same reason). */
+        int workers = cpu_count * 2;
+        cfg->n_workers                    = workers;
+        cfg->cache_memory_mb              = 512;
+        cfg->max_connections              = 100000;
+        cfg->file_cache_max_entries       = 4096;
+        cfg->socket_recv_buf_size         = 262144;
+        cfg->socket_send_buf_size         = 262144;
+        cfg->cpu_affinity_enabled         = 1;
+        cfg->numa_aware_enabled           = 1;
+        cfg->memory_soft_limit_mb         = 0;    /* disabled */
+        cfg->memory_hard_limit_mb         = 0;    /* disabled */
+        cfg->compress_level               = 9;    /* more CPU available, better ratio */
+        cfg->keepalive_timeout_ms         = 60000;
+    }
 }
 
 void lb_pool_config_init(lb_pool_config_t *pool) {
@@ -158,6 +215,27 @@ static char *trim(char *s) {
     return s;
 }
 
+/* Strips a trailing inline comment (a '#' not inside a quoted string) by
+ * truncating the line there. Must run after trim()'s leading-whitespace
+ * skip but before the "whole line is a comment" check, so lines like
+ * `key = value   # comment` and section headers like `[pool NAME] # note`
+ * both work -- previously only a comment as the FIRST non-whitespace
+ * character on a line was recognized; anything after a real value was
+ * parsed as part of that value (e.g. "1   # some note" failed cfg_atoi's
+ * strict end-of-string check and silently fell back to the key's
+ * default, with no warning). Quote-aware so a '#' inside a quoted value
+ * (e.g. auth_basic_realm = "Team #1") is not mistaken for a comment. */
+static void strip_inline_comment(char *s) {
+    int in_quotes = 0;
+    for (char *p = s; *p; p++) {
+        if (*p == '"') { in_quotes = !in_quotes; continue; }
+        if (*p == '#' && !in_quotes) {
+            *p = '\0';
+            break;
+        }
+    }
+}
+
 static void strip_quotes(char *s) {
     size_t len = strlen(s);
     if (len >= 2 && s[0] == '"' && s[len-1] == '"') {
@@ -183,8 +261,56 @@ static int parse_log_level(const char *val) {
     return cfg_atoi(val, 0);
 }
 
+/* First pass: scan the whole file just for a resource_profile line, so
+ * its defaults can be applied before the real (second) parsing pass --
+ * regardless of where in the file the operator put the resource_profile
+ * line, every other line in the file still gets to override whatever the
+ * profile pre-filled, since the second pass runs the normal key=value
+ * assignment logic same as always. Returns silently (profile left as
+ * whatever routa_config_init() already set, i.e. balanced/no-op) if no
+ * resource_profile line is found or the file can't be read a second time
+ * -- routa_config_load()'s own fopen() call right after this will
+ * surface any real file-access error properly. */
+static void prescan_resource_profile(routa_config_t *cfg, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = trim(line);
+        if (*s == '#' || *s == '\0' || *s == '[') continue;
+        strip_inline_comment(s);
+        s = trim(s);
+        if (*s == '\0') continue;
+
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = trim(s);
+        char *val = trim(eq + 1);
+        strip_quotes(val);
+
+        if (strcmp(key, "resource_profile") == 0) {
+            resource_profile_t profile;
+            if (strcasecmp(val, "light") == 0)            profile = RESOURCE_PROFILE_LIGHT;
+            else if (strcasecmp(val, "performance") == 0)  profile = RESOURCE_PROFILE_PERFORMANCE;
+            else if (strcasecmp(val, "balanced") == 0)     profile = RESOURCE_PROFILE_BALANCED;
+            else {
+                LOG_WARN("config: unknown resource_profile '%s', ignoring (valid: light|balanced|performance)", val);
+                break;
+            }
+            apply_resource_profile(cfg, profile);
+            break; /* only one resource_profile line is meaningful */
+        }
+    }
+    (void)fclose(f);
+}
+
 int routa_config_load(routa_config_t *cfg, const char *path) {
     if (!path) return -1;
+
+    prescan_resource_profile(cfg, path);
+
     FILE *f = fopen(path, "r");
     if (!f) {
         LOG_ERROR("Cannot open config file: %s", path);
@@ -200,6 +326,9 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
         lineno++;
         char *s = trim(line);
         if (*s == '#' || *s == '\0') continue;
+        strip_inline_comment(s);
+        s = trim(s);   /* re-trim: stripping a trailing comment can leave trailing whitespace */
+        if (*s == '\0') continue;   /* line was value + inline comment only, now empty -- skip */
 
         /* [pool NAME] section header: starts a new pool. Every subsequent
          * lb_* / upstream line applies to this pool until the next
@@ -523,7 +652,12 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             continue;
         }
 
-        if (strcmp(key, "port") == 0) {
+        if (strcmp(key, "resource_profile") == 0) {
+            /* Already applied by prescan_resource_profile() before this
+             * loop started -- this branch exists only so the second pass
+             * doesn't log a spurious "unknown key" warning for the same
+             * line it already consumed in the first pass. */
+        } else if (strcmp(key, "port") == 0) {
             cfg->port =cfg_atoi(val, 8080);
         } else if (strcmp(key, "workers") == 0) {
             cfg->n_workers = cfg_atoi(val, 12);
@@ -710,6 +844,38 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
             cfg->memory_hard_limit_mb = cfg_atoi(val, 0);
         } else if (strcmp(key, "numa_aware_enabled") == 0) {
             cfg->numa_aware_enabled = cfg_atoi(val, 0);
+        } else if (strcmp(key, "ws_enabled") == 0) {
+            cfg->ws.enabled = cfg_atoi(val, 0);
+        } else if (strcmp(key, "ws_max_connections") == 0) {
+            cfg->ws.max_connections = cfg_atoi(val, 10000);
+        } else if (strcmp(key, "ws_handshake_timeout_ms") == 0) {
+            cfg->ws.handshake_timeout_ms = cfg_atoi(val, 5000);
+        } else if (strcmp(key, "ws_idle_timeout_ms") == 0) {
+            cfg->ws.idle_timeout_ms = cfg_atoi(val, 0);
+        } else if (strcmp(key, "ws_max_frame_size") == 0) {
+            cfg->ws.max_frame_size = (size_t)cfg_atoi(val, 16 * 1024 * 1024);
+        } else if (strcmp(key, "ws_max_message_size") == 0) {
+            cfg->ws.max_message_size = (size_t)cfg_atoi(val, 64 * 1024 * 1024);
+        } else if (strcmp(key, "ws_ping_interval_ms") == 0) {
+            cfg->ws.ping_interval_ms = cfg_atoi(val, 30000);
+        } else if (strcmp(key, "ws_ping_timeout_ms") == 0) {
+            cfg->ws.ping_timeout_ms = cfg_atoi(val, 10000);
+        } else if (strcmp(key, "ws_max_ping_misses") == 0) {
+            cfg->ws.max_ping_misses = cfg_atoi(val, 3);
+        } else if (strcmp(key, "ws_read_buf_size") == 0) {
+            cfg->ws.read_buf_size = (size_t)cfg_atoi(val, 65536);
+        } else if (strcmp(key, "ws_write_buf_size") == 0) {
+            cfg->ws.write_buf_size = (size_t)cfg_atoi(val, 65536);
+        } else if (strcmp(key, "ws_write_queue_max") == 0) {
+            cfg->ws.write_queue_max = cfg_atoi(val, 128);
+        } else if (strcmp(key, "ws_permessage_deflate") == 0) {
+            cfg->ws.permessage_deflate = cfg_atoi(val, 0);
+        } else if (strcmp(key, "ws_compression_level") == 0) {
+            cfg->ws.compression_level = cfg_atoi(val, 6);
+        } else if (strcmp(key, "ws_compression_threshold") == 0) {
+            cfg->ws.compression_threshold = (size_t)cfg_atoi(val, 512);
+        } else if (strcmp(key, "ws_require_masking") == 0) {
+            cfg->ws.require_masking = cfg_atoi(val, 1);
         } else if (strcmp(key, "acl_default") == 0) {
             cfg->acl_enabled = 1;
             cfg->acl_default_allow = (strcasecmp(val, "allow") == 0) ? 1 : 0;

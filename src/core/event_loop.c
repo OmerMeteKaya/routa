@@ -106,6 +106,7 @@ struct event_loop {
     int            lb_count;
     int            should_stop;
     routa_h2_config_t h2_cfg;
+    ws_config_t       ws_cfg;
 
     /* Graceful shutdown */
     int            draining;
@@ -147,6 +148,10 @@ static int ws_route_placeholder(const http_request_t *req,
 void event_loop_set_h2_config(event_loop_t *loop,
                                const routa_h2_config_t *cfg) {
     if (loop && cfg) loop->h2_cfg = *cfg;
+}
+
+void event_loop_set_ws_config(event_loop_t *loop, const ws_config_t *cfg) {
+    if (loop && cfg) loop->ws_cfg = *cfg;
 }
 
 void event_loop_add_ws_route(event_loop_t *loop, const char *path,
@@ -216,11 +221,13 @@ static int handle_ws_read(worker_t *w, conn_t *conn) {
         return -1;
     }
 
-    /* Use the per-route config if set, otherwise fall back to defaults    */
-    ws_config_t default_cfg;
-    ws_config_init(&default_cfg);
+    /* Use the per-route config if set, otherwise fall back to the
+     * worker's configured defaults (from routa_config_t.ws, see
+     * event_loop_set_ws_config) -- previously this fell back to a
+     * hardcoded ws_config_init() default regardless of what the config
+     * file specified, silently ignoring every ws_* setting. */
     const ws_config_t *cfg = (handler->cfg.max_frame_size > 0)
-                             ? &handler->cfg : &default_cfg;
+                             ? &handler->cfg : &w->ws_cfg;
 
     int rc = ws_recv(conn, handler, cfg);
     if (rc < 0) {
@@ -956,10 +963,12 @@ static void handle_events_worker(worker_t *w) {
                         goto handle_state;
                     }
 
-                    ws_config_t default_cfg;
-                    ws_config_init(&default_cfg);
+                    /* See the comment on the identical fallback above --
+                     * this is the H1-upgrade-path counterpart of the same
+                     * fix (fall back to the worker's real configured
+                     * defaults, not a hardcoded ws_config_init()). */
                     const ws_config_t *wscfg = (wsh->cfg.max_frame_size > 0)
-                                               ? &wsh->cfg : &default_cfg;
+                                               ? &wsh->cfg : &w->ws_cfg;
 
                     if (ws_handshake(conn, &req, &conn->write_buf, wscfg) < 0) {
                         buf_reset(&conn->write_buf);
@@ -1623,9 +1632,11 @@ static void *worker_run(void *arg) {
 
         /* ── Periodic ping + H2 timeout sweep (~1 s) ── */
         if (now_ms - last_ping_sweep_ms >= 1000) {
-            ws_config_t default_cfg;
-            ws_config_init(&default_cfg);
-            ws_registry_ping_sweep(&w->ws_registry, &default_cfg, now_ms);
+            /* Previously used a hardcoded ws_config_init() default here
+             * (fixed 30s ping interval, 10s timeout, 3 max misses)
+             * regardless of ws_ping_interval_ms/ws_ping_timeout_ms/
+             * ws_max_ping_misses in the config file. */
+            ws_registry_ping_sweep(&w->ws_registry, &w->ws_cfg, now_ms);
             for (int _i = 0; _i < w->active_conn_count; ) {
                 conn_t *_c = w->active_conns[_i];
                 if (_c->state == CONN_H2 && _c->h2 &&
@@ -1979,6 +1990,7 @@ void event_loop_run(event_loop_t *loop) {
         w->loop               = loop;
         w->shutdown_timeout_ms = loop->shutdown_timeout_ms;
         w->h2_cfg             = loop->h2_cfg;
+        w->ws_cfg             = loop->ws_cfg;
 #if defined(__linux__) && defined(ROUTA_IO_URING)
         pthread_create(&w->thread, NULL, worker_run_uring, w);
 #else
