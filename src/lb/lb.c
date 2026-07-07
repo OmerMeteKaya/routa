@@ -80,7 +80,7 @@ static hash_ring_t *ring_build(upstream_node_t **nodes, int n, int vnodes_per) {
     return ring;
 }
 
-static upstream_node_t *ring_lookup(hash_ring_t *ring, uint32_t hash) {
+static upstream_node_t *ring_lookup(hash_ring_t *ring, upstream_pool_t *pool, uint32_t hash) {
     if (!ring || ring->count == 0) return NULL;
     int lo = 0, hi = ring->count - 1;
     while (lo < hi) {
@@ -88,14 +88,12 @@ static upstream_node_t *ring_lookup(hash_ring_t *ring, uint32_t hash) {
         if (ring->vnodes[mid].hash < hash) lo = mid + 1;
         else                               hi = mid;
     }
-    /* Walk forward to find first UP node */
+    /* Walk forward to find first selectable node (UP, or a DOWN node
+     * winning its half-open trial slot) */
     for (int i = 0; i < ring->count; i++) {
         int idx = (lo + i) % ring->count;
         upstream_node_t *n = ring->vnodes[idx].node;
-        pthread_spin_lock(&n->state_lock);
-        node_state_t st = n->state;
-        pthread_spin_unlock(&n->state_lock);
-        if (st == NODE_UP) return n;
+        if (upstream_node_is_selectable(n, pool)) return n;
     }
     return NULL;
 }
@@ -139,10 +137,7 @@ void lb_get_upstream_timeouts(const lb_t *lb, int *read_timeout_ms, int *write_t
 static upstream_node_t *pick_up_node(upstream_pool_t *pool) {
     for (int i = 0; i < pool->node_count; i++) {
         upstream_node_t *n = pool->nodes[i];
-        pthread_spin_lock(&n->state_lock);
-        node_state_t st = n->state;
-        pthread_spin_unlock(&n->state_lock);
-        if (st == NODE_UP) return n;
+        if (upstream_node_is_selectable(n, pool)) return n;
     }
     return NULL;
 }
@@ -154,7 +149,14 @@ static upstream_node_t *pick_wrr(lb_t *lb) {
 
     pthread_mutex_lock(&lb->wrr_lock);
 
-    /* Find max weight among UP nodes */
+    /* Find max weight among UP nodes. Intentionally UP-only (not
+     * is_selectable) -- the weighted math below assumes stable
+     * membership for the duration of this call, which a half-open trial
+     * (won via a one-shot CAS) can't provide across two loop passes
+     * without either double-counting it or racing another caller for
+     * the same slot. A half-open trial for this pool is instead given a
+     * chance via the dedicated check below, before falling into the
+     * weighted-only path. */
     int max_w = 0;
     for (int i = 0; i < pool->node_count; i++) {
         upstream_node_t *n = pool->nodes[i];
@@ -165,7 +167,16 @@ static upstream_node_t *pick_wrr(lb_t *lb) {
     }
 
     upstream_node_t *best = NULL;
-    if (max_w == 0) goto done;
+    if (max_w == 0) {
+        /* No UP nodes at all -- this is exactly the situation half-open
+         * exists for. Give one DOWN node (if its trial window has
+         * elapsed) a chance to prove it's back. */
+        for (int i = 0; i < pool->node_count; i++) {
+            upstream_node_t *n = pool->nodes[i];
+            if (upstream_node_is_selectable(n, pool)) { best = n; break; }
+        }
+        goto done;
+    }
 
     /* Smooth WRR: pick node with highest (effective_weight - current_weight) */
     int total_w = 0;
@@ -215,7 +226,14 @@ static upstream_node_t *pick_p2c(lb_t *lb) {
         pthread_spin_unlock(&n->state_lock);
         if (st == NODE_UP) up[up_cnt++] = n;
     }
-    if (up_cnt == 0) return NULL;
+    if (up_cnt == 0) {
+        /* No UP nodes -- offer a half-open trial instead of failing out. */
+        for (int i = 0; i < pool->node_count; i++) {
+            upstream_node_t *n = pool->nodes[i];
+            if (upstream_node_is_selectable(n, pool)) return n;
+        }
+        return NULL;
+    }
     if (up_cnt == 1) return up[0];
 
     /* Pick two distinct random candidates */
@@ -249,6 +267,13 @@ upstream_node_t *lb_pick_node_sticky(lb_t *lb, const char *client_ip,
             node_state_t st = node->state;
             pthread_spin_unlock(&node->state_lock);
             if (st == NODE_UP) return node;
+            /* Deliberately NOT offering a half-open trial here: sticky
+             * pinning to a DOWN node's trial would mean this one client
+             * either gets the (likely still-failing) node or, worse,
+             * silently steals the pool's only half-open slot on every
+             * request while the rest of the pool has no chance to probe
+             * recovery at all. Fall through to the normal algorithm
+             * instead, same as any other stale/invalid cookie case. */
         }
         /* Cookie present but stale/invalid/node down -- fall through to
          * the normal algorithm, which will pick a live node and (via the
@@ -283,10 +308,7 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
         if (n == 0) return NULL;
         for (int i = 0; i < n; i++) {
             upstream_node_t *node = pool->nodes[(rr + (uint32_t)i) % (uint32_t)n];
-            pthread_spin_lock(&node->state_lock);
-            node_state_t st = node->state;
-            pthread_spin_unlock(&node->state_lock);
-            if (st == NODE_UP) return node;
+            if (upstream_node_is_selectable(node, pool)) return node;
         }
         return NULL;
     }
@@ -305,7 +327,13 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
             uint32_t inf = __atomic_load_n(&n->inflight, __ATOMIC_RELAXED);
             if (inf < min_inf) { min_inf = inf; best = n; }
         }
-        return best;
+        if (best) return best;
+        /* No UP nodes -- offer a half-open trial instead of failing out. */
+        for (int i = 0; i < pool->node_count; i++) {
+            upstream_node_t *n = pool->nodes[i];
+            if (upstream_node_is_selectable(n, pool)) return n;
+        }
+        return NULL;
     }
     case LB_IP_HASH: {
         if (!client_ip) return pick_up_node(pool);
@@ -314,10 +342,7 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
         if (n == 0) return NULL;
         for (int i = 0; i < n; i++) {
             upstream_node_t *node = pool->nodes[(h + (uint32_t)i) % (uint32_t)n];
-            pthread_spin_lock(&node->state_lock);
-            node_state_t st = node->state;
-            pthread_spin_unlock(&node->state_lock);
-            if (st == NODE_UP) return node;
+            if (upstream_node_is_selectable(node, pool)) return node;
         }
         return NULL;
     }
@@ -328,10 +353,7 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
         int start = (int)(lb_rand() % (uint32_t)n);
         for (int i = 0; i < n; i++) {
             upstream_node_t *node = pool->nodes[(start + i) % n];
-            pthread_spin_lock(&node->state_lock);
-            node_state_t st = node->state;
-            pthread_spin_unlock(&node->state_lock);
-            if (st == NODE_UP) return node;
+            if (upstream_node_is_selectable(node, pool)) return node;
         }
         return NULL;
     }
@@ -342,7 +364,7 @@ upstream_node_t *lb_pick_node(lb_t *lb, const char *client_ip) {
         if (!lb->ring) return pick_up_node(pool);
         const char *key = client_ip ? client_ip : "default";
         uint32_t h = fnv1a(key, strlen(key));
-        return ring_lookup(lb->ring, h);
+        return ring_lookup(lb->ring, pool, h);
     }
     default:
         return pick_up_node(pool);
@@ -686,6 +708,7 @@ void lb_config_init(lb_config_t *cfg) {
     cfg->pool_idle_timeout_s     = 60;
     cfg->passive_fail_threshold  = 3;
     cfg->passive_recover_threshold = 2;
+    cfg->half_open_retry_after_ms = 30000;
     cfg->max_retries             = 1;
     cfg->retry_on_connect_fail   = 1;
     cfg->retry_on_5xx            = 0;
@@ -711,6 +734,7 @@ lb_t *lb_new(const lb_config_t *cfg) {
 
     lb->pool->passive_fail_threshold    = cfg->passive_fail_threshold;
     lb->pool->passive_recover_threshold = cfg->passive_recover_threshold;
+    lb->pool->half_open_retry_after_ms   = cfg->half_open_retry_after_ms;
 
     pthread_mutex_init(&lb->wrr_lock, NULL);
     return lb;

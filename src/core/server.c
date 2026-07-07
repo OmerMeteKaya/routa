@@ -446,6 +446,7 @@ server_t *server_from_config(const routa_config_t *cfg) {
         lbc.pool_idle_timeout_s       = pcfg->lb_pool_idle_timeout_s;
         lbc.passive_fail_threshold    = pcfg->lb_passive_fail_threshold;
         lbc.passive_recover_threshold = pcfg->lb_passive_recover_threshold;
+        lbc.half_open_retry_after_ms  = pcfg->lb_half_open_retry_after_ms;
         lbc.max_retries               = pcfg->lb_max_retries;
         lbc.retry_on_5xx              = pcfg->lb_retry_on_5xx;
         lbc.consistent_hash_vnodes    = pcfg->lb_consistent_hash_vnodes;

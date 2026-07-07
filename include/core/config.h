@@ -92,6 +92,8 @@ typedef struct {
     /* Passive health */
     int lb_passive_fail_threshold;
     int lb_passive_recover_threshold;
+    int lb_half_open_retry_after_ms;  /* circuit-breaker half-open, ms.
+                                       * 0 = disabled. default: 30000 */
 
     /* Active health check */
     cfg_hc_type_t lb_hc_type;

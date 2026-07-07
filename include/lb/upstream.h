@@ -71,9 +71,14 @@ typedef struct {
  * upstream_node_t — one backend server
  * ═══════════════════════════════════════════════════════════════════════════*/
 typedef enum {
-    NODE_UP   = 0,
-    NODE_DOWN = 1,
-    NODE_DRAINING = 2,   /* graceful removal: no new conns, finish existing */
+    NODE_UP        = 0,
+    NODE_DOWN      = 1,
+    NODE_DRAINING  = 2,   /* graceful removal: no new conns, finish existing */
+    NODE_HALF_OPEN = 3,   /* DOWN node currently allowing one trial request to
+                           * test recovery -- see upstream_node_is_selectable().
+                           * Only reachable/used when hc.type == HC_NONE; nodes
+                           * with active health checks recover via the probe
+                           * thread instead and never enter this state. */
 } node_state_t;
 
 struct upstream_node {
@@ -90,6 +95,19 @@ struct upstream_node {
     uint32_t  total_requests;
     uint32_t  total_errors;
     time_t    last_fail_time;
+
+    /* Circuit-breaker half-open state (only used when hc.type == HC_NONE --
+     * nodes with an active health check recover via the probe thread
+     * instead). down_since is set when the node transitions to NODE_DOWN;
+     * once half_open_retry_after_ms has elapsed, the NEXT request routed to
+     * this node is allowed through as a trial (state flips to
+     * NODE_HALF_OPEN for the duration of that one request) instead of being
+     * skipped like a normal DOWN node. half_open_probe_in_flight guards
+     * against multiple concurrent requests all trying to be "the" trial at
+     * once -- only the request that wins the compare-and-swap gets routed;
+     * everyone else still sees the node as DOWN. */
+    time_t              down_since;
+    volatile uint32_t   half_open_probe_in_flight; /* 0 or 1, CAS-guarded */
 
     /* Active health check */
     health_check_config_t hc;
@@ -153,6 +171,13 @@ struct upstream_pool {
     int passive_fail_threshold;    /* failures before marking DOWN, default 3 */
     int passive_recover_threshold; /* successes before marking UP,   default 2 */
 
+    /* Circuit-breaker half-open: how long a DOWN node (with no active
+     * health check) sits before the next request is let through as a
+     * trial. 0 disables half-open entirely (DOWN nodes with hc.type ==
+     * HC_NONE then stay DOWN forever, the pre-existing behavior).
+     * default: 30000 (30s). */
+    int half_open_retry_after_ms;
+
     /* Health check thread */
     pthread_t  hc_thread;
     int        hc_running;
@@ -190,5 +215,32 @@ void upstream_node_record_success(upstream_node_t *node,
                                   upstream_pool_t *pool);
 void upstream_node_record_failure(upstream_node_t *node,
                                   upstream_pool_t *pool);
+
+/* Returns 1 if this node should be considered for selection right now:
+* - NODE_UP                                   -> always 1
+* - NODE_DRAINING                              -> always 0
+* - NODE_DOWN, hc.type != HC_NONE              -> 0 (health-check thread
+*                                                 owns recovery for this node)
+* - NODE_DOWN, hc.type == HC_NONE:
+*     - half_open_retry_after_ms <= 0          -> 0 (half-open disabled)
+*     - not enough time elapsed since down_since -> 0
+*     - enough time elapsed, but another request already won the trial
+*       slot (CAS)                              -> 0
+*     - enough time elapsed AND this call wins the CAS -> 1 (caller is now
+*       responsible for routing exactly one request to this node and
+*       calling upstream_node_half_open_release() when it completes)
+* NODE_HALF_OPEN is a transient state only ever seen briefly by the winning
+* caller between this check and the request outcome being recorded; it is
+* not itself checked here.                                                */
+int upstream_node_is_selectable(upstream_node_t *node, upstream_pool_t *pool);
+
+/* Called after a half-open trial request completes (success or failure) to
+* release the in-flight guard so a future trial can be attempted. Safe to
+* call unconditionally -- a no-op if this node wasn't in a half-open trial
+* (e.g. it's a normal NODE_UP node). record_success/record_failure call
+* this internally, so callers going through those don't need to call it
+* themselves; it's exposed for callers that need to bail out before
+* reaching record_success/record_failure (e.g. connect() itself failed). */
+void upstream_node_half_open_release(upstream_node_t *node);
 
 #endif /* ROUTA_LB_UPSTREAM_H */

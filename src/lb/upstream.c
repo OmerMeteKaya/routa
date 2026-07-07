@@ -250,16 +250,58 @@ void upstream_node_set_state(upstream_node_t *node, node_state_t state) {
     pthread_spin_lock(&node->state_lock);
     node_state_t old = node->state;
     node->state = state;
+    if (state == NODE_DOWN && old != NODE_DOWN) {
+        /* Freshly DOWN: start the half-open clock and clear any stale
+         * in-flight guard from a previous half-open cycle. */
+        node->down_since = time(NULL);
+        node->half_open_probe_in_flight = 0;
+    }
     pthread_spin_unlock(&node->state_lock);
 
     if (old != state) {
         const char *s = state == NODE_UP ? "UP" :
-                        state == NODE_DOWN ? "DOWN" : "DRAINING";
+                        state == NODE_DOWN ? "DOWN" :
+                        state == NODE_HALF_OPEN ? "HALF_OPEN" : "DRAINING";
         LOG_INFO("upstream %s:%d → %s", node->host, node->port, s);
     }
 
     if (state == NODE_DOWN)
         upstream_node_drain_idle(node);
+}
+
+/* See doc comment in upstream.h. Only meaningful for nodes with hc.type ==
+ * HC_NONE -- nodes with an active health check never sit in a bare
+ * NODE_DOWN-with-no-recovery-path state, so they don't need this. */
+int upstream_node_is_selectable(upstream_node_t *node, upstream_pool_t *pool) {
+    pthread_spin_lock(&node->state_lock);
+    node_state_t st = node->state;
+    pthread_spin_unlock(&node->state_lock);
+
+    if (st == NODE_UP) return 1;
+    if (st == NODE_DRAINING || st == NODE_HALF_OPEN) return 0;
+
+    /* st == NODE_DOWN */
+    if (node->hc.type != HC_NONE) return 0;      /* hc thread owns recovery */
+    if (pool->half_open_retry_after_ms <= 0) return 0; /* half-open disabled */
+
+    time_t now = time(NULL);
+    long elapsed_ms = (long)difftime(now, node->down_since) * 1000L;
+    if (elapsed_ms < pool->half_open_retry_after_ms) return 0;
+
+    /* Try to win the trial slot -- only one caller may proceed. */
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&node->half_open_probe_in_flight,
+                                     &expected, 1u, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+        return 0; /* someone else already has the trial in flight */
+    }
+
+    upstream_node_set_state(node, NODE_HALF_OPEN);
+    return 1;
+}
+
+void upstream_node_half_open_release(upstream_node_t *node) {
+    __atomic_store_n(&node->half_open_probe_in_flight, 0u, __ATOMIC_SEQ_CST);
 }
 
 void upstream_node_record_success(upstream_node_t *node,
@@ -271,7 +313,7 @@ void upstream_node_record_success(upstream_node_t *node,
     node_state_t st = node->state;
     pthread_spin_unlock(&node->state_lock);
 
-    if (st == NODE_DOWN &&
+    if ((st == NODE_DOWN || st == NODE_HALF_OPEN) &&
         node->success_count >= (uint32_t)pool->passive_recover_threshold) {
         upstream_node_set_state(node, NODE_UP);
         /* reset under lock */
@@ -279,6 +321,8 @@ void upstream_node_record_success(upstream_node_t *node,
         node->success_count = 0;
         pthread_spin_unlock(&node->state_lock);
         }
+    if (st == NODE_HALF_OPEN)
+        upstream_node_half_open_release(node);
 }
 
 void upstream_node_record_failure(upstream_node_t *node,
@@ -289,7 +333,16 @@ void upstream_node_record_failure(upstream_node_t *node,
     node->total_errors++;
     node->last_fail_time = time(NULL);
     uint32_t fail = node->fail_count;
+    node_state_t st = node->state;
     pthread_spin_unlock(&node->state_lock);
+
+    if (st == NODE_HALF_OPEN) {
+        /* Trial failed: back to DOWN (resets down_since, restarting the
+         * half-open clock for the next attempt) and release the guard. */
+        upstream_node_set_state(node, NODE_DOWN);
+        upstream_node_half_open_release(node);
+        return;
+    }
 
     if (fail >= (uint32_t)pool->passive_fail_threshold) {
         upstream_node_set_state(node, NODE_DOWN);

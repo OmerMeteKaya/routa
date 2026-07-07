@@ -111,6 +111,7 @@ void lb_pool_config_init(lb_pool_config_t *pool) {
     pool->lb_pool_idle_timeout_s      = 60;
     pool->lb_passive_fail_threshold   = 3;
     pool->lb_passive_recover_threshold = 2;
+    pool->lb_half_open_retry_after_ms  = 30000;
     pool->lb_max_retries              = 1;
     pool->lb_retry_on_5xx             = 0;
     pool->lb_consistent_hash_vnodes   = 150;
@@ -379,6 +380,8 @@ int routa_config_load(routa_config_t *cfg, const char *path) {
                 pool->lb_passive_fail_threshold = cfg_atoi(val, 3);
             } else if (strcmp(key, "lb_passive_recover_threshold") == 0) {
                 pool->lb_passive_recover_threshold = cfg_atoi(val, 2);
+            } else if (strcmp(key, "lb_half_open_retry_after_ms") == 0) {
+                pool->lb_half_open_retry_after_ms = cfg_atoi(val, 30000);
             } else if (strcmp(key, "lb_hc_type") == 0) {
                 if (strcasecmp(val, "none") == 0)        pool->lb_hc_type = CFG_HC_NONE;
                 else if (strcasecmp(val, "tcp") == 0)    pool->lb_hc_type = CFG_HC_TCP;

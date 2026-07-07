@@ -32,6 +32,12 @@ typedef struct {
     int passive_fail_threshold;    /* default: 3                            */
     int passive_recover_threshold; /* default: 2                            */
 
+    /* Circuit-breaker half-open: how long (ms) a DOWN node with no active
+     * health check (hc.type == HC_NONE) waits before the next request is
+     * let through as a recovery trial. 0 disables half-open -- such a
+     * node then stays DOWN forever once tripped. default: 30000 (30s). */
+    int half_open_retry_after_ms;
+
     /* Active health check (applies to all nodes unless overridden) */
     health_check_config_t hc;
 
