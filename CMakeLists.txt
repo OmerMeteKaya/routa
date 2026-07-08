@@ -7,7 +7,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 include(cmake/CompileFlags.cmake)
 
 # ── Options ──────────────────────────────────────────────────────────────────
-option(ROUTA_IO_URING "Use io_uring I/O backend (Linux only)" OFF)
 option(ROUTA_NUMA "Enable NUMA-aware worker placement (requires libnuma, Linux only)" OFF)
 option(ACCESS_LOG "Enable JSON access logging" OFF)
 if(ACCESS_LOG)
@@ -85,19 +84,6 @@ else()
     message(STATUS "NUMA awareness: disabled")
 endif()
 
-# ── io_uring (Linux only, opt-in) ────────────────────────────────────────────
-if(ROUTA_IO_URING)
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "io_uring is Linux-only")
-  endif()
-  find_library(LIBURING_LIB uring REQUIRED)
-  target_sources(routa_core PRIVATE src/net/uring.c)
-  target_link_libraries(routa_core PRIVATE uring)
-  target_compile_definitions(routa_core PUBLIC ROUTA_IO_URING)
-  message(STATUS "io_uring: enabled")
-else()
-  message(STATUS "io_uring: disabled")
-endif()
 # ── Examples ─────────────────────────────────────────────────────────────────
 foreach(example hello_world config_example chunked_example ws_echo_server h2_test_server h2c_test_server unified_test_server mixed_pool_test ws_proxy_test_server)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")

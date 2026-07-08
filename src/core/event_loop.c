@@ -34,7 +34,6 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <signal.h>
-#include "net/uring.h"
 #include "http/ws.h"
 #include "http/ws_registry.h"
 #if defined(__linux__)
@@ -49,9 +48,6 @@
 #include "net/h2_client.h"
 
 
-#if defined(__linux__) && defined(ROUTA_IO_URING)
-#include "net/uring.h"
-#endif
 
 #define MAX_EVENTS        1024
 #define SEND_BUF_SZ       131072
@@ -2027,201 +2023,6 @@ static void *worker_run(void *arg) {
 }
 
 
-/* ── io_uring worker ────────────────────────────────────────────────────────*/
-#if defined(__linux__) && defined(ROUTA_IO_URING)
-
-static void conn_close_uring(worker_t *w, conn_t *conn) {
-    if (conn->closing) return;
-    conn->closing = 1;
-    if (conn->tls) tls_shutdown(conn->tls);
-    if (conn->sendfile_fd >= 0) { close(conn->sendfile_fd); conn->sendfile_fd = -1; }
-    if (conn->fd >= 0) { shutdown(conn->fd, SHUT_WR); close(conn->fd); conn->fd = -1; }
-    if (conn->pending_io <= 0) { conn_remove(w, conn); conn_free(conn); }
-}
-
-static void handle_request_parsing(worker_t *w, conn_t *conn) {
-    http_request_t req;
-    size_t consumed = 0;
-    int pr = http_request_parse(&req, &conn->read_buf, &consumed);
-
-    if (pr == 1) {
-        if (!conn->recv_pending) {
-            conn->recv_pending = 1;
-            if (uring_submit_recv(w->uring, conn, conn->fd,
-                                  conn->recv_buf, RECV_BUF_SZ) < 0)
-                conn_close_uring(w, conn);
-        }
-        return;
-    }
-    if (pr == -1) {
-        buf_reset(&conn->write_buf);
-        http_response_simple(&conn->write_buf, 400, "Bad Request",
-                             "text/plain", "Bad Request\n");
-        conn->keep_alive   = 0;
-        conn->send_buf_len = conn->write_buf.len;
-        memcpy(conn->send_buf, conn->write_buf.data, conn->send_buf_len);
-        if (uring_submit_send(w->uring, conn, conn->fd,
-                              conn->send_buf, conn->send_buf_len) < 0)
-            conn_close_uring(w, conn);
-        return;
-    }
-
-    conn->consumed   = consumed;
-    conn->keep_alive = req.keep_alive;
-
-    http_response_t resp;
-    http_response_init(&resp);
-    int allowed = 0;
-    route_t *route = router_match(w->router, &req, &allowed);
-
-    if (!route && allowed == 0) {
-        http_response_simple(&conn->write_buf, 404, "Not Found", "text/plain", "Not Found\n");
-    } else if (!route) {
-        http_response_set_status(&resp, 405, "Method Not Allowed");
-        http_response_set_body(&resp, "Method Not Allowed\n", 20);
-        buf_reset(&conn->write_buf);
-        http_response_serialize(&resp, &conn->write_buf);
-    } else {
-        if (w->chain) {
-            w->chain->current = 0;
-            middleware_chain_set_handler(w->chain, route->handler, route->ctx);
-            middleware_chain_execute(w->chain, &req, &resp);
-        } else {
-            route->handler(&req, &resp, route->ctx);
-        }
-        http_response_set_header(&resp, "Connection",
-                                 conn->keep_alive ? "keep-alive" : "close");
-        buf_reset(&conn->write_buf);
-        http_response_serialize(&resp, &conn->write_buf);
-        if (resp.body_fd >= 0 && !conn->tls) {
-            conn->sendfile_fd  = resp.body_fd;
-            conn->sendfile_off = resp.body_fd_off;
-            conn->sendfile_rem = resp.body_fd_len;
-            resp.body_fd = -1;
-        }
-    }
-
-    http_response_destroy(&resp);
-    http_request_free(&req);
-
-    conn->send_buf_len = conn->write_buf.len;
-    if (conn->send_buf_len > SEND_BUF_SZ) conn->send_buf_len = SEND_BUF_SZ;
-    memcpy(conn->send_buf, conn->write_buf.data, conn->send_buf_len);
-    if (uring_submit_send(w->uring, conn, conn->fd,
-                          conn->send_buf, conn->send_buf_len) < 0)
-        conn_close_uring(w, conn);
-}
-
-static void uring_cqe_handler(uring_udata_t *ud, int res,
-                               uint32_t flags, void *arg) {
-    worker_t *w = (worker_t *)arg;
-
-    if (ud->op == URING_OP_ACCEPT) {
-        if (!(flags & IORING_CQE_F_MORE)) uring_submit_accept(w->uring);
-        if (res < 0) return;
-        conn_t *c = conn_new(res, "unknown", 0);
-        if (!c) { close(res); return; }
-        c->active = 1;
-        w->active_conns[w->active_conn_count++] = c;
-        c->recv_pending = 1;
-        if (uring_submit_recv(w->uring, c, res, c->recv_buf, RECV_BUF_SZ) < 0)
-            conn_close_uring(w, c);
-        return;
-    }
-
-    conn_t *conn = (conn_t *)ud->conn;
-    if (!conn || conn->id != ud->conn_id || !conn->active) {
-        uring_udata_put(w->uring, ud); return;
-    }
-    conn->pending_io--;
-
-    if (res == -EAGAIN || res == -EINTR) {
-        if (ud->op == URING_OP_RECV) {
-            conn->recv_pending = 1;
-            uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
-        }
-        uring_udata_put(w->uring, ud); return;
-    }
-    if (conn->closing) {
-        if (conn->pending_io <= 0) { conn_remove(w, conn); conn_free(conn); }
-        uring_udata_put(w->uring, ud); return;
-    }
-    switch (ud->op) {
-        case URING_OP_RECV:
-            if (res <= 0) { conn_close_uring(w, conn); break; }
-            buf_append(&conn->read_buf, conn->recv_buf, (size_t)res);
-            handle_request_parsing(w, conn);
-            break;
-        case URING_OP_SEND:
-            if (res < 0) { conn_close_uring(w, conn); break; }
-            if ((size_t)res < conn->send_buf_len) {
-                conn->send_buf_len -= (size_t)res;
-                memmove(conn->send_buf, conn->send_buf + res, conn->send_buf_len);
-                uring_submit_send(w->uring, conn, conn->fd,
-                                  conn->send_buf, conn->send_buf_len);
-                break;
-            }
-            conn->send_buf_len = 0;
-            buf_reset(&conn->write_buf);
-            if (conn->consumed > 0) { buf_consume(&conn->read_buf, conn->consumed); conn->consumed = 0; }
-            if (conn->keep_alive) {
-                if (conn->read_buf.len > 0) handle_request_parsing(w, conn);
-                else {
-                    conn->recv_pending = 1;
-                    uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
-                }
-            } else conn_close_uring(w, conn);
-            break;
-        case URING_OP_SPLICE:
-            if (res < 0) { conn_close_uring(w, conn); break; }
-            if (ud->splice_phase == 0) { if (ud->fd >= 0) { close(ud->fd); ud->fd = -1; } break; }
-            conn->sendfile_rem -= (size_t)res;
-            if (conn->sendfile_rem > 0)
-                uring_submit_splice(w->uring, conn, conn->sendfile_fd,
-                                    conn->fd, conn->sendfile_rem);
-            else {
-                close(conn->sendfile_fd); conn->sendfile_fd = -1;
-                if (conn->keep_alive) {
-                    conn->recv_pending = 1;
-                    uring_submit_recv(w->uring, conn, conn->fd, conn->recv_buf, RECV_BUF_SZ);
-                } else conn_close_uring(w, conn);
-            }
-            break;
-    }
-    uring_udata_put(w->uring, ud);
-}
-
-static void *worker_run_uring(void *arg) {
-    worker_t *w = (worker_t *)arg;
-    w->server_fd = net_server_socket(w->port, 128);
-    if (w->server_fd < 0) return NULL;
-
-    w->active_conns = calloc((size_t)w->max_connections, sizeof(conn_t *));
-    if (!w->active_conns) { net_close(w->server_fd); return NULL; }
-
-    w->uring = uring_new(w->server_fd, URING_QUEUE_DEPTH, URING_POOL_SZ);
-    if (!w->uring) { free(w->active_conns); net_close(w->server_fd); return NULL; }
-
-    while (!w->should_stop) {
-        int n = uring_wait(w->uring, uring_cqe_handler, w);
-        if (n < 0 && !w->should_stop) LOG_ERROR("uring_wait failed");
-    }
-
-    for (int i = 0; i < w->active_conn_count; i++) {
-        conn_t *c = w->active_conns[i];
-        if (c->tls) tls_shutdown(c->tls);
-        if (c->sendfile_fd >= 0) close(c->sendfile_fd);
-        net_close(c->fd);
-        conn_free(c);
-    }
-    uring_free(w->uring);
-    free(w->active_conns);
-    net_close(w->server_fd);
-    return NULL;
-}
-
-#endif /* ROUTA_IO_URING */
-
 /* ── Public API ─────────────────────────────────────────────────────────────*/
 
 void event_loop_run(event_loop_t *loop) {
@@ -2249,11 +2050,7 @@ void event_loop_run(event_loop_t *loop) {
         w->shutdown_timeout_ms = loop->shutdown_timeout_ms;
         w->h2_cfg             = loop->h2_cfg;
         w->ws_cfg             = loop->ws_cfg;
-#if defined(__linux__) && defined(ROUTA_IO_URING)
-        pthread_create(&w->thread, NULL, worker_run_uring, w);
-#else
-        pthread_create(&w->thread, NULL, worker_run, w);
-#endif
+pthread_create(&w->thread, NULL, worker_run, w);
 
 #ifdef __linux__
         /* CPU affinity: pin worker i to core (start_core + i), wrapping

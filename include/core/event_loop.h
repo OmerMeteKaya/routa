@@ -10,12 +10,7 @@
 #include "http/middleware.h"
 #include "http/ws.h"
 #include "lb/lb.h"
-#include "net/uring.h"
 #include "core/config.h"
-
-#if defined(__linux__) && defined(ROUTA_IO_URING)
-#include "net/uring.h"
-#endif
 
 typedef struct event_loop event_loop_t;
 typedef struct worker     worker_t;
@@ -55,8 +50,6 @@ struct worker {
     lb_t           *lbs[ROUTA_MAX_LB_POOLS];
     int             lb_count;
 
-    /* io_uring (optional) */
-   // uring_t        *uring;
     uint8_t        *recv_bufs;
     uint8_t        *send_bufs;
 
