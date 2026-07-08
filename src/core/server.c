@@ -127,13 +127,21 @@ void server_route(server_t *s, const char *path, int methods,
 }
 
 /* ── Middleware ─────────────────────────────────────────────────────────────*/
-void server_use(server_t *s, middleware_fn_t fn, void *ctx) {
-    if (!s) return;
+int server_use(server_t *s, middleware_fn_t fn, void *ctx) {
+    if (!s) return -1;
     if (!s->chain) {
         s->chain = middleware_chain_new();
-        if (!s->chain) { LOG_ERROR("Failed to create middleware chain"); return; }
+        if (!s->chain) { LOG_ERROR("Failed to create middleware chain"); return -1; }
     }
-    middleware_chain_use(s->chain, fn, ctx);
+    /* Return value is the middleware's index within the chain (0-based,
+     * registration order) -- server_from_config() records these per
+     * middleware type (s->acl_mw_idx, s->rate_limit_mw_idx, etc.) so hot
+     * reload (SIGHUP) can later swap in a freshly-built ctx for exactly
+     * the right chain slot via middleware_chain_update_ctx(). -1 means
+     * "not registered" (e.g. that middleware type was never enabled). */
+    int idx = s->chain->count;
+    if (middleware_chain_use(s->chain, fn, ctx) < 0) return -1;
+    return idx;
 }
 
 /* ── Load balancer ──────────────────────────────────────────────────────────*/
@@ -277,6 +285,9 @@ void server_run(server_t *s) {
     event_loop_set_config_reload((event_loop_t *)s->loop,
                                  &g_reload_flag,
                                  g_config_path[0] ? g_config_path : NULL);
+    event_loop_set_middleware_reload_indices((event_loop_t *)s->loop,
+        s->acl_mw_idx, s->cors_mw_idx, s->basic_auth_mw_idx,
+        s->jwt_auth_mw_idx, s->rate_limit_mw_idx, s->compress_mw_idx);
 
     if (s->chain)
         event_loop_set_chain((event_loop_t *)s->loop, s->chain);
@@ -308,6 +319,16 @@ server_t *server_from_config(const routa_config_t *cfg) {
 
     server_t *s = server_new(cfg->port, cfg->n_workers);
     if (!s) return NULL;
+
+    /* -1 = "this middleware type isn't enabled" -- see the doc comment
+     * on these fields in server.h. Set before any server_use() calls
+     * below so an early-return path can't leave them uninitialized. */
+    s->acl_mw_idx         = -1;
+    s->cors_mw_idx        = -1;
+    s->basic_auth_mw_idx  = -1;
+    s->jwt_auth_mw_idx    = -1;
+    s->rate_limit_mw_idx  = -1;
+    s->compress_mw_idx    = -1;
 
     event_loop_set_max_connections((event_loop_t *)s->loop,
                                    cfg->max_connections);
@@ -366,13 +387,13 @@ server_t *server_from_config(const routa_config_t *cfg) {
                 acl_config_add_rule(acl_cfg, cfg->acl_rules[i].rule,
                                     cfg->acl_rules[i].action == 0 ? ACL_ACTION_ALLOW : ACL_ACTION_DENY);
             }
-            server_use(s, mw_acl, acl_cfg);
+            s->acl_mw_idx = server_use(s, mw_acl, acl_cfg);
         }
     }
     if (cfg->cors_enabled) {
         cors_config_t *cors_cfg = mw_cors_config_new(
             cfg->cors_origin, cfg->cors_methods, cfg->cors_headers);
-        if (cors_cfg) server_use(s, mw_cors, cors_cfg);
+        if (cors_cfg) s->cors_mw_idx = server_use(s, mw_cors, cors_cfg);
         /* Note: cors_cfg is intentionally leaked for the process lifetime
          * (freed at exit) -- mirrors the existing lifetime pattern for
          * static_configs[] in this same function; server_free() doesn't
@@ -386,7 +407,7 @@ server_t *server_from_config(const routa_config_t *cfg) {
                     cfg->auth_basic_users[i].username,
                     cfg->auth_basic_users[i].password);
             }
-            server_use(s, mw_basic_auth, auth_cfg);
+            s->basic_auth_mw_idx = server_use(s, mw_basic_auth, auth_cfg);
         }
     }
     if (cfg->auth_jwt_enabled) {
@@ -415,13 +436,13 @@ server_t *server_from_config(const routa_config_t *cfg) {
                 strncpy(jwt_cfg->issuer, cfg->auth_jwt_issuer, sizeof(jwt_cfg->issuer) - 1);
             if (cfg->auth_jwt_audience[0])
                 strncpy(jwt_cfg->audience, cfg->auth_jwt_audience, sizeof(jwt_cfg->audience) - 1);
-            server_use(s, mw_jwt_auth, jwt_cfg);
+            s->jwt_auth_mw_idx = server_use(s, mw_jwt_auth, jwt_cfg);
         }
     }
     if (cfg->rate_limit_enabled) {
         rate_limit_config_t *rl_cfg = mw_rate_limit_config_new(
             cfg->rate_limit_requests_per_second, cfg->rate_limit_burst);
-        if (rl_cfg) server_use(s, mw_rate_limit, rl_cfg);
+        if (rl_cfg) s->rate_limit_mw_idx = server_use(s, mw_rate_limit, rl_cfg);
     }
     if (cfg->compress_enabled) {
         compress_config_t *cc = calloc(1, sizeof(compress_config_t));
@@ -429,7 +450,7 @@ server_t *server_from_config(const routa_config_t *cfg) {
             cc->min_size = cfg->compress_min_size;
             cc->level    = cfg->compress_level;
             cc->prefer   = COMPRESS_PREFER_GZIP;
-            server_use(s, mw_compress, cc);
+            s->compress_mw_idx = server_use(s, mw_compress, cc);
         }
     }
 

@@ -60,7 +60,18 @@ void middleware_next(middleware_chain_t *chain,
         return;
     }
     middleware_t *mw = &chain->middlewares[current];
-    mw->fn(chain, req, resp, middleware_next, mw->ctx, current + 1);
+    /* Atomic load: see middleware_chain_update_ctx() -- a concurrent
+     * hot-reload may swap this pointer between requests (never mid-
+     * request, since each request reads it exactly once here at the
+     * start of its middleware call). */
+    void *ctx = __atomic_load_n(&mw->ctx, __ATOMIC_ACQUIRE);
+    mw->fn(chain, req, resp, middleware_next, ctx, current + 1);
+}
+
+int middleware_chain_update_ctx(middleware_chain_t *chain, int idx, void *new_ctx) {
+    if (!chain || idx < 0 || idx >= chain->count) return -1;
+    __atomic_store_n(&chain->middlewares[idx].ctx, new_ctx, __ATOMIC_RELEASE);
+    return 0;
 }
 
 void middleware_chain_free(middleware_chain_t *chain) {

@@ -57,12 +57,33 @@ typedef struct {
      * directly instead of server_from_config(). */
     int  metrics_enabled;
     char metrics_path[256];
+
+    /* ── Hot-reload bookkeeping ────────────────────────────────────────────
+     * Chain index of each config-driven middleware, as returned by
+     * server_use() -- -1 if that middleware was never enabled (so this
+     * server has no such slot to reload into; the reload logic simply
+     * skips it, same as at startup). Populated once by server_from_config()
+     * and never changes afterward (the middleware TYPES present don't
+     * change on reload, only their config content does -- e.g. you can't
+     * newly enable ACL via a SIGHUP reload if it wasn't enabled at
+     * startup; that would require restructuring the chain, which stays a
+     * restart-only operation). */
+    int acl_mw_idx;
+    int cors_mw_idx;
+    int basic_auth_mw_idx;
+    int jwt_auth_mw_idx;
+    int rate_limit_mw_idx;
+    int compress_mw_idx;
 } server_t;
 
 server_t *server_new(int port, int n_threads);
 void      server_run(server_t *s);
 void      server_free(server_t *s);
-void      server_use(server_t *s, middleware_fn_t fn, void *ctx);
+/* Returns the middleware's chain index (registration order, 0-based),
+ * or -1 on failure. Used by server_from_config() to remember which
+ * chain slot each config-driven middleware landed in, for hot reload --
+ * see middleware_chain_update_ctx(). */
+int       server_use(server_t *s, middleware_fn_t fn, void *ctx);
 void      server_route(server_t *s, const char *path, int methods,
                        route_handler_t handler, void *ctx);
 int       server_static(server_t *s, const char *url_prefix,

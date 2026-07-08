@@ -108,6 +108,17 @@ void          event_loop_set_config_reload(event_loop_t *loop,
                                            volatile sig_atomic_t *flag,
                                            const char *path);
 
+/* Registers each config-driven middleware's chain index (as recorded by
+ * server_from_config() in server_t, see its doc comment) so hot reload
+ * (SIGHUP) can rebuild each one's ctx from the newly-loaded config and
+ * swap it in via middleware_chain_update_ctx(). idx = -1 means that
+ * middleware type isn't enabled for this server -- reload skips it, same
+ * as at startup. Call once, before server_run() / event_loop_run(). */
+void          event_loop_set_middleware_reload_indices(
+                 event_loop_t *loop,
+                 int acl_idx, int cors_idx, int basic_auth_idx,
+                 int jwt_auth_idx, int rate_limit_idx, int compress_idx);
+
 /* Override the graceful-shutdown drain timeout (ms).  Call before run().    */
 void          event_loop_set_shutdown_timeout(event_loop_t *loop, int ms);
 int event_loop_broadcast(event_loop_t *loop,

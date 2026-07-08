@@ -12,6 +12,11 @@
 #include "net/io.h"
 #include "http/request.h"
 #include "http/response.h"
+#include "http/mw_acl.h"
+#include "http/mw_cors.h"
+#include "http/mw_auth.h"
+#include "http/mw_ratelimit.h"
+#include "http/mw_compress.h"
 #include "util/logger.h"
 #if defined(__linux__)
 #include <sys/sendfile.h>
@@ -115,6 +120,16 @@ struct event_loop {
     /* Hot reload (SIGHUP) — set via event_loop_set_config_reload()         */
     volatile sig_atomic_t *reload_flag;
     char           config_path[512];
+
+    /* Chain indices of config-driven middlewares, for hot reload -- see
+     * event_loop_set_middleware_reload_indices()'s doc comment. -1 = not
+     * enabled for this server. */
+    int            reload_acl_idx;
+    int            reload_cors_idx;
+    int            reload_basic_auth_idx;
+    int            reload_jwt_auth_idx;
+    int            reload_rate_limit_idx;
+    int            reload_compress_idx;
 
     /* Protects tls_ctx pointer during hot reload: readers (accept path)
      * hold rdlock; reloader (worker 0) holds wrlock while swapping.        */
@@ -1543,6 +1558,128 @@ static void worker_apply_reload(worker_t *w) {
             LOG_ERROR("hot reload: TLS reload failed, keeping old certificates");
     }
 
+    /* Process-wide memory limits — plain ints on event_loop_t, safe to
+     * write directly (no lock: worker 0 is the only writer, readers in
+     * the sweep loop read them at most once per ~2s tick, a torn read of
+     * an int-sized value isn't a real hazard here). */
+    w->loop->memory_soft_limit_mb = new_cfg.memory_soft_limit_mb;
+    w->loop->memory_hard_limit_mb = new_cfg.memory_hard_limit_mb;
+    LOG_INFO("hot reload: memory limits -> soft=%d hard=%d",
+             new_cfg.memory_soft_limit_mb, new_cfg.memory_hard_limit_mb);
+
+    /* WebSocket config — affects newly-handshaking connections only;
+     * connections already in CONN_WEBSOCKET keep whatever w->ws_cfg
+     * snapshot they captured (in the per-route cfg lookup at handshake
+     * time), unaffected by this later change. */
+    w->ws_cfg = new_cfg.ws;
+    LOG_INFO("hot reload: ws config updated");
+
+    /* Global response header rules — read directly off event_loop_t by
+     * the response path (see event_loop_set_global_response_headers()'s
+     * existing callers); safe to just re-call it here. */
+    event_loop_set_global_response_headers(
+        new_cfg.response_header_add, new_cfg.response_header_add_count,
+        new_cfg.response_header_remove, new_cfg.response_header_remove_count);
+    LOG_INFO("hot reload: global response headers updated");
+
+    /* ── Middleware ctx hot-swap ──────────────────────────────────────────
+     * For each middleware type that was enabled at startup (idx >= 0),
+     * build a brand-new ctx from the reloaded config and atomically swap
+     * it into the chain slot via middleware_chain_update_ctx() -- see
+     * that function's doc comment for why this is a pointer swap rather
+     * than an in-place mutation (no lock needed, in-flight requests see
+     * either the complete old or complete new config, never a torn
+     * state). The old ctx struct is intentionally leaked (see the same
+     * doc comment) -- an accepted tradeoff given this whole layer is
+     * slated for a Rust rewrite rather than adding refcounting here.
+     * A middleware type that was NOT enabled at startup (idx == -1) is
+     * skipped entirely: newly enabling a middleware via reload would
+     * require restructuring the chain itself, which stays restart-only. */
+    if (w->loop->reload_acl_idx >= 0 && new_cfg.acl_enabled) {
+        acl_config_t *new_acl = acl_config_new(new_cfg.acl_default_allow);
+        if (new_acl) {
+            for (int i = 0; i < new_cfg.acl_rule_count; i++) {
+                acl_config_add_rule(new_acl, new_cfg.acl_rules[i].rule,
+                    new_cfg.acl_rules[i].action == 0 ? ACL_ACTION_ALLOW : ACL_ACTION_DENY);
+            }
+            middleware_chain_update_ctx(w->chain, w->loop->reload_acl_idx, new_acl);
+            LOG_INFO("hot reload: ACL rules updated (%d rule(s))", new_cfg.acl_rule_count);
+        }
+    }
+
+    if (w->loop->reload_cors_idx >= 0 && new_cfg.cors_enabled) {
+        cors_config_t *new_cors = mw_cors_config_new(
+            new_cfg.cors_origin, new_cfg.cors_methods, new_cfg.cors_headers);
+        if (new_cors) {
+            middleware_chain_update_ctx(w->chain, w->loop->reload_cors_idx, new_cors);
+            LOG_INFO("hot reload: CORS config updated");
+        }
+    }
+
+    if (w->loop->reload_basic_auth_idx >= 0 && new_cfg.auth_basic_enabled) {
+        basic_auth_config_t *new_auth = basic_auth_config_new(new_cfg.auth_basic_realm);
+        if (new_auth) {
+            for (int i = 0; i < new_cfg.auth_basic_user_count; i++) {
+                basic_auth_config_add_user(new_auth,
+                    new_cfg.auth_basic_users[i].username,
+                    new_cfg.auth_basic_users[i].password);
+            }
+            middleware_chain_update_ctx(w->chain, w->loop->reload_basic_auth_idx, new_auth);
+            LOG_INFO("hot reload: basic auth config updated (%d user(s))",
+                     new_cfg.auth_basic_user_count);
+        }
+    }
+
+    if (w->loop->reload_jwt_auth_idx >= 0 && new_cfg.auth_jwt_enabled) {
+        jwt_config_t *new_jwt = NULL;
+        if (new_cfg.auth_jwt_secret[0]) {
+            new_jwt = jwt_config_new_hs256(new_cfg.auth_jwt_secret);
+        } else if (new_cfg.auth_jwt_pubkey_path[0]) {
+            FILE *pkf = fopen(new_cfg.auth_jwt_pubkey_path, "r");
+            if (pkf) {
+                char pembuf[8192];
+                size_t n = fread(pembuf, 1, sizeof(pembuf) - 1, pkf);
+                pembuf[n] = '\0';
+                fclose(pkf);
+                new_jwt = jwt_config_new_rs256(pembuf);
+            } else {
+                LOG_ERROR("hot reload: cannot open auth_jwt_pubkey_path '%s', keeping old JWT config",
+                          new_cfg.auth_jwt_pubkey_path);
+            }
+        }
+        if (new_jwt) {
+            new_jwt->verify_exp = new_cfg.auth_jwt_verify_exp;
+            if (new_cfg.auth_jwt_issuer[0])
+                strncpy(new_jwt->issuer, new_cfg.auth_jwt_issuer, sizeof(new_jwt->issuer) - 1);
+            if (new_cfg.auth_jwt_audience[0])
+                strncpy(new_jwt->audience, new_cfg.auth_jwt_audience, sizeof(new_jwt->audience) - 1);
+            middleware_chain_update_ctx(w->chain, w->loop->reload_jwt_auth_idx, new_jwt);
+            LOG_INFO("hot reload: JWT auth config updated");
+        }
+    }
+
+    if (w->loop->reload_rate_limit_idx >= 0 && new_cfg.rate_limit_enabled) {
+        rate_limit_config_t *new_rl = mw_rate_limit_config_new(
+            new_cfg.rate_limit_requests_per_second, new_cfg.rate_limit_burst);
+        if (new_rl) {
+            middleware_chain_update_ctx(w->chain, w->loop->reload_rate_limit_idx, new_rl);
+            LOG_INFO("hot reload: rate limit updated (%d req/s, burst %d)",
+                     new_cfg.rate_limit_requests_per_second, new_cfg.rate_limit_burst);
+        }
+    }
+
+    if (w->loop->reload_compress_idx >= 0 && new_cfg.compress_enabled) {
+        compress_config_t *new_cc = calloc(1, sizeof(compress_config_t));
+        if (new_cc) {
+            new_cc->min_size = new_cfg.compress_min_size;
+            new_cc->level    = new_cfg.compress_level;
+            new_cc->prefer   = COMPRESS_PREFER_GZIP;
+            middleware_chain_update_ctx(w->chain, w->loop->reload_compress_idx, new_cc);
+            LOG_INFO("hot reload: compress config updated (level %d, min_size %zu)",
+                     new_cfg.compress_level, new_cfg.compress_min_size);
+        }
+    }
+
     LOG_INFO("hot reload complete");
 }
 
@@ -2289,6 +2426,19 @@ void event_loop_set_config_reload(event_loop_t *loop,
     loop->reload_flag = flag;
     if (path)
         strncpy(loop->config_path, path, sizeof(loop->config_path) - 1);
+}
+
+void event_loop_set_middleware_reload_indices(
+        event_loop_t *loop,
+        int acl_idx, int cors_idx, int basic_auth_idx,
+        int jwt_auth_idx, int rate_limit_idx, int compress_idx) {
+    if (!loop) return;
+    loop->reload_acl_idx        = acl_idx;
+    loop->reload_cors_idx       = cors_idx;
+    loop->reload_basic_auth_idx = basic_auth_idx;
+    loop->reload_jwt_auth_idx   = jwt_auth_idx;
+    loop->reload_rate_limit_idx = rate_limit_idx;
+    loop->reload_compress_idx   = compress_idx;
 }
 
 void event_loop_set_shutdown_timeout(event_loop_t *loop, int ms) {

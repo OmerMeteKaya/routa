@@ -11,6 +11,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
@@ -147,9 +148,52 @@ static int resolve_node_addr(upstream_node_t *node) {
         return 0;
     }
 
-    pthread_spin_unlock(&node->state_lock);
-    LOG_ERROR("upstream: cannot parse IP '%s' as IPv4 or IPv6", node->host);
-    return -1;
+    /* Not an IP literal -- try it as a hostname (e.g. "api.internal").
+     * getaddrinfo() is a blocking syscall, so this DNS lookup happens
+     * synchronously on whichever worker thread first tries to connect to
+     * this node -- but only ONCE per node, ever: node->addr_resolved
+     * caches the result (this whole function returns immediately at the
+     * top if already resolved), same as the IP-literal fast paths above.
+     * This means a hostname upstream's resolved address is fixed for the
+     * process's lifetime (no re-resolution on DNS/TTL changes) -- a
+     * simple, deliberate tradeoff for a first hostname-support pass;
+     * revisit with periodic re-resolution if DNS-based failover across
+     * the resolved IP itself (as opposed to routa's own health checking
+     * across configured nodes) becomes a real requirement. */
+    {
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", node->port);
+
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family   = AF_UNSPEC; /* accept whichever family DNS returns */
+
+        struct addrinfo *res = NULL;
+        int gai_rc = getaddrinfo(node->host, port_str, &hints, &res);
+        if (gai_rc != 0 || !res) {
+            pthread_spin_unlock(&node->state_lock);
+            LOG_ERROR("upstream: cannot resolve hostname '%s': %s",
+                      node->host, gai_strerror(gai_rc));
+            if (res) freeaddrinfo(res);
+            return -1;
+        }
+
+        /* Use the first result -- getaddrinfo() with AF_UNSPEC typically
+         * orders results per RFC 6724 (e.g. preferring IPv6 if the host
+         * has working IPv6 connectivity), which is a reasonable default
+         * without adding our own preference logic. */
+        memcpy(&node->addr, res->ai_addr, res->ai_addrlen);
+        node->addr_family   = res->ai_family;
+        node->addr_len      = (socklen_t)res->ai_addrlen;
+        node->addr_resolved = 1;
+        freeaddrinfo(res);
+
+        pthread_spin_unlock(&node->state_lock);
+        LOG_INFO("upstream: resolved hostname '%s' to an address (family=%d)",
+                 node->host, node->addr_family);
+        return 0;
+    }
 }
 
 int upstream_conn_connect_async(upstream_node_t *node) {
