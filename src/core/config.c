@@ -507,10 +507,21 @@ static int routa_config_parse_file(routa_config_t *cfg, const char *path, int de
     while (fgets(raw_line, sizeof(raw_line), f)) {
         lineno++;
 
-        /* Expand ${VAR} references before anything else touches the
-         * line -- every subsequent step (comment stripping, quote
-         * stripping, key/value split, unit parsing) operates on the
-         * already-expanded text. */
+        /* Bug fix: skip whole-line comments (and blank lines) BEFORE
+         * expanding ${VAR} references, not after. A line like
+         * "# tls_cert = ${TLS_CERT}" in a comment explaining the syntax
+         * would otherwise still have ${TLS_CERT} expanded (and warned
+         * about, if unset) even though the line is never actually used --
+         * expand_env_vars() doesn't know or care that the text it's
+         * looking at is inside a comment. Trim on the raw (pre-expansion)
+         * line first to check for '#'/blank, then only expand if the line
+         * survives that check. Inline comments (`key = value  # comment`)
+         * are still handled after expansion, same as before -- those
+         * can't be detected this early since the line doesn't start with
+         * '#'. */
+        char *raw_trimmed = trim(raw_line);
+        if (*raw_trimmed == '#' || *raw_trimmed == '\0') continue;
+
         expand_env_vars(raw_line, line, sizeof(line));
 
         char *s = trim(line);

@@ -115,5 +115,20 @@ void mw_acl(middleware_chain_t *chain, const http_request_t *req,
         http_response_set_body(resp, "Forbidden\n", 10);
         return;   /* do not call next() -- request is blocked */
     }
-    next(chain, req, resp, current + 1);
+    /* Bug fix: this was "current + 1", but every other middleware in
+     * the chain (mw_logger, mw_cors, mw_auth, mw_rate_limit, mw_compress)
+     * calls next() with the plain "current" it received, not "current + 1".
+     * middleware_next() itself already computes and passes "current + 1"
+     * to whichever middleware fn it invokes (see mw->fn(..., current + 1)
+     * in middleware.c) -- so by the time mw_acl's own "current" parameter
+     * is set, it's already the correct "next index to run" value. Passing
+     * "current + 1" here made middleware_next() skip an extra slot beyond
+     * that, silently dropping whichever middleware was registered
+     * immediately after mw_acl in the chain (e.g. with the default
+     * registration order logger -> acl -> cors -> auth -> ratelimit ->
+     * compress, this made mw_cors never run whenever ACL was enabled --
+     * or mw_compress, if cors/auth/ratelimit were all disabled, as in the
+     * config that first surfaced this: gzip compression silently never
+     * engaging on any server with acl_enabled=1). */
+    next(chain, req, resp, current);
 }

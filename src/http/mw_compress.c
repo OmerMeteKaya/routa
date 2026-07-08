@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #endif
 #include "http/mw_compress.h"
+#include <stdio.h>
 #include "http/response.h"
 #include "http/request.h"
 #include "util/logger.h"
@@ -133,6 +134,7 @@ void mw_compress(middleware_chain_t *chain,
     /* Run the rest of the chain first — we compress the final response */
     next(chain, req, resp, current);
 
+
     /* ── Guard conditions ── */
 
     /* Already encoded or chunked — skip */
@@ -150,6 +152,8 @@ void mw_compress(middleware_chain_t *chain,
     if (!resp->body || resp->body_len == 0)
         return;
 
+    fprintf(stderr, "DEBUG mw_compress: body_len=%zu min_size=%zu accepts_gzip=%d\n",
+            resp->body_len, cfg->min_size, client_accepts_gzip(req));
     /* Below minimum size threshold */
     if (resp->body_len < cfg->min_size)
         return;

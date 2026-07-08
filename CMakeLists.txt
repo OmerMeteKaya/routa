@@ -84,8 +84,16 @@ else()
     message(STATUS "NUMA awareness: disabled")
 endif()
 
+# ── Main binary ───────────────────────────────────────────────────────────────
+# The actual "run this to host a site" production binary: loads a config
+# file (default "routa.conf", or argv[1]) and serves it -- see src/main.c.
+# This is what `./routa /etc/routa/routa.conf` means in practice.
+add_executable(routa src/main.c)
+target_link_libraries(routa PRIVATE routa_core)
+target_include_directories(routa PRIVATE include)
+
 # ── Examples ─────────────────────────────────────────────────────────────────
-foreach(example hello_world config_example chunked_example ws_echo_server h2_test_server h2c_test_server unified_test_server mixed_pool_test ws_proxy_test_server)
+foreach(example hello_world)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
     add_executable(${example} examples/${example}.c)
     target_link_libraries(${example} PRIVATE routa_core)
@@ -94,7 +102,7 @@ foreach(example hello_world config_example chunked_example ws_echo_server h2_tes
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_config test_h2_hpack test_h2 test_auth test_metrics test_proxy_lb test_wrr_distribution)
+foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_config test_h2_hpack test_h2 test_auth test_metrics test_proxy_lb test_wrr_distribution test_real_world)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
     add_executable(${test} tests/${test}.c)
     target_link_libraries(${test} PRIVATE routa_core)
@@ -102,19 +110,30 @@ foreach(test test_buf test_request test_middleware test_chunked test_file_cache 
   endif()
 endforeach()
 
+# ── Test helper binaries (not registered as ctest tests themselves --
+# spawned as subprocesses by the tests that need them, e.g.
+# test_real_world.c forking tests/helpers/real_world_server.c) ────────────
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/helpers/real_world_server.c")
+    add_executable(real_world_server tests/helpers/real_world_server.c)
+    target_link_libraries(real_world_server PRIVATE routa_core)
+    target_include_directories(real_world_server PRIVATE include)
+    # test_real_world.c needs to exec this binary by an absolute path --
+    # it runs with WORKING_DIRECTORY set to the repo root (so its own
+    # relative config/cert paths resolve correctly), but the binary
+    # itself lives in the build directory, not the repo root. Bake the
+    # actual build output path in as a compile definition rather than
+    # guessing/hardcoding a build directory name (which varies: build_release,
+    # build_asan, build_tsan, ... -- see the top-level Makefile's targets).
+    if(TARGET test_real_world)
+        target_compile_definitions(test_real_world PRIVATE
+            REAL_WORLD_SERVER_PATH="$<TARGET_FILE:real_world_server>")
+    endif()
+endif()
+
 include(cmake/Sanitizers.cmake)
 
-target_link_libraries(test_h2 PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
-target_link_libraries(h2_test_server PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
-target_link_libraries(h2c_test_server PRIVATE routa_core pthread)
-if(TARGET unified_test_server)
-  target_link_libraries(unified_test_server PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
-endif()
-if(TARGET mixed_pool_test)
-  target_link_libraries(mixed_pool_test PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
-endif()
-if(TARGET ws_proxy_test_server)
-  target_link_libraries(ws_proxy_test_server PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
+if(TARGET test_h2)
+  target_link_libraries(test_h2 PRIVATE routa_core OpenSSL::SSL OpenSSL::Crypto pthread)
 endif()
 
 enable_testing()
@@ -131,3 +150,4 @@ add_test(NAME test_metrics   COMMAND test_metrics)
 add_test(NAME test_proxy_lb   COMMAND test_proxy_lb)
 add_test(NAME test_config   COMMAND test_config WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME test_wrr_distribution COMMAND test_wrr_distribution)
+add_test(NAME test_real_world COMMAND test_real_world WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
