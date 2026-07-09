@@ -717,6 +717,7 @@ int hpack_ctx_init(hpack_ctx_t *ctx, size_t max_size,
                    size_t max_header_list_size) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->table.max_size           = max_size;
+    ctx->hard_max_size             = max_size;
     ctx->huffman_encode           = huffman_encode;
     ctx->dynamic_table_update     = dynamic_table_update;
     ctx->max_header_list_size     = max_header_list_size;
@@ -794,10 +795,28 @@ int hpack_decode(hpack_ctx_t *ctx,
 
         /* ── Dynamic table size update ── */
         if ((first & 0xe0) == 0x20) {
+            /* RFC 7541 4.2/6.3: a dynamic table size update MUST occur at
+             * the beginning of the first header block following the
+             * change to SETTINGS_HEADER_TABLE_SIZE it applies to -- i.e.
+             * before any header field representation in this block, not
+             * after. Previously this was accepted anywhere in the block
+             * (h2spec HPACK 4.2#1 confirmed: an update at the end of a
+             * header block was silently applied instead of being a
+             * decoding/COMPRESSION_ERROR). */
+            if (count > 0) goto fail;
+
             uint64_t new_sz;
             int n = hpack_decode_int(src + pos, src_len - pos, 5, &new_sz);
             if (n < 0) goto fail;
             pos += (size_t)n;
+
+            /* RFC 7541 4.2: the new size MUST NOT exceed the maximum set
+             * by this connection's SETTINGS_HEADER_TABLE_SIZE (tracked in
+             * ctx->table.max_size, established at ctx init / SETTINGS
+             * time) -- a larger requested size is a decoding error
+             * (h2spec HPACK 6.3#1 confirmed this wasn't checked). */
+            if (new_sz > ctx->hard_max_size) goto fail;
+
             hpack_dynamic_table_resize(ctx, (size_t)new_sz);
             continue;
         }

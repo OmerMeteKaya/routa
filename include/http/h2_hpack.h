@@ -30,6 +30,13 @@ typedef struct {
 /* ── Context (one per direction per h2_conn) ─────────────────────────────── */
 typedef struct {
     hpack_dynamic_table_t table;
+    /* RFC 7541 4.2: the hard upper bound this endpoint advertised via
+     * SETTINGS_HEADER_TABLE_SIZE at ctx-init time. table.max_size tracks
+     * the CURRENT size (changed by every dynamic table size update
+     * instruction the peer sends), so it cannot also serve as "the limit
+     * a size update must not exceed" -- this field is that fixed limit,
+     * set once at init and never modified afterward. */
+    size_t   hard_max_size;
     size_t   max_header_list_size;  /* 0 = unlimited; set from SETTINGS   */
     size_t   current_header_list_size; /* running total for decode         */
     int                   huffman_encode;    /* outbound: from config        */

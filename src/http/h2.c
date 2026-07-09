@@ -518,7 +518,11 @@ static int conn_error(h2_conn_t *hc, h2_error_code_t code) {
 
 static int handle_settings(h2_conn_t *hc,
                             const uint8_t *payload, uint32_t length,
-                            uint8_t flags) {
+                            uint8_t flags, uint32_t stream_id) {
+    /* RFC 7540 6.5: SETTINGS always applies to the whole connection, so
+     * its stream identifier MUST be 0x0 -- h2spec 6.5#2 confirmed this
+     * wasn't checked at all. */
+    if (stream_id != 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     if (flags & H2_FLAG_ACK) {
         if (length != 0)
             return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
@@ -561,9 +565,26 @@ static int handle_settings(h2_conn_t *hc,
             hc->peer_initial_window_size = val;
             hc->initial_send_window      = val;
             /* ── EKLE: connection-level send window'u da güncelle ── */
-            hc->send_window += delta;
-            if (hc->send_window > 0x7fffffff)
-                return conn_error(hc, H2_ERR_FLOW_CONTROL_ERROR);
+            {
+                /* RFC 7540 6.9.2: adjusting SETTINGS_INITIAL_WINDOW_SIZE can
+                 * push a stream's or the connection's send_window above
+                 * 2^31-1. send_window is int32_t, so checking AFTER the
+                 * add (as the old code did: "hc->send_window += delta; if
+                 * (hc->send_window > 0x7fffffff)") is a signed-integer-
+                 * overflow check performed on a value that already
+                 * overflowed -- 0x7fffffff (INT32_MAX) is the maximum
+                 * possible int32_t value, so a real overflow wraps to
+                 * negative and this comparison can never be true (this is
+                 * why h2spec's "SETTINGS_INITIAL_WINDOW_SIZE ... window to
+                 * be negative" test failed: the overflow was silently
+                 * accepted instead of triggering FLOW_CONTROL_ERROR).
+                 * Compute in a wider (int64_t) type and validate BEFORE
+                 * narrowing back to int32_t. */
+                int64_t wide = (int64_t)hc->send_window + (int64_t)delta;
+                if (wide > 0x7fffffffLL)
+                    return conn_error(hc, H2_ERR_FLOW_CONTROL_ERROR);
+                hc->send_window = (int32_t)wide;
+            }
             /* stream window'ları güncelle */
             if (hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR) {
                 for (int j = 0; j < hc->streams.pool.count; j++)
@@ -755,9 +776,45 @@ void h2_conn_flush_pending(h2_conn_t *hc) {
         }
     }
 }
+/* RFC 7540 5.1: a frame referencing a stream ID that has never been
+ * opened (greater than the highest stream ID seen so far) targets an
+ * IDLE stream. Receiving DATA, RST_STREAM, or WINDOW_UPDATE for an idle
+ * stream MUST be a CONNECTION error of type PROTOCOL_ERROR (h2spec
+ * 5.1#1/#2/#3), distinct from a stream that was legitimately opened and
+ * has since closed (a lenient stream-level response is fine there --
+ * previously both cases were treated identically via stream_find()
+ * returning NULL for both). */
+static int is_idle_stream(h2_conn_t *hc, uint32_t stream_id) {
+    return stream_id > hc->last_stream_id;
+}
+
+/* RFC 7540 6.3: a standalone PRIORITY frame. Previously not validated at
+ * all (dispatch simply did `case H2_FRAME_PRIORITY: break;`, silently
+ * accepting anything) -- h2spec 6.3#1/#2 and 5.3.1#2 confirmed this let
+ * through a zero stream_id, a wrong-length payload, and a stream
+ * depending on itself, none of which should ever reach the application. */
+static int handle_priority(h2_conn_t *hc, const uint8_t *payload,
+                            uint32_t length, uint32_t stream_id) {
+    if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
+    if (length != 5)    return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
+
+    uint32_t dependency = (((uint32_t)payload[0] & 0x7f) << 24) |
+                          ((uint32_t)payload[1] << 16) |
+                          ((uint32_t)payload[2] <<  8) |
+                           (uint32_t)payload[3];
+    /* RFC 7540 5.3.1: a stream cannot depend on itself. */
+    if (dependency == stream_id) {
+        write_rst_stream(&hc->write_buf, stream_id, H2_ERR_PROTOCOL_ERROR);
+        return 0;
+    }
+    return 0;
+}
+
 static int handle_window_update(h2_conn_t *hc, const uint8_t *payload,
                                  uint32_t length, uint32_t stream_id) {
     if (length != 4) return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
+    if (stream_id != 0 && is_idle_stream(hc, stream_id))
+        return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     uint32_t increment = (((uint32_t)payload[0] & 0x7f) << 24) |
                           ((uint32_t)payload[1] << 16) |
                           ((uint32_t)payload[2] <<  8) |
@@ -768,17 +825,37 @@ static int handle_window_update(h2_conn_t *hc, const uint8_t *payload,
         return 0;
     }
 
+    /* Same wide-type-then-narrow overflow check as the SETTINGS path
+     * above (see that comment) -- checking send_window AFTER adding to it
+     * in-place, as int32_t, cannot detect an overflow because a real
+     * overflow already wrapped the value before the comparison runs.
+     * RFC 7540 6.9.1: a client can legally send WINDOW_UPDATE increments
+     * that are individually valid (up to 2^31-1 each) but whose
+     * cumulative sum pushes the window over 2^31-1 -- this MUST be
+     * rejected with FLOW_CONTROL_ERROR, not silently wrapped into an
+     * undefined/garbage window value (confirmed via h2spec 6.9.1#2/#3,
+     * and observed directly in this session: repeated large
+     * WINDOW_UPDATEs from curl drove hc->send_window into the billions,
+     * which is exactly this unchecked overflow -- a strong suspect for
+     * this session's still-unresolved H2-over-TLS large-file race
+     * condition, since a wrapped/garbage window value feeding into every
+     * subsequent min(conn_win, stream_win) flow-control decision would
+     * produce exactly the kind of nondeterministic, hard-to-reproduce
+     * stalls observed). */
     if (stream_id == 0) {
-        hc->send_window += (int32_t)increment;
-        if (hc->send_window > 0x7fffffff)
+        int64_t wide = (int64_t)hc->send_window + (int64_t)increment;
+        if (wide > 0x7fffffffLL)
             return conn_error(hc, H2_ERR_FLOW_CONTROL_ERROR);
+        hc->send_window = (int32_t)wide;
     } else {
         h2_stream_t *s = stream_find(hc, stream_id);
         if (s) {
-            s->send_window += (int32_t)increment;
-            if (s->send_window > 0x7fffffff) {
+            int64_t wide = (int64_t)s->send_window + (int64_t)increment;
+            if (wide > 0x7fffffffLL) {
                 write_rst_stream(&hc->write_buf, stream_id,
                                  H2_ERR_FLOW_CONTROL_ERROR);
+            } else {
+                s->send_window = (int32_t)wide;
             }
         }
     }
@@ -848,6 +925,8 @@ static int handle_rst_stream(h2_conn_t *hc, const uint8_t *payload,
                               uint32_t length, uint32_t stream_id) {
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     if (length != 4)    return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
+    if (is_idle_stream(hc, stream_id))
+        return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
     uint32_t error_code = ((uint32_t)payload[0] << 24) |
                           ((uint32_t)payload[1] << 16) |
@@ -884,7 +963,93 @@ static int handle_goaway(h2_conn_t *hc, const uint8_t *payload,
 }
 
 /* ── Build http_request_t from decoded HPACK headers ────────────────────── */
+/* RFC 7540 §8.1.2.1/§8.1.2.3/§8.1.2.6 request validation.
+ *
+ * Prior to this fix, stream_to_request() accepted essentially any header
+ * block: missing/duplicate/malformed pseudo-headers, pseudo-headers
+ * arriving after regular headers, unknown pseudo-headers, connection-
+ * specific headers (forbidden in H2), a "te" value other than "trailers",
+ * and a content-length that didn't match the actual body -- all were
+ * silently accepted and dispatched to the application as if the request
+ * were well-formed (confirmed via h2spec section 8.1.2.1/.2/.3/.6, all
+ * failing before this fix: expected GOAWAY/RST_STREAM PROTOCOL_ERROR,
+ * actual was a normal 2xx response). Returns 0 if the header block is
+ * valid, -1 if it must be rejected with a stream-level PROTOCOL_ERROR
+ * (caller does the actual RST_STREAM/error bookkeeping -- this function
+ * only validates). */
+static int validate_request_headers(h2_stream_t *s) {
+    int seen_method = 0, seen_scheme = 0, seen_path = 0, seen_authority = 0;
+    int seen_regular_header = 0;
+    const char *path_value = NULL;
+
+    for (int i = 0; i < s->header_count; i++) {
+        const char *name  = s->headers[i].name;
+        const char *value = s->headers[i].value;
+        if (!name) continue;
+
+        /* RFC 7540 8.1.2: header field names MUST be lowercase (this
+         * applies to pseudo-headers too, though in practice HPACK huffman
+         * decoding of a compliant client never produces uppercase -- an
+         * uppercase name here means the client deliberately sent one). */
+        for (const char *p = name; *p; p++) {
+            if (*p >= 'A' && *p <= 'Z') return -1;
+        }
+
+        if (name[0] == ':') {
+            /* RFC 7540 8.1.2.1: all pseudo-headers MUST appear before any
+             * regular header field in the block. */
+            if (seen_regular_header) return -1;
+
+            if (strcmp(name, ":method") == 0) {
+                if (seen_method) return -1;
+                seen_method = 1;
+            } else if (strcmp(name, ":scheme") == 0) {
+                if (seen_scheme) return -1;
+                seen_scheme = 1;
+            } else if (strcmp(name, ":path") == 0) {
+                if (seen_path) return -1;
+                seen_path = 1;
+                path_value = value;
+            } else if (strcmp(name, ":authority") == 0) {
+                if (seen_authority) return -1;
+                seen_authority = 1;
+            } else {
+                /* Unknown pseudo-header, or a response-only one (:status)
+                 * appearing on a request -- both forbidden. */
+                return -1;
+            }
+        } else {
+            seen_regular_header = 1;
+
+            /* RFC 7540 8.1.2.2: connection-specific fields are forbidden
+             * in HTTP/2. */
+            if (strcasecmp(name, "connection")        == 0 ||
+                strcasecmp(name, "keep-alive")         == 0 ||
+                strcasecmp(name, "proxy-connection")   == 0 ||
+                strcasecmp(name, "transfer-encoding")  == 0 ||
+                strcasecmp(name, "upgrade")            == 0) {
+                return -1;
+            }
+            /* RFC 7540 8.1.2.2: "te" MUST NOT contain any value other
+             * than "trailers". */
+            if (strcasecmp(name, "te") == 0 &&
+                (!value || strcasecmp(value, "trailers") != 0)) {
+                return -1;
+            }
+        }
+    }
+
+    /* RFC 7540 8.1.2.3: :method, :scheme, :path are required (:authority
+     * is not, Host can substitute). :path additionally MUST NOT be empty. */
+    if (!seen_method || !seen_scheme || !seen_path) return -1;
+    if (path_value && path_value[0] == '\0') return -1;
+
+    return 0;
+}
+
 static int stream_to_request(h2_stream_t *s, http_request_t *req) {
+    if (validate_request_headers(s) < 0) return -1;
+
     memset(req, 0, sizeof(*req));
     req->version_major = 2;
     req->version_minor = 0;
@@ -934,6 +1099,22 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
         s->body.cap  = 0;
         s->body.off  = 0;
     }
+
+    /* RFC 7540 8.1.2.6: if content-length is present, it MUST match the
+     * actual body size assembled from DATA frames. A mismatch (either
+     * direction) is a framing inconsistency and MUST be a stream error. */
+    for (int i = 0; i < req->header_count; i++) {
+        if (strcasecmp(req->headers[i].key, "content-length") == 0) {
+            char *endptr = NULL;
+            long long declared = strtoll(req->headers[i].value, &endptr, 10);
+            if (endptr == req->headers[i].value || declared < 0 ||
+                (size_t)declared != req->body_len) {
+                return -1;
+            }
+            break;
+        }
+    }
+
     return 0;
 }
 /* ── Write HTTP response as H2 HEADERS + DATA frames ────────────────────── */
@@ -1324,7 +1505,17 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
     uint64_t dispatch_start = routa_now_us();
     http_request_t  req;
     http_response_t resp;
-    stream_to_request(s, &req);
+    if (stream_to_request(s, &req) < 0) {
+        /* RFC 7540 8.1.2.1/.2/.3/.6: malformed request headers (missing/
+         * duplicate/misordered pseudo-headers, forbidden connection-
+         * specific headers, bad content-length, etc.) -- see
+         * validate_request_headers() in stream_to_request(). MUST be
+         * rejected as a stream error, not dispatched to the application. */
+        write_rst_stream(&hc->write_buf, stream_id, H2_ERR_PROTOCOL_ERROR);
+        s->state = H2_STREAM_CLOSED;
+        stream_remove(hc, stream_id);
+        return 0;
+    }
     req.start_us = dispatch_start;
     strncpy(req.remote_ip, hc->conn->remote_ip, sizeof(req.remote_ip) - 1);
     req.remote_ip[sizeof(req.remote_ip) - 1] = '\0';
@@ -1428,6 +1619,20 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
 
     if (flags & H2_FLAG_PRIORITY) {
         if (hdr_len < 5) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
+        /* RFC 7540 5.3.1: a stream cannot depend on itself, including via
+         * the inline PRIORITY fields carried in a HEADERS frame (not just
+         * a standalone PRIORITY frame -- see handle_priority() for that
+         * path). Previously these 5 bytes were skipped without being
+         * interpreted at all (h2spec 5.3.1#1 confirmed self-dependency
+         * via HEADERS was silently accepted). */
+        uint32_t hdr_dependency = (((uint32_t)hdr_data[0] & 0x7f) << 24) |
+                                  ((uint32_t)hdr_data[1] << 16) |
+                                  ((uint32_t)hdr_data[2] <<  8) |
+                                   (uint32_t)hdr_data[3];
+        if (hdr_dependency == stream_id) {
+            write_rst_stream(&hc->write_buf, stream_id, H2_ERR_PROTOCOL_ERROR);
+            return 0;
+        }
         hdr_data += 5;
         hdr_len  -= 5;
     }
@@ -1583,6 +1788,9 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
     /* FIX: max_frame_size enforcement on DATA                           */
     if (length > hc->peer_max_frame_size)
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
+
+    if (is_idle_stream(hc, stream_id))
+        return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
     h2_stream_t *s = stream_find(hc, stream_id);
     if (!s) {
@@ -1815,7 +2023,7 @@ while (rb->len - offset >= H2_FRAME_HDR_SZ) {
     int rc = 0;
     switch (type) {
     case H2_FRAME_SETTINGS:
-        rc = handle_settings(hc, payload, pay_len, flags);
+        rc = handle_settings(hc, payload, pay_len, flags, sid);
         break;
     case H2_FRAME_PING:
         rc = handle_ping(hc, payload, pay_len, flags, sid);
@@ -1842,6 +2050,7 @@ while (rb->len - offset >= H2_FRAME_HDR_SZ) {
                          router, chain);
         break;
     case H2_FRAME_PRIORITY:
+        rc = handle_priority(hc, payload, pay_len, sid);
         break;
     case H2_FRAME_PUSH_PROMISE:
         buf_consume(rb, offset);
