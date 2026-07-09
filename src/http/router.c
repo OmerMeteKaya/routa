@@ -152,6 +152,22 @@ route_t *router_match(router_t *r, const http_request_t *req, int *allowed_metho
     int best_match  = -1;
     int prefix_match = -1;
     int exact_match  = -1;
+    /* Bug fix: prefix_match used to be unconditionally overwritten by
+     * every matching wildcard route encountered later in the loop, so
+     * whichever wildcard route happened to be registered LAST always
+     * won -- regardless of specificity. In practice this meant a
+     * catch-all static file route ("/ -> docroot", which matches every
+     * path via the "prefix_len == 1 && route->path[0] == '/'" special
+     * case below) registered after a more specific proxy/API route like
+     * "/proxy/*" would silently steal every request meant for that more
+     * specific route, since pool routes are registered before
+     * static_dir routes in server_from_config() (see server.c). Now we
+     * track the matched route's actual prefix length and only replace
+     * prefix_match when a LONGER (more specific) prefix is found, so
+     * "/proxy/*" (prefix length 6) always beats "/*" (prefix length 0)
+     * for a request to "/proxy/anything", irrespective of registration
+     * order. */
+    size_t best_prefix_len = 0;
 
     for (int i = 0; i < r->route_count; i++) {
         route_t *route = &r->routes[i];
@@ -164,10 +180,15 @@ route_t *router_match(router_t *r, const http_request_t *req, int *allowed_metho
 
         if (route_path_len > 0 && route->path[route_path_len - 1] == '*') {
             size_t prefix_len = route_path_len - 1;
+            int matched = 0;
             if (strncmp(route->path, req->path, prefix_len) == 0)
-                prefix_match = i;
+                matched = 1;
             if (prefix_len == 1 && route->path[0] == '/')
+                matched = 1;
+            if (matched && (prefix_match < 0 || prefix_len > best_prefix_len)) {
                 prefix_match = i;
+                best_prefix_len = prefix_len;
+            }
             continue;
         }
 
@@ -176,8 +197,12 @@ route_t *router_match(router_t *r, const http_request_t *req, int *allowed_metho
             route->path[route_path_len - 1] == '*') {
             size_t prefix_len = route_path_len - 2;
             if (strncmp(route->path, req->path, prefix_len) == 0 &&
-                (req->path[prefix_len] == '\0' || req->path[prefix_len] == '/'))
-                prefix_match = i;
+                (req->path[prefix_len] == '\0' || req->path[prefix_len] == '/')) {
+                if (prefix_match < 0 || prefix_len > best_prefix_len) {
+                    prefix_match = i;
+                    best_prefix_len = prefix_len;
+                }
+            }
         }
     }
 

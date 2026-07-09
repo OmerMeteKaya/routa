@@ -3,6 +3,7 @@
 #endif
 #include "http/h2.h"
 #include "http/router.h"
+#include "core/event_loop.h"
 #include "http/middleware.h"
 #include "http/request.h"
 #include "http/response.h"
@@ -15,6 +16,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <ctype.h>
+#include <unistd.h>
 #include "util/metrics.h"
 
 /* Return value from dispatch_stream when the stream was handed to the proxy.
@@ -74,6 +77,8 @@ static h2_stream_t *pool_create(h2_stream_pool_t *p, uint32_t id,
     buf_init(&s->header_block);
     buf_init(&s->pending_data);
     s->pending_offset = 0;
+    s->pending_body_fd = -1;
+    s->pending_body_fd_remaining = 0;
     return s;
 }
 
@@ -162,6 +167,8 @@ static h2_stream_t *map_create(h2_stream_map_t *m, uint32_t id,
     buf_init(&s->header_block);
     buf_init(&s->pending_data);
     s->pending_offset = 0;
+    s->pending_body_fd = -1;
+    s->pending_body_fd_remaining = 0;
 
     int mask = m->capacity - 1;
     int idx  = (int)(id & (uint32_t)mask);
@@ -596,43 +603,139 @@ static int handle_ping(h2_conn_t *hc, const uint8_t *payload,
 }
 
 static void flush_pending(h2_conn_t *hc, h2_stream_t *s) {
-    if (s->pending_data.len == 0) return;
+    if (s->pending_data.len == 0 && s->pending_body_fd < 0) return;
 
-    size_t rem = s->pending_data.len - s->pending_offset;
-    const uint8_t *ptr = (const uint8_t *)buf_data(&s->pending_data)
-                     + s->pending_offset;
+    if (s->pending_data.len > 0) {
+        size_t rem = s->pending_data.len - s->pending_offset;
+        const uint8_t *ptr = (const uint8_t *)buf_data(&s->pending_data)
+                         + s->pending_offset;
+        while (rem > 0) {
+            int32_t conn_win   = hc->send_window;
+            int32_t stream_win = s->send_window;
+            int32_t win        = conn_win < stream_win ? conn_win : stream_win;
+            if (win <= 0) return;
+            size_t can_send = (size_t)win < rem ? (size_t)win : rem;
+            size_t chunk    = can_send < hc->peer_max_frame_size
+                              ? can_send : hc->peer_max_frame_size;
+            int end = (chunk == rem) && s->pending_body_fd < 0;
+            if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
+                                H2_FRAME_DATA,
+                                end ? H2_FLAG_END_STREAM : 0,
+                                s->id) < 0) return;
+            if (buf_append(&hc->write_buf, ptr, chunk) < 0) return;
+            hc->send_window   -= (int32_t)chunk;
+            s->send_window    -= (int32_t)chunk;
+            s->pending_offset += chunk;
+            ptr += chunk;
+            rem -= chunk;
+        }
+        if (s->pending_offset >= s->pending_data.len) {
+            buf_reset(&s->pending_data);
+            s->pending_offset = 0;
+        } else {
+            return;
+        }
+    }
 
-    while (rem > 0) {
+    /* Cap how much we stuff into hc->write_buf per call -- send_response()
+     * (h2.c's main body_fd path) and h2_conn_flush() both enforce/expect
+     * write_buf to stay under H2_WRITE_BUF_SOFT_LIMIT; without this check
+     * a single flush_pending() call for a large file (e.g. a 20MB video)
+     * would keep reading and appending as long as the flow-control window
+     * allowed, blowing straight through h2_conn_flush()'s 4MB hard cap
+     * (H2_ERR_ENHANCE_YOUR_CALM connection abort) before the socket ever
+     * got a chance to drain any of it. Instead, stop once write_buf has a
+     * healthy amount queued and let the normal POLLER_WRITE -> h2_conn_flush
+     * -> h2_conn_flush_pending cycle (see event_loop.c) drain it and come
+     * back for more. */
+    #define H2_WRITE_BUF_SOFT_LIMIT (1024 * 1024)
+    while (s->pending_body_fd >= 0 && s->pending_body_fd_remaining > 0) {
+        if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) {
+            /* Proactively flush -- see send_response()'s matching comment
+             * for why relying solely on a later POLLER_WRITE event isn't
+             * enough on a fast/loopback socket under edge-triggered epoll. */
+            if (h2_conn_flush(hc) < 0) return;
+            if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) return; /* genuinely stalled, wait for real event */
+        }
+
         int32_t conn_win   = hc->send_window;
         int32_t stream_win = s->send_window;
         int32_t win        = conn_win < stream_win ? conn_win : stream_win;
-        if (win <= 0) break;
+        if (win <= 0) return;
 
-        size_t can_send = (size_t)win < rem ? (size_t)win : rem;
-        size_t chunk    = can_send < hc->peer_max_frame_size
-                          ? can_send : hc->peer_max_frame_size;
-        int end = (chunk == rem);
+        uint8_t fbuf[65536];
+        size_t want = s->pending_body_fd_remaining;
+        if (want > sizeof(fbuf)) want = sizeof(fbuf);
 
-        if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
-                            H2_FRAME_DATA,
-                            end ? H2_FLAG_END_STREAM : 0,
-                            s->id) < 0) break;
-        if (buf_append(&hc->write_buf, ptr, chunk) < 0) break;
+        ssize_t nr = read(s->pending_body_fd, fbuf, want);
+        if (nr <= 0) {
+            close(s->pending_body_fd);
+            s->pending_body_fd = -1;
+            s->pending_body_fd_remaining = 0;
+            break;
+        }
 
-        hc->send_window   -= (int32_t)chunk;
-        s->send_window    -= (int32_t)chunk;
-        s->pending_offset += chunk;
-        ptr += chunk;
-        rem -= chunk;
+        size_t rem = (size_t)nr;
+        const uint8_t *ptr = fbuf;
+        while (rem > 0) {
+            conn_win   = hc->send_window;
+            stream_win = s->send_window;
+            win        = conn_win < stream_win ? conn_win : stream_win;
+            if (win <= 0) {
+                /* rem bytes were already read from disk (as part of this
+                 * nr-byte read()) but not yet sent -- stash them in
+                 * pending_data. pending_body_fd_remaining must NOT be
+                 * decremented here: it tracks bytes not yet read from
+                 * disk at all, and every byte actually sent this
+                 * iteration already decremented it above (chunk-by-chunk,
+                 * see "s->pending_body_fd_remaining -= chunk" below). The
+                 * previous version double-subtracted here, underflowing
+                 * this size_t field into a huge value on the very first
+                 * stall of any body_fd transfer -- which then made
+                 * subsequent resume attempts read garbage-sized chunks
+                 * and never converge, hanging the response forever
+                 * (root cause of H2 static-file/video downloads over TLS
+                 * stalling partway through and never completing). */
+                if (buf_append(&s->pending_data, ptr, rem) < 0) return;
+                s->pending_offset = 0;
+                return;
+            }
+            size_t can_send = (size_t)win < rem ? (size_t)win : rem;
+            size_t chunk    = can_send < hc->peer_max_frame_size
+                              ? can_send : hc->peer_max_frame_size;
+            s->pending_body_fd_remaining -= chunk;
+            int end = (chunk == rem) && s->pending_body_fd_remaining == 0;
+            if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
+                                H2_FRAME_DATA,
+                                end ? H2_FLAG_END_STREAM : 0,
+                                s->id) < 0) return;
+            if (buf_append(&hc->write_buf, ptr, chunk) < 0) return;
+            hc->send_window   -= (int32_t)chunk;
+            s->send_window    -= (int32_t)chunk;
+            ptr += chunk;
+            rem -= chunk;
+        }
     }
 
-    if (s->pending_offset >= s->pending_data.len) {
-        buf_reset(&s->pending_data);
-        s->pending_offset = 0;
-        if (s->state == H2_STREAM_HALF_CLOSED_REMOTE) {
-            s->state = H2_STREAM_CLOSED;
-            stream_remove(hc, s->id);
-        }
+    if (s->pending_body_fd >= 0 && s->pending_body_fd_remaining == 0) {
+        close(s->pending_body_fd);
+        s->pending_body_fd = -1;
+    }
+
+    /* Always attempt a flush before returning, regardless of which path
+     * got us here (pending_data drained, body_fd resume drained, or
+     * mid-stream after queuing more DATA frames). Uses worker_conn_flush()
+     * rather than a bare h2_conn_flush() -- see the matching comment in
+     * handle_window_update() for why a partial TLS flush needs the
+     * poller re-armed for POLLER_WRITE, not just a single write attempt. */
+    if (hc->write_buf.len > 0 && hc->worker) {
+        worker_conn_flush((worker_t *)hc->worker, hc->conn);
+    }
+
+    if (s->pending_data.len == 0 && s->pending_body_fd < 0 &&
+        s->state == H2_STREAM_HALF_CLOSED_REMOTE) {
+        s->state = H2_STREAM_CLOSED;
+        stream_remove(hc, s->id);
     }
 }
 void h2_conn_flush_pending(h2_conn_t *hc) {
@@ -640,14 +743,14 @@ void h2_conn_flush_pending(h2_conn_t *hc) {
     if (hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR) {
         for (int i = 0; i < hc->streams.pool.count; i++) {
             h2_stream_t *s = &hc->streams.pool.slots[i];
-            if (s->pending_data.len > s->pending_offset)
+            if (s->pending_data.len > s->pending_offset || s->pending_body_fd >= 0)
                 flush_pending(hc, s);
         }
     } else {
         for (int i = 0; i < hc->streams.map.capacity; i++) {
             if (!hc->streams.map.keys[i]) continue;
             h2_stream_t *s = hc->streams.map.buckets[i];
-            if (s->pending_data.len > s->pending_offset)
+            if (s->pending_data.len > s->pending_offset || s->pending_body_fd >= 0)
                 flush_pending(hc, s);
         }
     }
@@ -680,25 +783,63 @@ static int handle_window_update(h2_conn_t *hc, const uint8_t *payload,
         }
     }
 
+    /* NOTE: also check pending_body_fd, not just pending_data -- a stream
+     * can be stalled purely on a body_fd resume (e.g. the write_buf
+     * soft-limit path in send_response()/flush_pending()) with an empty
+     * pending_data buffer. Without this, a WINDOW_UPDATE for such a
+     * stream never re-invoked flush_pending(), leaving the response
+     * stalled forever even once the peer granted more flow-control
+     * window (this was the actual root cause of large H2 responses
+     * hanging indefinitely just past the write_buf soft limit). */
     if (stream_id == 0) {
         if (hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR) {
             for (int i = 0; i < hc->streams.pool.count; i++) {
                 h2_stream_t *ps = &hc->streams.pool.slots[i];
-                if (ps->pending_data.len > ps->pending_offset)
+                if (ps->pending_data.len > ps->pending_offset || ps->pending_body_fd >= 0)
                     flush_pending(hc, ps);
             }
         } else {
             for (int i = 0; i < hc->streams.map.capacity; i++) {
                 if (!hc->streams.map.keys[i]) continue;
                 h2_stream_t *ps = hc->streams.map.buckets[i];
-                if (ps->pending_data.len > ps->pending_offset)
+                if (ps->pending_data.len > ps->pending_offset || ps->pending_body_fd >= 0)
                     flush_pending(hc, ps);
             }
         }
     } else {
         h2_stream_t *ps = stream_find(hc, stream_id);
-        if (ps && ps->pending_data.len > ps->pending_offset)
+        if (ps && (ps->pending_data.len > ps->pending_offset || ps->pending_body_fd >= 0))
             flush_pending(hc, ps);
+    }
+    /* flush_pending() only enqueues DATA frames into hc->write_buf -- it
+     * never writes to the actual socket (only its own internal soft-limit
+     * check does, and only once write_buf crosses ~1MB). A WINDOW_UPDATE
+     * that resumes a body_fd transfer near its end can leave a
+     * perfectly well-formed, fully-queued response (including the
+     * END_STREAM-flagged final DATA frame) sitting in write_buf
+     * indefinitely if nothing else forces a flush before the next real
+     * socket-write event -- which, on an already-writable loopback
+     * socket under edge-triggered epoll, may never arrive. This was the
+     * actual root cause of H2-over-TLS large file/video downloads
+     * completing all their internal bookkeeping (END_STREAM flag set,
+     * pending_body_fd drained to 0) but the client never receiving the
+     * final bytes. Flush eagerly here whenever this WINDOW_UPDATE caused
+     * anything to be queued. */
+    /* Use worker_conn_flush() instead of a bare h2_conn_flush() call --
+     * on TLS connections, a single flush attempt here can be a PARTIAL
+     * flush (SSL_write hitting SSL_ERROR_WANT_WRITE mid-buffer, far more
+     * likely under TLS's extra encrypt/memcpy overhead than on a raw
+     * socket, which is why this only reproduced over TLS and not h2c).
+     * A bare h2_conn_flush() call has no way to re-arm the poller for
+     * POLLER_WRITE if it can't finish, so any bytes left in write_buf
+     * after a partial flush here just sat forever with nothing watching
+     * for the socket to become writable again -- this was the root cause
+     * of the ~80% failure rate on large (>1MB) H2-over-TLS responses.
+     * worker_conn_flush() (event_loop.c) already handles exactly this:
+     * flush, and if write_buf.len is still > 0 afterward, re-register
+     * POLLER_WRITE. */
+    if (hc->write_buf.len > 0 && hc->worker) {
+        worker_conn_flush((worker_t *)hc->worker, hc->conn);
     }
     return 0;
 }
@@ -719,6 +860,15 @@ static int handle_rst_stream(h2_conn_t *hc, const uint8_t *payload,
         ROUTA_METRIC_INC(h2_rst_streams_total);
         buf_reset(&s->pending_data);
         s->pending_offset = 0;
+        /* Close any in-flight body_fd (e.g. a large static file transfer
+         * stalled on flow control) instead of leaking the fd -- the
+         * client is telling us it no longer wants this stream's data,
+         * same as the pending_data buffer being discarded above. */
+        if (s->pending_body_fd >= 0) {
+            close(s->pending_body_fd);
+            s->pending_body_fd = -1;
+            s->pending_body_fd_remaining = 0;
+        }
         s->state = H2_STREAM_CLOSED;
         stream_remove(hc, stream_id);
     }
@@ -802,9 +952,19 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
     enc_headers[nhdr].value = status_str;
     nhdr++;
 
+    /* resp->body_fd responses (static.c's sendfile path) carry their
+     * length in body_fd_len, not body_len -- http_response_set_body_fd()
+     * deliberately zeroes body_len (see response.c). Every body_len check
+     * in this function needs the same body_fd-aware fallback, or H2
+     * responses for large/sendfile-served files silently ship zero body
+     * bytes while still claiming :status 200 (this was completely broken
+     * before this fix -- H1 had its own separate bug in the same area,
+     * now fixed, but H2 needed this independent fix). */
+    size_t effective_body_len = resp->body_fd >= 0 ? resp->body_fd_len : resp->body_len;
+
     char cl_val[32];
-    if (resp->body_len > 0) {
-        (void)snprintf(cl_val, sizeof(cl_val), "%zu", resp->body_len);
+    if (effective_body_len > 0) {
+        (void)snprintf(cl_val, sizeof(cl_val), "%zu", effective_body_len);
         enc_headers[nhdr].name  = "content-length";
         enc_headers[nhdr].value = cl_val;
         nhdr++;
@@ -814,7 +974,14 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
     enc_headers[nhdr].value = "routa";
     nhdr++;
 
-    for (int i = 0; i < resp->header_count; i++) {
+    /* RFC 7540 §8.1.2: header field names MUST be lowercase. resp->headers
+     * may carry names as set by application code (e.g. static.c's
+     * "Content-Type"), so lowercase a copy here rather than assuming
+     * every caller already did -- HTTP/1.1 is case-insensitive so this
+     * bug was invisible there, but strict H2 clients (curl, nghttp2)
+     * correctly reject any uppercase header name with PROTOCOL_ERROR. */
+    char lname_buf[35][128];  /* stack, not static -- send_response() runs on multiple worker threads */
+    for (int i = 0; i < resp->header_count && i < 35; i++) {
         const char *hname = resp->headers[i][0];
         const char *hval  = resp->headers[i][1];
         if (!hname || hname[0] == '\0') continue;
@@ -822,7 +989,13 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
         /* content-length is emitted above; skip duplicates from set_body */
         if (strcasecmp(hname, "content-length") == 0) continue;
         if (strcasecmp(hname, "server") == 0) continue;
-        enc_headers[nhdr].name  = (char *)hname;
+
+        size_t k = 0;
+        for (; hname[k] != '\0' && k < sizeof(lname_buf[i]) - 1; k++)
+            lname_buf[i][k] = (char)tolower((unsigned char)hname[k]);
+        lname_buf[i][k] = '\0';
+
+        enc_headers[nhdr].name  = lname_buf[i];
         enc_headers[nhdr].value = (char *)hval;
         nhdr++;
     }
@@ -833,9 +1006,8 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
     hc->hpack_tx.dynamic_table_update = saved_dtu;
     if (hdr_len < 0) return -1;
 
-    /* FIX: correctly detect body presence including fd path              */
     int has_body = (resp->body && resp->body_len > 0) ||
-                   (resp->body_fd >= 0 && resp->body_len > 0);
+                   (resp->body_fd >= 0 && resp->body_fd_len > 0);
     uint8_t hflags = H2_FLAG_END_HEADERS |
                      (has_body ? 0 : H2_FLAG_END_STREAM);
 
@@ -846,17 +1018,56 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
     if (buf_append(&hc->write_buf, hdr_block, (size_t)hdr_len) < 0)
         return -1;
 
-    /* ── body_fd path (read into buffer, then flow-control-aware send) ── */
-    if (resp->body_fd >= 0 && resp->body_len > 0) {
+    /* ── body_fd path (read into buffer, then flow-control-aware send) ──
+     * total must come from body_fd_len (see effective_body_len comment
+     * above). Also seek to body_fd_off first -- static.c sets this to a
+     * nonzero value for Range requests (see resolve_path()/range parsing
+     * in static.c), and without the seek this path always re-read from
+     * byte 0 regardless of the requested range. */
+    if (resp->body_fd >= 0 && resp->body_fd_len > 0) {
         #define FBUF_SZ 65536
         uint8_t *fbuf = malloc(FBUF_SZ);
         if (!fbuf) return -1;
 
-        size_t total  = resp->body_len;
+        lseek(resp->body_fd, resp->body_fd_off, SEEK_SET);
+
+        size_t total  = resp->body_fd_len;
         size_t offset = 0;  /* bytes sent to write_buf so far */
         int    rc     = 0;
 
         while (offset < total) {
+            /* Same write_buf soft-limit reasoning as flush_pending()'s
+             * resume loop -- once write_buf has a healthy amount queued,
+             * proactively flush it to the socket right here (synchronous,
+             * non-blocking write -- h2_conn_flush() is just a thin
+             * io_write_from_buf() wrapper, safe to call reentrantly from
+             * here) instead of just stopping and hoping a later
+             * POLLER_WRITE event resumes us. On a fast/loopback socket
+             * that's already writable, edge-triggered epoll may not
+             * deliver a fresh writable edge after we re-arm for
+             * POLLER_WRITE, so relying on that alone left multi-MB
+             * responses (large static files, video-sized files) stalled
+             * forever just past the soft limit. Only fall back to
+             * stashing body_fd state + returning (relying on the next
+             * real POLLER_WRITE/WINDOW_UPDATE-driven flush_pending call)
+             * if the socket genuinely can't take more right now. */
+            if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) {
+                if (h2_conn_flush(hc) < 0) {
+                    free(fbuf);
+                    return -1;
+                }
+                if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) {
+                    /* Socket truly can't absorb more right now (EAGAIN) --
+                     * genuinely defer to the event loop. */
+                    ROUTA_METRIC_INC(h2_flow_control_stalls_total);
+                    s->pending_body_fd = resp->body_fd;
+                    s->pending_body_fd_remaining = total - offset;
+                    resp->body_fd = -1;
+                    free(fbuf);
+                    return 0;
+                }
+            }
+
             size_t want = total - offset;
             if (want > FBUF_SZ) want = FBUF_SZ;
 
@@ -871,9 +1082,31 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                 int32_t stream_win = s->send_window;
                 int32_t win        = conn_win < stream_win ? conn_win : stream_win;
                 if (win <= 0) {
+                    /* Stash the unsent tail of THIS read into pending_data,
+                     * and remember the fd + remaining on-disk bytes so
+                     * flush_pending()'s body_fd resume logic can pick up
+                     * where we left off once WINDOW_UPDATE arrives.
+                     * Previously nothing preserved this state -- whatever
+                     * hadn't been read from disk yet was silently
+                     * dropped, truncating every H2 response whose
+                     * body_fd content exceeded one flow-control window's
+                     * worth of data (the H2-side counterpart of the H1
+                     * send_file_tls() truncation bug fixed earlier). */
                     ROUTA_METRIC_INC(h2_flow_control_stalls_total);
-                    if (buf_append(&s->pending_data, ptr, rem) < 0) return -1;
+                    if (buf_append(&s->pending_data, ptr, rem) < 0) { free(fbuf); return -1; }
                     s->pending_offset = 0;
+                    s->pending_body_fd = resp->body_fd;
+                    /* Bytes not yet even read from disk = total minus
+                     * everything read so far (offset + nr). rem (the
+                     * unsent tail of THIS read) is already accounted for
+                     * separately via pending_data -- adding it here again
+                     * double-counted it, overestimating the on-disk
+                     * remainder by `rem` bytes on every stall (same class
+                     * of bug as flush_pending()'s underflow, fixed
+                     * alongside this). */
+                    s->pending_body_fd_remaining = total - offset - (size_t)nr;
+                    resp->body_fd = -1; /* ownership transferred to the stream */
+                    free(fbuf);
                     return 0;
                 }
 
@@ -881,7 +1114,7 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                 size_t chunk    = can_send < hc->peer_max_frame_size
                                   ? can_send : hc->peer_max_frame_size;
 
-                int end = (chunk == rem);
+                int end = (chunk == rem) && (offset + (size_t)nr == total);
 
                 if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
                                     H2_FRAME_DATA,
@@ -894,6 +1127,8 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
                 ptr += chunk;
                 rem -= chunk;
             }
+
+            offset += (size_t)nr;
         }
 
         free(fbuf);
@@ -950,7 +1185,7 @@ int h2_proxy_send_response(h2_conn_t *hc, uint32_t stream_id,
 
     int rc = send_response(hc, stream_id, s, resp);
 
-    if (s->pending_data.len == 0) {
+    if (s->pending_data.len == 0 && s->pending_body_fd < 0) {
         s->state = H2_STREAM_CLOSED;
         ROUTA_METRIC_INC(h2_streams_closed_total);
         ROUTA_METRIC_DEC(h2_active_streams);
@@ -1024,7 +1259,7 @@ int h2_push_response(h2_conn_t *hc,
     int rc = send_response(hc, promised_stream_id, ps, resp);
 
     /* Clean up if all data sent                                          */
-    if (ps->pending_data.len == 0) {
+    if (ps->pending_data.len == 0 && ps->pending_body_fd < 0) {
         ps->state = H2_STREAM_CLOSED;
         stream_remove(hc, promised_stream_id);
     }
@@ -1257,7 +1492,7 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
             return 0;  /* stream kept alive; upstream response will close it */
         }
         buf_reset(&s->body);
-        if (s->pending_data.len == 0) {
+        if (s->pending_data.len == 0 && s->pending_body_fd < 0) {
             s->state = H2_STREAM_CLOSED;
             ROUTA_METRIC_INC(h2_streams_closed_total);
             ROUTA_METRIC_DEC(h2_active_streams);
@@ -1328,7 +1563,7 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
             return 0;  /* stream kept alive; upstream response will close it */
         }
         buf_reset(&s->body);
-        if (s->pending_data.len == 0) {
+        if (s->pending_data.len == 0 && s->pending_body_fd < 0) {
             s->state = H2_STREAM_CLOSED;
             stream_remove(hc, stream_id);
         }
@@ -1391,7 +1626,7 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
             return 0;  /* stream kept alive; upstream response will close it */
         }
         buf_reset(&s->body);
-        if (s->pending_data.len == 0) {
+        if (s->pending_data.len == 0 && s->pending_body_fd < 0) {
             s->state = H2_STREAM_CLOSED;
             ROUTA_METRIC_INC(h2_streams_closed_total);
             ROUTA_METRIC_DEC(h2_active_streams);
@@ -1507,7 +1742,7 @@ int h2_upgrade_from_h1(h2_conn_t      *hc,
 
     if (drc != H2_DISPATCH_PROXY) {
         s->body.data = NULL; s->body.len = 0; s->body.cap = 0; s->body.off  = 0;
-        if (s->pending_data.len == 0) {
+        if (s->pending_data.len == 0 && s->pending_body_fd < 0) {
             s->state = H2_STREAM_CLOSED;
             stream_remove(hc, 1);
         }

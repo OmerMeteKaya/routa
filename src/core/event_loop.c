@@ -314,7 +314,23 @@ void worker_conn_flush(worker_t *w, conn_t *conn)
     }
 }
 
-/* TLS sendfile fallback: read file → tls_write */
+/* TLS sendfile fallback: read file → tls_write, blocking-emulation loop.
+ *
+ * conn->fd is non-blocking (edge-triggered epoll), so tls_write() can:
+ *   (a) return a SHORT count (n > 0 but n < requested) -- SSL_write does
+ *       not guarantee writing the whole buffer in one call, unlike a
+ *       blocking write() to a regular file.
+ *   (b) return -1 for SSL_ERROR_WANT_WRITE/WANT_READ, meaning "try again,
+ *       nothing was written" -- NOT a fatal error. The previous version
+ *       treated this identically to a real error and aborted immediately,
+ *       which is exactly what silently truncated every response whose
+ *       body exceeded the socket's TLS write buffer capacity (observed:
+ *       2MB file truncated to exactly 512KB = 8 * 64KB chunks, i.e. it
+ *       died on the first WANT_WRITE, which on a fast loopback with a
+ *       large file arrives quickly once the kernel socket buffer fills).
+ * Both must be retried, not treated as fatal, for this "blocking" fallback
+ * to actually behave as advertised. A short retry-sleep avoids a tight
+ * spin loop while the kernel socket buffer drains. */
 static int send_file_tls(worker_t *w, conn_t *conn,
                          int fd, off_t off, size_t len) {
     (void)w;
@@ -325,7 +341,24 @@ static int send_file_tls(worker_t *w, conn_t *conn,
         size_t  to_read = rem < sizeof(tmp) ? rem : sizeof(tmp);
         ssize_t n       = read(fd, tmp, to_read);
         if (n <= 0) break;
-        if (tls_write(conn->tls, tmp, (size_t)n) < 0) { close(fd); return -1; }
+
+        size_t written = 0;
+        while (written < (size_t)n) {
+            ssize_t wn = tls_write(conn->tls, tmp + written, (size_t)n - written);
+            if (wn > 0) {
+                written += (size_t)wn;
+                continue;
+            }
+            if (wn == -1) {
+                /* WANT_READ/WANT_WRITE: not fatal, just not ready yet */
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; /* 1ms */
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            /* wn == 0 (ZERO_RETURN, clean TLS close) or -2 (real error) */
+            close(fd);
+            return -1;
+        }
         rem -= (size_t)n;
     }
     close(fd);
@@ -905,7 +938,6 @@ static void handle_events_worker(worker_t *w) {
 
             int allowed_methods = 0;
             route_t *matched_route = router_match(w->router, &req, &allowed_methods);
-
             if (matched_route == NULL && allowed_methods == 0) {
                 /* 404 — legacy write_buf */
                 buf_reset(&conn->write_buf);
@@ -1062,8 +1094,34 @@ static void handle_events_worker(worker_t *w) {
                         /* Headers via writev, then CONN_SENDFILE */
                         conn_prepare_writev(conn, &resp);
                     } else {
-                        /* TLS: blocking file send, then headers via writev */
+                        /* TLS: no async sendfile() equivalent, so this path
+                         * is blocking -- but headers MUST reach the peer
+                         * before the body. conn_prepare_writev() only
+                         * serializes headers into conn->hdr_buf; it does
+                         * NOT write them to the socket (that normally
+                         * happens later via the writev/POLLER_WRITE path).
+                         * send_file_tls() used to be called immediately
+                         * after, writing raw file bytes straight to the
+                         * TLS session while the headers were still sitting
+                         * unsent in conn->hdr_buf -- the peer received body
+                         * bytes before (or instead of) headers, corrupting
+                         * the response (observed as connection resets /
+                         * empty bodies under wrk for any body_fd response
+                         * over TLS, e.g. large static files, range
+                         * requests). Fix: flush conn->hdr_buf to the TLS
+                         * session synchronously first, THEN send the file
+                         * body. */
                         conn_prepare_writev(conn, &resp);
+                        if (conn->hdr_buf.len > 0) {
+                            if (tls_write(conn->tls, buf_data(&conn->hdr_buf),
+                                         buf_len(&conn->hdr_buf)) < 0) {
+                                conn->state = CONN_CLOSING;
+                                http_response_destroy(&resp);
+                                http_request_free(&req);
+                                goto handle_state;
+                            }
+                            buf_consume(&conn->hdr_buf, conn->hdr_buf.len);
+                        }
                         send_file_tls(w, conn, resp.body_fd,
                                       resp.body_fd_off, resp.body_fd_len);
                         resp.body_fd = -1;
@@ -1100,6 +1158,25 @@ static void handle_events_worker(worker_t *w) {
                     }
                     h2_conn_flush_pending(conn->h2);
                     if (conn->h2->write_buf.len > 0) {
+                        /* h2_conn_flush_pending() (e.g. resuming a
+                         * body_fd-backed response after a WINDOW_UPDATE,
+                         * see h2.c's flush_pending()) can refill write_buf
+                         * here. Previously this just re-armed POLLER_WRITE
+                         * and continued without attempting a real write --
+                         * on a loopback socket that's already writable,
+                         * edge-triggered epoll may never deliver a fresh
+                         * writable edge to justify a "later" flush, so
+                         * this data could sit unsent indefinitely. This
+                         * was the root cause of H2-over-TLS large file/
+                         * video downloads hanging partway through even
+                         * though flow control and the body_fd resume
+                         * logic were both working correctly (confirmed by
+                         * the same request completing successfully over
+                         * plaintext h2c, where the socket's own EAGAIN
+                         * behavior happened to mask this gap). Flush
+                         * eagerly here instead of only hoping for a later
+                         * event. */
+                        h2_conn_flush(conn->h2);
                         conn_poller_mod(w, conn, POLLER_READ | POLLER_WRITE | POLLER_ET);
                         continue;
                     }
@@ -1124,6 +1201,25 @@ static void handle_events_worker(worker_t *w) {
                             }
                             goto h2_write_done;
                         }
+                    }
+                    /* The "drain pending input" loop above can process
+                     * WINDOW_UPDATE frames whose handler (handle_window_update
+                     * -> flush_pending(), see h2.c) refills write_buf with
+                     * resumed body_fd data -- but nothing in this loop or
+                     * its exit path ever called h2_conn_flush() to actually
+                     * put that data on the wire. On a loopback socket
+                     * already writable under edge-triggered epoll, just
+                     * re-arming POLLER_WRITE and hoping for a future edge
+                     * is not guaranteed to produce one, so this data could
+                     * sit in write_buf indefinitely. This was the actual
+                     * root cause of H2-over-TLS large file/video downloads
+                     * hanging partway through -- confirmed by the
+                     * identical request completing successfully over
+                     * plaintext h2c, where the socket's own write-side
+                     * retry behavior happened to paper over this gap by
+                     * forcing a flush elsewhere. Flush eagerly here. */
+                    if (conn->h2->write_buf.len > 0) {
+                        h2_conn_flush(conn->h2);
                     }
                     if (conn->h2->write_buf.len > 0) {
                         conn_poller_mod(w, conn,
@@ -1417,6 +1513,55 @@ static void handle_events_worker(worker_t *w) {
                         conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
                         break;
             case CONN_WRITING:
+                        /* A response can already be FULLY complete by the
+                         * time we land in this case -- specifically, the
+                         * TLS body_fd path (see the POLLER_READ handling
+                         * above: "TLS: no async sendfile() equivalent")
+                         * flushes headers AND the entire file body
+                         * synchronously before ever reaching
+                         * `conn->state = CONN_WRITING; goto handle_state;`.
+                         * In that situation, write_buf/hdr_buf/resp_body_ptr
+                         * are all already empty/NULL here, so there is
+                         * nothing left to write -- but the code below
+                         * unconditionally re-arms POLLER_WRITE and waits,
+                         * which (on a connection that's already fully
+                         * drained) never fires again since nothing will
+                         * ever make the socket "become" writable in a new
+                         * way. The connection was permanently stuck in
+                         * CONN_WRITING, silently discarding every
+                         * subsequent request sent on the same keep-alive
+                         * connection (confirmed: second-and-later large
+                         * file requests over TLS on a reused connection
+                         * came back with an empty body). Detect the
+                         * fully-drained case up front and go straight back
+                         * to reading the next request instead. */
+                        if (conn->write_buf.len == 0 && conn->hdr_buf.len == 0 &&
+                            conn->resp_body_ptr == NULL &&
+                            conn->ws_state != WS_STATE_HANDSHAKING) {
+                            conn_reset_write_state(conn);
+                            buf_consume(&conn->read_buf, conn->consumed);
+                            conn->consumed = 0;
+                            if (!conn->keep_alive) {
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                            conn->state = CONN_READING;
+                            conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
+                            /* Eagerly try to read a pipelined next request,
+                             * same reasoning as the WS-transition copy below
+                             * -- a client that already sent it won't
+                             * generate a fresh epoll edge to prompt us. */
+                            ssize_t rn = io_read_into_buf(conn->fd, &conn->read_buf, conn->tls);
+                            if (rn == 0) {
+                                conn->state = CONN_CLOSING;
+                                goto handle_state;
+                            }
+                            if (conn->read_buf.len > 0) {
+                                conn->state = CONN_READING;
+                                goto handle_state;
+                            }
+                            break;
+                        }
                         /* Attempt an immediate flush of any buffered response
                          * (e.g. a 502 from proxy_begin()'s synchronous upstream_error
                          * path, or from proxy_on_upstream_writable()) before relying

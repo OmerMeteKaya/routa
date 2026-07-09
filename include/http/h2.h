@@ -96,6 +96,13 @@ typedef struct h2_stream {
     /* Outbound data buffered while send window is exhausted              */
     buf_t             pending_data;
     size_t            pending_offset;
+    /* Outbound body_fd (sendfile-style) response still in flight when
+     * flow control stalls mid-transfer -- see send_response()'s body_fd
+     * path and its resume logic. -1 = no fd-backed response pending.
+     * The fd's own read position tracks progress (each read() advances
+     * it), so only the remaining byte count needs to be kept here. */
+    int               pending_body_fd;
+    size_t            pending_body_fd_remaining;
     uint64_t start_us;
 } h2_stream_t;
 

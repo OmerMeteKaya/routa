@@ -130,6 +130,17 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/helpers/real_world_server.c")
     endif()
 endif()
 
+# ── Bench server (tests/bench/bench_server.c) ────────────────────────────
+# Not a ctest -- invoked manually by tests/bench/*.sh scripts. Config-driven
+# (tests/bench/bench.conf) plus a WS echo route and a deliberately
+# CPU-bound /api/cpu route, used to measure worker-blocking behavior under
+# load (see PROJECT_SUMMARY / bench plan).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench/bench_server.c")
+    add_executable(bench_server tests/bench/bench_server.c)
+    target_link_libraries(bench_server PRIVATE routa_core)
+    target_include_directories(bench_server PRIVATE include)
+endif()
+
 include(cmake/Sanitizers.cmake)
 
 if(TARGET test_h2)
