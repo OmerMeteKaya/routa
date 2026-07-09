@@ -143,6 +143,18 @@ typedef struct h2_conn {
     /* Our SETTINGS (what we sent to the peer) */
     uint32_t          max_concurrent_streams;
 
+    /* This endpoint's own SETTINGS_MAX_FRAME_SIZE, as advertised to the
+     * peer -- RFC 7540 4.2 requires incoming DATA (and other frame)
+     * payload sizes be checked against the RECEIVER's own advertised
+     * limit, not the peer's. peer_max_frame_size (below) is the peer's
+     * advertised limit, which governs what WE may send them, not what
+     * they may send us -- these were previously conflated, with
+     * handle_data() checking incoming DATA length against
+     * peer_max_frame_size instead of this field (h2spec 4.2#1 confirmed:
+     * a compliant 2^14-and-up-sized DATA frame within our OWN advertised
+     * limit was incorrectly rejected as FRAME_SIZE_ERROR whenever the
+     * peer's own advertised limit happened to be smaller/default). */
+    uint32_t          our_max_frame_size;
     /* Peer SETTINGS (updated on each SETTINGS frame from client)         */
     uint32_t          peer_header_table_size;
     uint32_t          peer_max_concurrent_streams;

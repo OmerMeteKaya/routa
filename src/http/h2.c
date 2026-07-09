@@ -435,6 +435,7 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
         cfg->max_frame_size,
         cfg->max_header_list_size,
     };
+    hc->our_max_frame_size = cfg->max_frame_size;
     if (write_settings(&hc->write_buf, ids, vals, 5) < 0) goto fail;
     hc->settings_ack_pending = 1;
 
@@ -1600,7 +1601,9 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
     if ((stream_id & 1) == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
-    if (length > hc->peer_max_frame_size)
+    /* See our_max_frame_size's doc comment in h2.h -- incoming frame size
+     * is checked against our own advertised limit, not the peer's. */
+    if (length > hc->our_max_frame_size)
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
 
     /* ── Strip padding and priority BEFORE creating the stream ────────── */
@@ -1719,8 +1722,10 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
     if (stream_id != hc->continuation_stream_id)
         return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
-    /* FIX: max_frame_size enforcement on CONTINUATION                   */
-    if (length > hc->peer_max_frame_size)
+    /* max_frame_size enforcement on CONTINUATION -- checked against our
+     * own advertised limit, not the peer's (see our_max_frame_size's doc
+     * comment in h2.h). */
+    if (length > hc->our_max_frame_size)
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
 
     h2_stream_t *s = stream_find(hc, stream_id);
@@ -1785,8 +1790,12 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
                         struct middleware_chain *chain) {
     if (stream_id == 0) return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
 
-    /* FIX: max_frame_size enforcement on DATA                           */
-    if (length > hc->peer_max_frame_size)
+    /* RFC 7540 4.2: incoming DATA length is checked against OUR OWN
+     * advertised SETTINGS_MAX_FRAME_SIZE (our_max_frame_size), not the
+     * peer's (peer_max_frame_size governs what WE may send THEM). See
+     * our_max_frame_size's doc comment in h2.h for the full story --
+     * this was previously checked against the wrong field. */
+    if (length > hc->our_max_frame_size)
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
 
     if (is_idle_stream(hc, stream_id))
@@ -2006,7 +2015,16 @@ while (rb->len - offset >= H2_FRAME_HDR_SZ) {
 
     if (rb->len - offset < H2_FRAME_HDR_SZ + pay_len) break;
 
-    if (pay_len > hc->peer_max_frame_size &&
+    /* RFC 7540 4.2: any incoming frame's payload length is checked
+     * against OUR OWN advertised SETTINGS_MAX_FRAME_SIZE (our_max_frame_size),
+     * not the peer's (peer_max_frame_size governs what WE may send THEM,
+     * not what they may send us) -- see our_max_frame_size's doc comment
+     * in h2.h. This was the actual root cause of h2spec 4.2#1: a
+     * perfectly valid DATA frame within our own advertised limit was
+     * rejected here, in the general frame-size gate, before handle_data()
+     * (which had its own, now-also-fixed, separate copy of the same
+     * wrong-field bug) ever got a chance to look at it. */
+    if (pay_len > hc->our_max_frame_size &&
         type != H2_FRAME_SETTINGS) {
         buf_consume(rb, offset);
         return conn_error(hc, H2_ERR_FRAME_SIZE_ERROR);
