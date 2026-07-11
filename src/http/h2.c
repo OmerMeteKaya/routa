@@ -1158,6 +1158,21 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
         }
     }
 
+    /* Trailers (RFC 7540 8.1), if any were sent -- see handle_headers()'s
+     * is_trailers handling, which stores them on the stream (s->trailer_*)
+     * because they arrive in a separate HEADERS frame from the one this
+     * function is otherwise built from, at a point after this request's
+     * body is already fully assembled. STEAL the pointers (same pattern
+     * as the main headers loop above) rather than copying, since s is
+     * about to be torn down by the caller. */
+    for (int i = 0; i < s->trailer_count && i < 16; i++) {
+        req->trailers[i].key   = s->trailer_headers[i].name;
+        req->trailers[i].value = s->trailer_headers[i].value;
+        s->trailer_headers[i].name  = NULL;
+        s->trailer_headers[i].value = NULL;
+    }
+    req->trailer_count = s->trailer_count;
+
     return 0;
 }
 /* ── Write HTTP response as H2 HEADERS + DATA frames ────────────────────── */
@@ -1686,6 +1701,32 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
 
     /* ── Now create stream — all frame-level validation passed ─────────── */
     h2_stream_t *s = stream_find(hc, stream_id);
+    /* RFC 7540 8.1: a second HEADERS frame on a stream that's already had
+     * its request headers processed (state is HALF_CLOSED_REMOTE, i.e.
+     * we're waiting for END_STREAM after DATA frames) is TRAILERS, not a
+     * new/duplicate request. Trailers MUST carry END_STREAM (a client
+     * sending them without ending the stream makes no sense -- RFC 7540
+     * 8.1, confirmed via h2spec 8.1#1) and MUST NOT contain pseudo-
+     * headers (only regular header fields are valid in a trailer
+     * block). Previously this whole case was silently treated as if it
+     * were a brand-new HEADERS block for the request (overwriting
+     * s->headers), which is why h2spec 8.1#1 failed: a malformed
+     * trailers-without-END_STREAM sequence was accepted and dispatched
+     * as if nothing were wrong, instead of PROTOCOL_ERROR. */
+    /* Broadened from "state == HALF_CLOSED_REMOTE" -- h2spec 8.1#1's
+     * actual scenario sends HEADERS (no END_STREAM) -> DATA (no
+     * END_STREAM either) -> a second HEADERS (no END_STREAM), i.e. the
+     * stream is still OPEN, not yet HALF_CLOSED_REMOTE, when the second
+     * HEADERS arrives. Any second HEADERS frame on a stream that
+     * already has its initial request headers (s->headers != NULL) is
+     * either legitimate trailers (which MUST carry END_STREAM) or a
+     * protocol violation -- there is no valid reason for a THIRD set of
+     * non-trailer headers on one stream. */
+    int is_trailers = (s && s->headers != NULL);
+    if (is_trailers && !(flags & H2_FLAG_END_STREAM)) {
+        write_rst_stream(&hc->write_buf, stream_id, H2_ERR_PROTOCOL_ERROR);
+        return 0;
+    }
     if (!s) {
         if (stream_id <= hc->last_stream_id)
             return conn_error(hc, H2_ERR_PROTOCOL_ERROR);
@@ -1718,6 +1759,53 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
                          s->header_block.len,
                          headers, 64);
     buf_reset(&s->header_block);
+    if (is_trailers) {
+        /* RFC 7540 8.1.2.1: trailers MUST NOT contain pseudo-headers --
+         * check before storing/dispatching anything. */
+        int rejected = 0;
+        for (int i = 0; i < n; i++) {
+            if (headers[i].name && headers[i].name[0] == ':') {
+                rejected = 1;
+                break;
+            }
+        }
+        if (rejected) {
+            hpack_headers_free(headers, n);
+            write_rst_stream(&hc->write_buf, stream_id, H2_ERR_PROTOCOL_ERROR);
+            return 0;
+        }
+        int copy_n = n < 16 ? n : 16;
+        for (int i = 0; i < copy_n; i++) {
+            s->trailer_headers[i] = headers[i];
+        }
+        /* Free anything beyond the 16-trailer cap we didn't keep a
+         * reference to, to avoid leaking them -- mirrors the >64 header
+         * truncation pattern used for regular headers elsewhere. */
+        for (int i = copy_n; i < n; i++) {
+            free(headers[i].name);
+            free(headers[i].value);
+        }
+        s->trailer_count = copy_n;
+        /* Trailers always carry END_STREAM (checked above), so THIS is
+         * the point where the request is actually complete -- dispatch
+         * now, same pattern as the END_STREAM-on-HEADERS and
+         * END_STREAM-on-DATA paths elsewhere in this file. Previously
+         * this just tore the stream down (stream_remove()) without ever
+         * dispatching, which is why h2spec's "POST request with
+         * trailers" test got no response at all -- the request was
+         * silently discarded once trailers arrived instead of being
+         * completed and answered. */
+        s->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        int drc = dispatch_stream(hc, s, stream_id, router, chain);
+        if (hc->write_buf.len > 0) {
+            ssize_t wr = io_write_from_buf(hc->conn->fd,
+                                            &hc->write_buf,
+                                            hc->conn->tls);
+            (void)wr;
+        }
+        if (drc == H2_DISPATCH_PROXY) return 0;
+        return drc;
+    }
     s->expect_continuation = 0;
 
     if (n < 0) return conn_error(hc, H2_ERR_COMPRESSION_ERROR);

@@ -103,6 +103,16 @@ typedef struct h2_stream {
      * it), so only the remaining byte count needs to be kept here. */
     int               pending_body_fd;
     size_t            pending_body_fd_remaining;
+    /* HTTP/2 trailers (RFC 7540 8.1): a second HEADERS frame arriving
+     * after DATA frames, before END_STREAM. Held here (raw decoded
+     * headers, not yet copied into an http_request_t) between the point
+     * where the trailers HEADERS frame is parsed and the point where
+     * dispatch_stream() builds the actual request and can copy them in --
+     * these two points are NOT the same call for a body-then-trailers
+     * sequence, unlike the pseudo-headers/regular headers on the initial
+     * HEADERS frame. */
+    hpack_header_t    trailer_headers[16];
+    int               trailer_count;
     uint64_t start_us;
 } h2_stream_t;
 
