@@ -87,6 +87,12 @@ upstream_pool_t *lb_get_pool(lb_t *lb);
 void lb_get_upstream_timeouts(const lb_t *lb, int *read_timeout_ms, int *write_timeout_ms);
 int  lb_sticky_enabled(const lb_t *lb);
 const char *lb_sticky_cookie_name(const lb_t *lb);
+/* Retry policy accessors -- see lb.c's lb_retry_on_5xx_enabled() doc
+ * comment for why these were added (lb_retry_on_5xx / lb_max_retries
+ * were parsed from config but never actually consulted anywhere). */
+int  lb_retry_on_5xx_enabled(const lb_t *lb);
+int  lb_get_max_retries(const lb_t *lb);
+void lb_record_retry(lb_t *lb);
 /* Create / destroy */
 lb_t *lb_new(const lb_config_t *cfg);
 void  lb_free(lb_t *lb);

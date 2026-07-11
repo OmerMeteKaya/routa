@@ -57,34 +57,84 @@ ssize_t io_read_into_buf(int fd, buf_t *b, tls_conn_t *tls) {
         }
         return total;
     } else {
-        /* Plain fd — same approach                                         */
-        size_t avail = b->cap - b->off - b->len;
-        if (avail < 8192) {
-            /* Compact: move data to front of buffer, reset offset          */
-            if (b->off > 0) {
-                memmove(b->data, b->data + b->off, b->len);
-                b->off = 0;
-                avail  = b->cap - b->len;
-            }
+        /* ROOT CAUSE FIX: the plaintext path previously did exactly ONE
+         * read() call and returned, unlike the TLS branch above (which
+         * correctly loops until EAGAIN/SSL_pending()==0). Under
+         * edge-triggered epoll (EPOLLET, used throughout this codebase),
+         * a readable edge fires ONCE when data becomes available -- if
+         * more data remains in the kernel socket buffer than a single
+         * read() drains, epoll will NOT fire again for this fd until NEW
+         * data arrives, because from the kernel's perspective nothing
+         * "changed" (the fd was already readable and still is). Any
+         * message/payload larger than one read() worth (in practice,
+         * anything exceeding the buffer's available capacity per call,
+         * confirmed at ~16KB in testing) would have its remainder
+         * silently stuck in the kernel buffer forever, with the
+         * application-level protocol parser (e.g. ws_recv()'s payload
+         * accumulation) waiting for bytes that would never be delivered
+         * -- observed as a WebSocket binary/text message over 16KB never
+         * completing (on_message() never fired), despite the client
+         * successfully sending all the bytes and the connection
+         * remaining technically alive. This affects every plaintext
+         * (non-TLS) connection: HTTP/1.1 request bodies, WebSocket
+         * frames, h2c -- not just WS, though WS's per-message framing
+         * made the symptom easiest to reproduce and diagnose. */
+        /* saw_eof distinguishes "read a real 0-byte EOF from the peer"
+         * (connection genuinely closed) from "drained everything
+         * available and hit EAGAIN" (connection alive, just no more data
+         * right now) -- both end the loop, but callers rely on this
+         * function's return value to tell them apart: 0 means "closed,
+         * tear down the connection", -1 means "EAGAIN, nothing wrong,
+         * just wait for the next readable event". A prior version of
+         * this fix conflated the two by returning `total > 0 ? total : 0`
+         * on EAGAIN with zero bytes read this call, which callers (e.g.
+         * handle_ws_read's caller in event_loop.c) interpreted as EOF and
+         * incorrectly tore down perfectly healthy WebSocket connections
+         * the moment a read happened to return EAGAIN before any new
+         * data had arrived (very reproducible: any message spanning
+         * multiple TCP segments would trigger this on the follow-up
+         * read()). */
+        ssize_t total = 0;
+        int saw_eof = 0;
+        while (1) {
+            size_t avail = b->cap - b->off - b->len;
             if (avail < 8192) {
-                size_t new_cap = b->cap == 0 ? 16384 : b->cap * 2;
-                while (new_cap < b->len + 8192) new_cap *= 2;
-                uint8_t *nd = realloc(b->data, new_cap);
-                if (!nd) return -1;
-                b->data = nd;
-                b->cap  = new_cap;
+                /* Compact: move data to front of buffer, reset offset      */
+                if (b->off > 0) {
+                    memmove(b->data, b->data + b->off, b->len);
+                    b->off = 0;
+                    avail  = b->cap - b->len;
+                }
+                if (avail < 8192) {
+                    size_t new_cap = b->cap == 0 ? 16384 : b->cap * 2;
+                    while (new_cap < b->len + 8192) new_cap *= 2;
+                    uint8_t *nd = realloc(b->data, new_cap);
+                    if (!nd) return total > 0 ? total : -1;
+                    b->data = nd;
+                    b->cap  = new_cap;
+                    avail   = b->cap - b->len;  /* b->off == 0 here         */
+                }
             }
+            ssize_t n = read(fd,
+                             b->data + b->off + b->len,
+                             avail);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                return total > 0 ? total : -1;
+            }
+            if (n == 0) { saw_eof = 1; break; }
+            b->len += (size_t)n;
+            total  += n;
+            /* A short read (less than requested) on a non-blocking
+             * socket usually means the kernel buffer is drained for now
+             * -- but isn't a hard guarantee, so we still rely on EAGAIN
+             * above to actually stop. This mirrors the TLS branch's
+             * SSL_pending() check in spirit: keep pulling until the
+             * kernel says there's genuinely nothing left. */
         }
-        ssize_t n = read(fd,
-                         b->data + b->off + b->len,
-                         b->cap - b->off - b->len);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
-            return -1;
-        }
-        if (n == 0) return 0;
-        b->len += (size_t)n;
-        return n;
+        if (saw_eof) return total;         /* 0 if nothing was read before EOF, else the partial total -- either way, caller sees EOF via a subsequent 0-byte call if total>0 leaves data to process first */
+        if (total == 0) return -1;         /* EAGAIN with nothing read this call -- NOT EOF */
+        return total;
     }
 }
 

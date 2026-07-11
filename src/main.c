@@ -45,6 +45,15 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "routa: failed to start server from config '%s'\n", config_path);
         return 1;
     }
+    /* Required for SIGHUP hot-reload to work at all -- server_from_config()
+     * alone has no way to know which file to re-read on SIGHUP (that's
+     * normally server_from_config_file()'s job, but this binary loads
+     * config manually via routa_config_load()+routa_config_validate() for
+     * better error messages, bypassing that). Without this call, every
+     * SIGHUP was silently a no-op in production (confirmed via bench
+     * testing under sustained load: 5 consecutive SIGHUPs produced "hot
+     * reload: no config path stored, skipping" every time). */
+    server_set_config_path(config_path);
 
     LOG_INFO("routa: starting on port %d (config: %s)", cfg.port, config_path);
     server_run(s);

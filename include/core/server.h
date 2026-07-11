@@ -102,6 +102,15 @@ int  server_lb_add_upstream_tls(server_t *s,
 /* Create server from config struct / file */
 server_t *server_from_config(const routa_config_t *cfg);
 server_t *server_from_config_file(const char *path);
+/* Sets the config file path used for SIGHUP hot-reload -- required if you
+ * load config manually (routa_config_load() + server_from_config()),
+ * since server_from_config() alone has no way to know which file to
+ * re-read on SIGHUP. server_from_config_file() calls this internally;
+ * callers using the manual two-step path must call it themselves before
+ * server_run(), or SIGHUP hot-reload will be silently disabled (this was
+ * previously the case for src/main.c itself -- see server_set_config_path()
+ * in server.c for the full story). */
+void server_set_config_path(const char *path);
 int server_lb_route(server_t *s, const char *path, int methods);
 void server_lb_set_acl(server_t *s, void *acl);
 

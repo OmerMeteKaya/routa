@@ -269,8 +269,26 @@ void worker_conn_flush(worker_t *w, conn_t *conn)
     if (!conn) return;
     if (conn->h2 && conn->h2->write_buf.len > 0) {
         h2_conn_flush(conn->h2);
-        if (conn->h2->write_buf.len > 0)
+        if (conn->h2->write_buf.len > 0) {
             conn_poller_mod(w, conn, POLLER_READ | POLLER_WRITE | POLLER_ET);
+        } else {
+            /* Flush fully drained write_buf -- make sure the connection
+             * is still watched for POLLER_READ. Without this, a
+             * connection whose poller registration happened to be
+             * POLLER_WRITE-only at the moment this function was called
+             * (e.g. mid-flow-control-stall, waiting only to finish
+             * draining write_buf) would be left with NO active epoll
+             * interest at all once write_buf hit zero here -- the worker
+             * would never see another readable event for this fd again,
+             * silently orphaning the connection (confirmed via strace:
+             * the fd received zero read/write/epoll_ctl syscalls for the
+             * remainder of the connection's life after this exact call
+             * pattern, until the peer eventually gave up and closed).
+             * This was a strong suspect -- possibly the actual root cause
+             * -- for the intermittent H2-over-TLS large-file stalls
+             * investigated earlier this session. */
+            conn_poller_mod(w, conn, POLLER_READ | POLLER_ET);
+        }
         return;
     }
     if (conn->h2) return;

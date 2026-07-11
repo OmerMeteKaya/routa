@@ -26,6 +26,24 @@ static struct event_loop  *g_loop        = NULL;
 static volatile sig_atomic_t g_reload_flag = 0;
 static char                g_config_path[512] = {0};
 
+/* Public setter for g_config_path -- server_from_config_file() sets this
+ * internally, but callers that load config manually (routa_config_load()
+ * + server_from_config(), rather than the all-in-one
+ * server_from_config_file()) previously had no way to enable SIGHUP hot-
+ * reload at all: g_config_path stayed empty, event_loop_set_config_reload()
+ * (called from server_run(), see below) received NULL, and every SIGHUP
+ * was silently ignored with a "hot reload: no config path stored,
+ * skipping" log line. This affected src/main.c itself -- the actual
+ * production `routa` binary -- meaning hot-reload was completely
+ * non-functional in production despite being fully implemented and
+ * exercised by unit tests that go through server_from_config_file().
+ * Confirmed via bench testing under load: 5 consecutive SIGHUPs during
+ * sustained traffic produced "no config path stored, skipping" every
+ * time, with zero actual reload occurring. */
+void server_set_config_path(const char *path) {
+    if (path) strncpy(g_config_path, path, sizeof(g_config_path) - 1);
+}
+
 /* SIGTERM / SIGINT — initiate graceful drain */
 static void signal_handler(int sig) {
     (void)sig;

@@ -141,6 +141,17 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench/bench_server.c")
     target_include_directories(bench_server PRIVATE include)
 endif()
 
+# ── Fake site server (tests/fakesite/fakesite_server.c) ──────────────────
+# Not a ctest -- a hands-on "host a real site" demo combining a static
+# frontend, 3 proxy pools (fast/slow/flaky upstreams), a CPU-bound route,
+# and a WS notifications route in one routa instance, to sanity-check
+# everything fixed this session working together in a realistic setup.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/fakesite/fakesite_server.c")
+    add_executable(fakesite_server tests/fakesite/fakesite_server.c)
+    target_link_libraries(fakesite_server PRIVATE routa_core)
+    target_include_directories(fakesite_server PRIVATE include)
+endif()
+
 include(cmake/Sanitizers.cmake)
 
 if(TARGET test_h2)
@@ -158,7 +169,7 @@ add_test(NAME test_h2_hpack    COMMAND test_h2_hpack)
 add_test(NAME test_h2    COMMAND test_h2)
 add_test(NAME test_auth    COMMAND test_auth)
 add_test(NAME test_metrics   COMMAND test_metrics)
-add_test(NAME test_proxy_lb   COMMAND test_proxy_lb)
+add_test(NAME test_proxy_lb   COMMAND test_proxy_lb WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME test_config   COMMAND test_config WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME test_wrr_distribution COMMAND test_wrr_distribution)
 add_test(NAME test_real_world COMMAND test_real_world WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

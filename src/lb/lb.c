@@ -122,6 +122,24 @@ upstream_pool_t *lb_get_pool(lb_t *lb) {
 int lb_sticky_enabled(const lb_t *lb) {
     return lb ? lb->cfg.sticky_session_enabled : 0;
 }
+/* Retry policy accessors -- lb_config_t's max_retries/retry_on_5xx were
+ * parsed from config and stored on lb_t (see cfg field above), but
+ * (until this fix) nothing in proxy.c ever read them: the only retry
+ * path implemented was "upstream connect() refused," never "upstream
+ * responded but with a 5xx status." A pool configured with
+ * lb_retry_on_5xx = true had zero effect on its actual behavior --
+ * confirmed via bench testing against a deliberately flaky (10% error
+ * rate) upstream: the end-to-end client-visible error rate matched the
+ * raw upstream error rate exactly, regardless of this setting. */
+int lb_retry_on_5xx_enabled(const lb_t *lb) {
+    return lb ? lb->cfg.retry_on_5xx : 0;
+}
+int lb_get_max_retries(const lb_t *lb) {
+    return lb ? lb->cfg.max_retries : 0;
+}
+void lb_record_retry(lb_t *lb) {
+    if (lb) __sync_fetch_and_add(&lb->stat_retries, 1);
+}
 
 const char *lb_sticky_cookie_name(const lb_t *lb) {
     return (lb && lb->cfg.sticky_cookie_name[0]) ? lb->cfg.sticky_cookie_name : "routa_sticky";

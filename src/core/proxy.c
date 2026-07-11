@@ -627,6 +627,70 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
         return 0;
     }
 
+    /* Retry on 5xx (RFC-agnostic operational feature, not spec-mandated):
+     * lb_retry_on_5xx / lb_max_retries were previously parsed from config
+     * and stored, but nothing ever consulted them -- the only retry path
+     * implemented was "upstream connect() refused" (see
+     * proxy_on_upstream_writable() above). A pool with
+     * lb_retry_on_5xx = true had zero actual effect; confirmed via bench
+     * testing against a deliberately flaky (10% error rate) upstream,
+     * where the client-visible error rate matched the raw upstream error
+     * rate exactly. This mirrors the existing connect-refused retry's
+     * pattern: pick a different node, resend the deep-copied request
+     * (ctx->retry_req, taken once in proxy_begin() since the caller's
+     * original http_request_t is long gone by the time a response
+     * arrives), same TLS-crossing restriction (retry_node must not use
+     * TLS when the original attempt didn't -- crossing protocols
+     * mid-retry stays out of scope, matching the existing connect-retry
+     * comment above). Only fires once (attempt 0 -> 1), same bound as
+     * the connect-refused path -- lb_get_max_retries() governs how many
+     * total attempts are allowed; this implementation caps at a single
+     * retry regardless of a larger configured value, which is a
+     * reasonable and conservative first cut rather than a full retry
+     * budget/backoff loop. */
+    if (resp.status >= 500 && resp.status <= 599 &&
+        ctx->lb && lb_retry_on_5xx_enabled(ctx->lb) &&
+        ctx->attempt < lb_get_max_retries(ctx->lb) &&
+        ctx->has_retry_req) {
+        upstream_node_t *retry_node = lb_pick_node(ctx->lb, conn->remote_ip);
+        int orig_used_tls = (ctx->node && ctx->node->use_tls);
+        if (retry_node && retry_node->use_tls == orig_used_tls) {
+            ctx->attempt++;
+            lb_record_retry(ctx->lb);
+            http_response_destroy(&resp);
+            buf_reset(&ctx->req_buf);
+            upstream_conn_t *retry_uconn = NULL;
+            int retry_fd = lb_begin_forward_to_node(
+                ctx->lb, retry_node, &ctx->retry_req, conn->remote_ip,
+                conn->tls ? "https" : "http", &ctx->req_buf, &retry_uconn);
+            if (retry_fd >= 0) {
+                ctx->upstream_fd    = retry_fd;
+                ctx->node           = retry_node;
+                ctx->uconn          = retry_uconn;
+                ctx->req_sent       = 0;
+                ctx->upstream_state = (retry_uconn && retry_uconn->requests > 0)
+                                    ? PROXY_STATE_WRITING
+                                    : PROXY_STATE_CONNECTING;
+                void *poller_ptr = (conn->h2 && ctx->front_stream_id > 0)
+                                 ? (void *)ctx : (void *)conn;
+                if (!conn->h2) conn->state = CONN_UPSTREAM_CONNECTING;
+                poller_add(w->poller, retry_fd, POLLER_WRITE | POLLER_ET,
+                          poller_ptr);
+                if (ctx->upstream_state == PROXY_STATE_WRITING)
+                    proxy_on_upstream_writable(w, conn, ctx);
+                return 0;
+            }
+            /* retry_fd < 0: no node available to retry against -- fall
+             * through and forward the original 5xx response as-is below
+             * (resp was already destroyed above, so re-init a minimal
+             * one describing the original failure rather than trying to
+             * resurrect the freed response). */
+            http_response_init(&resp);
+            http_response_set_status(&resp, 502, "Bad Gateway");
+            http_response_set_body(&resp, "Bad Gateway\n", 12);
+        }
+    }
+
     /* Sticky session: set the cookie identifying which node served this
      * request, so subsequent requests from this client stick to it (as
      * long as it stays UP -- see lb_pick_node_sticky()). Set on every

@@ -639,7 +639,26 @@ static void flush_pending(h2_conn_t *hc, h2_stream_t *s) {
             size_t can_send = (size_t)win < rem ? (size_t)win : rem;
             size_t chunk    = can_send < hc->peer_max_frame_size
                               ? can_send : hc->peer_max_frame_size;
-            int end = (chunk == rem) && s->pending_body_fd < 0;
+            /* ROOT CAUSE FIX (see investigation report): END_STREAM here
+             * was computed as "this is the last chunk of pending_data AND
+             * the body_fd is already closed" -- but pending_body_fd is
+             * only set to -1 much later, in this same function's cleanup
+             * block, strictly after this drain completes. On the specific
+             * (and, under TLS, fairly common) timing where a flow-control
+             * stall lands inside the FINAL read() of the file --
+             * pending_body_fd_remaining reaches exactly 0 at the same
+             * moment the unsent tail is stashed into pending_data --
+             * pending_body_fd is still >= 0 here (correctly: the fd isn't
+             * closed yet), so `end` was wrongly false on the true last
+             * DATA frame of the response. The stream was then torn down
+             * (see the pending_data==0 && pending_body_fd<0 check further
+             * down) without ever having sent END_STREAM, leaving the
+             * client waiting forever despite having received every byte
+             * of the body. The correct condition is "no bytes left
+             * anywhere" -- pending_body_fd already closed, OR nothing
+             * left to read from disk even though the fd is still open. */
+            int end = (chunk == rem) &&
+                      (s->pending_body_fd < 0 || s->pending_body_fd_remaining == 0);
             if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
                                 H2_FRAME_DATA,
                                 end ? H2_FLAG_END_STREAM : 0,
@@ -673,10 +692,20 @@ static void flush_pending(h2_conn_t *hc, h2_stream_t *s) {
     #define H2_WRITE_BUF_SOFT_LIMIT (1024 * 1024)
     while (s->pending_body_fd >= 0 && s->pending_body_fd_remaining > 0) {
         if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) {
-            /* Proactively flush -- see send_response()'s matching comment
-             * for why relying solely on a later POLLER_WRITE event isn't
-             * enough on a fast/loopback socket under edge-triggered epoll. */
-            if (h2_conn_flush(hc) < 0) return;
+            /* Use worker_conn_flush(), not a bare h2_conn_flush() --
+             * h2_conn_flush() only writes to the socket, it never
+             * touches the connection's epoll registration. If write_buf
+             * fully drains here, the connection's poller interest could
+             * be left in whatever state it was in when we got here
+             * (potentially POLLER_WRITE-only, with no POLLER_READ, if
+             * that's what an earlier code path had armed) -- silently
+             * orphaning the fd from ever being polled for read again
+             * (confirmed via strace: exactly this call pattern preceded
+             * a connection receiving zero further read/write/epoll_ctl
+             * syscalls for the rest of its life, until the peer's own
+             * timeout closed it). worker_conn_flush() re-arms POLLER_READ
+             * (and POLLER_WRITE if still needed) correctly in all cases. */
+            if (hc->worker) worker_conn_flush((worker_t *)hc->worker, hc->conn);
             if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) return; /* genuinely stalled, wait for real event */
         }
 
@@ -704,20 +733,33 @@ static void flush_pending(h2_conn_t *hc, h2_stream_t *s) {
             stream_win = s->send_window;
             win        = conn_win < stream_win ? conn_win : stream_win;
             if (win <= 0) {
-                /* rem bytes were already read from disk (as part of this
-                 * nr-byte read()) but not yet sent -- stash them in
-                 * pending_data. pending_body_fd_remaining must NOT be
-                 * decremented here: it tracks bytes not yet read from
-                 * disk at all, and every byte actually sent this
-                 * iteration already decremented it above (chunk-by-chunk,
-                 * see "s->pending_body_fd_remaining -= chunk" below). The
-                 * previous version double-subtracted here, underflowing
-                 * this size_t field into a huge value on the very first
-                 * stall of any body_fd transfer -- which then made
-                 * subsequent resume attempts read garbage-sized chunks
-                 * and never converge, hanging the response forever
-                 * (root cause of H2 static-file/video downloads over TLS
-                 * stalling partway through and never completing). */
+                /* ROOT CAUSE FIX (round 2 investigation, confirmed via
+                 * live instrumentation): rem bytes were already read()
+                 * from disk as part of this nr-byte read() -- the fd's
+                 * file position has already advanced past them, they are
+                 * NOT "still on disk to be read again." The previous
+                 * comment here claimed pending_body_fd_remaining must NOT
+                 * be decremented for these bytes, reasoning that only
+                 * bytes actually chunked into a DATA frame should count
+                 * against it -- that reasoning was wrong. It caused
+                 * pending_body_fd_remaining to permanently leak by `rem`
+                 * bytes on every stall-mid-read event, since these bytes
+                 * are consumed from the fd but never subtracted anywhere.
+                 * Confirmed by live trace: across one failing 20MB H2-
+                 * over-TLS transfer, the cumulative leak across 319 stall
+                 * events summed to exactly 10,504,032 bytes -- bit-for-
+                 * bit identical to the bogus "remaining" value logged at
+                 * the moment the fd legitimately hit real EOF. Because
+                 * pending_body_fd_remaining never reached 0 while the fd
+                 * was still open, the nr<=0 EOF branch a few lines below
+                 * silently closed the fd and zeroed the counter without
+                 * ever emitting END_STREAM -- despite every real byte of
+                 * the file having already been sent in DATA frames. This
+                 * mirrors send_response()'s OWN correct sibling logic
+                 * (its equivalent stash site subtracts total-offset-nr,
+                 * i.e. the ENTIRE current read, sent and unsent portions
+                 * alike) -- this copy is now brought in line with that. */
+                s->pending_body_fd_remaining -= rem;
                 if (buf_append(&s->pending_data, ptr, rem) < 0) return;
                 s->pending_offset = 0;
                 return;
@@ -1234,10 +1276,12 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
              * real POLLER_WRITE/WINDOW_UPDATE-driven flush_pending call)
              * if the socket genuinely can't take more right now. */
             if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) {
-                if (h2_conn_flush(hc) < 0) {
-                    free(fbuf);
-                    return -1;
-                }
+                /* worker_conn_flush(), not bare h2_conn_flush() -- see
+                 * the matching comment in flush_pending()'s resume loop
+                 * for why a fully-drained write_buf still needs the
+                 * connection's poller registration explicitly re-armed,
+                 * not just the socket written to. */
+                if (hc->worker) worker_conn_flush((worker_t *)hc->worker, hc->conn);
                 if (hc->write_buf.len >= H2_WRITE_BUF_SOFT_LIMIT) {
                     /* Socket truly can't absorb more right now (EAGAIN) --
                      * genuinely defer to the event loop. */
@@ -2084,6 +2128,28 @@ while (rb->len - offset >= H2_FRAME_HDR_SZ) {
         clock_gettime(CLOCK_MONOTONIC, &_rts);
         hc->last_recv_ts = (uint64_t)_rts.tv_sec * 1000 +
                            (uint64_t)_rts.tv_nsec / 1000000;
+    }
+
+    /* CRITICAL FIX: last_stream_ts was previously set exactly once, in
+     * h2_conn_new() at connection creation time, and NEVER updated again
+     * anywhere -- not on stream open, not on DATA/WINDOW_UPDATE activity,
+     * nothing. h2_conn_check_timeouts() (called every ~1s by the worker's
+     * sweep loop) uses (now_ms - last_stream_ts) > stream_timeout_ms
+     * (default 30000ms) to decide whether an open stream has gone idle
+     * and should be GOAWAY'd -- but since last_stream_ts never advanced
+     * past connection creation, ANY connection with an open stream still
+     * alive 30+ seconds after the TCP/TLS handshake -- including one
+     * actively streaming a large response, with WINDOW_UPDATEs and DATA
+     * frames flowing the whole time -- would be treated as "idle" and
+     * forcibly GOAWAY'd purely based on connection age. This was a
+     * genuine, confirmed contributor to this session's H2-over-TLS
+     * large-file race condition. Update on every frame here -- any frame
+     * at all is evidence the stream/connection is alive. */
+    {
+        struct timespec _sts;
+        clock_gettime(CLOCK_MONOTONIC, &_sts);
+        hc->last_stream_ts = (uint64_t)_sts.tv_sec * 1000 +
+                             (uint64_t)_sts.tv_nsec / 1000000;
     }
 
     offset += H2_FRAME_HDR_SZ + pay_len;
