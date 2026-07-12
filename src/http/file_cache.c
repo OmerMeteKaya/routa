@@ -3,6 +3,7 @@
 #endif
 #include "http/file_cache.h"
 #include "util/logger.h"
+#include "util/metrics.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -126,15 +127,17 @@ static int entry_valid(tl_slot_t *slot, time_t now) {
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 int file_cache_get(const char *path, file_cache_entry_t *out) {
-    if (!g_enabled || !path || !out) return 0;
+    if (!g_enabled || !path || !out) return 0;   /* not a real lookup attempt -- not counted as a miss */
     tl_init();
     uint32_t hash = fnv1a(path);
     time_t   now  = time(NULL);
     int idx = find_slot(path, hash);
     if (idx >= 0 && entry_valid(&tl_slots[idx], now)) {
         *out = tl_slots[idx].entry;
+        ROUTA_METRIC_INC(file_cache_hits_total);
         return 1;
     }
+    ROUTA_METRIC_INC(file_cache_misses_total);
     return 0;
 }
 

@@ -4,6 +4,7 @@
 #include "http/mw_auth.h"
 #include "http/cookie.h"
 #include "util/logger.h"
+#include "util/metrics.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -72,6 +73,7 @@ static uint8_t *b64_decode(const char *src, size_t *out_len) {
 }
 
 static void send_401_basic(http_response_t *resp, const char *realm) {
+    ROUTA_METRIC_INC(auth_basic_failures_total);
     char www_auth[512];
     (void)snprintf(www_auth, sizeof(www_auth),
              "Basic realm=\"%s\", charset=\"UTF-8\"", realm);
@@ -406,6 +408,7 @@ jwt_claims_t *jwt_verify(const jwt_config_t *cfg, const char *token) {
 /* ── mw_jwt_auth ─────────────────────────────────────────────────────────── */
 
 static void send_401_bearer(http_response_t *resp, const char *msg) {
+    ROUTA_METRIC_INC(auth_jwt_failures_total);
     http_response_set_status(resp, 401, "Unauthorized");
     http_response_set_header(resp, "www-authenticate", "Bearer");
     http_response_set_body(resp, msg ? msg : "Unauthorized\n",

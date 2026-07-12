@@ -4,6 +4,7 @@
 #include "http/mw_ratelimit.h"
 #include "http/response.h"
 #include "util/logger.h"
+#include "util/metrics.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -104,6 +105,7 @@ void mw_rate_limit(middleware_chain_t *chain, const http_request_t *req,
                 return;
             } else {
                 pthread_mutex_unlock(&g_limiter.mutexes[bucket_idx]);
+                ROUTA_METRIC_INC(rate_limit_rejected_total);
                 http_response_set_status(resp, 429, "Too Many Requests");
                 http_response_set_header(resp, "Content-Type", "text/plain");
                 http_response_set_body(resp, "Too Many Requests\n", 19);

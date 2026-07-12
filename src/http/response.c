@@ -4,6 +4,7 @@
 #include "http/response.h"
 #include "util/logger.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
@@ -36,6 +37,23 @@ void http_response_set_status(http_response_t *r, int status, const char *reason
 
 void http_response_set_header(http_response_t *r, const char *key, const char *val) {
     if (!r || !key || !val) return;
+
+    /* If this key already exists (case-insensitive), overwrite its value
+     * in place instead of appending a duplicate. Without this, calling
+     * set_header() twice for the same key (e.g. mw_compress rewriting
+     * Content-Length after http_response_set_body() already set it)
+     * produced two separate header lines in the serialized response --
+     * an RFC 7230 violation with undefined behavior in real clients. */
+    for (int i = 0; i < r->header_count; i++) {
+        if (r->headers[i][0] && strcasecmp(r->headers[i][0], key) == 0) {
+            char *new_val = strdup(val);
+            if (!new_val) return;
+            free((char *)r->headers[i][1]);
+            r->headers[i][1] = new_val;
+            return;
+        }
+    }
+
     if (r->header_count >= 32) return;
     int i = r->header_count;
     free((char *)r->headers[i][0]);  /* release previous key */

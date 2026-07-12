@@ -19,6 +19,14 @@ struct event_loop;
 typedef struct {
     lb_t *lb;
     void *route_ctx;   /* lb_handler_ctx_t, freed in server_free */
+    /* Pool name as given in the config's [pool NAME] section (or empty
+     * string for the legacy single-implicit-pool style with no [pool]
+     * header at all). Purely for observability -- lb_t/upstream_pool_t
+     * themselves have no concept of a name, so without this, per-pool
+     * Prometheus metrics would have no way to label which pool is which
+     * beyond a bare numeric index. Set once in server_from_config(),
+     * never changes afterward. */
+    char  name[128];
 } lb_pool_entry_t;
 
 /* ctx passed to the internal route handler that marks a path as "proxy to

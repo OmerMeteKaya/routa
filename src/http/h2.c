@@ -1186,6 +1186,7 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
     if (s->body.len > 0) {
         req->body     = (char *)buf_data(&s->body);
         req->body_len = s->body.len;
+        routa_metrics_record_bytes_received(req->body_len);
         /* Steal body buffer */
         s->body.data = NULL;
         s->body.len  = 0;

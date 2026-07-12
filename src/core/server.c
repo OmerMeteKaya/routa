@@ -322,8 +322,13 @@ void server_run(server_t *s) {
     routa_metrics_init();
     if (s->metrics_enabled) {
         const char *mpath = s->metrics_path[0] ? s->metrics_path : "/metrics";
+        /* ctx = s (not NULL): routa_metrics_handler() forwards this to
+         * routa_metrics_prometheus_lb() so per-pool/upstream metrics can
+         * be rendered too, not just the global counters. See
+         * mw_metrics.c's routa_metrics_handler() and metrics.h's
+         * routa_metrics_prometheus_lb() doc comments. */
         event_loop_add_route((event_loop_t *)s->loop, mpath,
-                             1 << HTTP_GET, routa_metrics_handler, NULL);
+                             1 << HTTP_GET, routa_metrics_handler, s);
     }
     
     event_loop_run((event_loop_t *)s->loop);
@@ -513,6 +518,13 @@ server_t *server_from_config(const routa_config_t *cfg) {
                       pcfg->name[0] ? pcfg->name : "(default)");
             continue;
         }
+        /* Record the pool's config-file name for observability -- see
+         * lb_pool_entry_t.name's doc comment in server.h. server_enable_lb()
+         * always appends to the end of s->lb_pools[], so the just-added
+         * entry is at lb_pool_count-1 right after a successful call. */
+        strncpy(s->lb_pools[s->lb_pool_count - 1].name, pcfg->name,
+                sizeof(s->lb_pools[s->lb_pool_count - 1].name) - 1);
+
         for (int i = 0; i < pcfg->upstream_count; i++) {
             if (pcfg->upstreams[i].use_tls) {
                 server_lb_add_upstream_tls(s,

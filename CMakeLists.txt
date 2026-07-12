@@ -102,7 +102,7 @@ foreach(example hello_world)
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_request test_middleware test_chunked test_file_cache test_ws test_config test_h2_hpack test_h2 test_auth test_metrics test_proxy_lb test_wrr_distribution test_real_world)
+foreach(test test_buf test_http1_request_parsing test_middleware_chain test_chunked test_file_cache test_ws test_config test_config_behavior test_h2_hpack test_h2 test_auth test_metrics test_metrics_behavior test_proxy_lb test_mw_acl test_mw_cors test_mw_compress test_mw_ratelimit)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
     add_executable(${test} tests/${test}.c)
     target_link_libraries(${test} PRIVATE routa_core)
@@ -159,17 +159,76 @@ if(TARGET test_h2)
 endif()
 
 enable_testing()
-add_test(NAME test_buf        COMMAND test_buf)
-add_test(NAME test_request    COMMAND test_request)
-add_test(NAME test_middleware COMMAND test_middleware)
-add_test(NAME test_chunked    COMMAND test_chunked)
-add_test(NAME test_file_cache    COMMAND test_file_cache)
-add_test(NAME test_ws    COMMAND test_ws)
-add_test(NAME test_h2_hpack    COMMAND test_h2_hpack)
-add_test(NAME test_h2    COMMAND test_h2)
-add_test(NAME test_auth    COMMAND test_auth)
-add_test(NAME test_metrics   COMMAND test_metrics)
-add_test(NAME test_proxy_lb   COMMAND test_proxy_lb WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-add_test(NAME test_config   COMMAND test_config WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-add_test(NAME test_wrr_distribution COMMAND test_wrr_distribution)
-add_test(NAME test_real_world COMMAND test_real_world WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# ── core ──
+add_test(NAME test_buf COMMAND test_buf)
+set_tests_properties(test_buf PROPERTIES LABELS "core")
+
+# ── http1 ──
+add_test(NAME test_http1_request_parsing COMMAND test_http1_request_parsing)
+set_tests_properties(test_http1_request_parsing PROPERTIES LABELS "http1")
+
+add_test(NAME test_chunked COMMAND test_chunked)
+set_tests_properties(test_chunked PROPERTIES LABELS "http1")
+
+# ── http2 ──
+add_test(NAME test_h2_hpack COMMAND test_h2_hpack)
+set_tests_properties(test_h2_hpack PROPERTIES LABELS "http2")
+
+add_test(NAME test_h2 COMMAND test_h2)
+set_tests_properties(test_h2 PROPERTIES LABELS "http2;tls")
+
+# ── websocket ──
+add_test(NAME test_ws COMMAND test_ws)
+set_tests_properties(test_ws PROPERTIES LABELS "websocket")
+
+# ── proxy_lb ──
+add_test(NAME test_proxy_lb COMMAND test_proxy_lb WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_proxy_lb PROPERTIES LABELS "proxy_lb;tls")
+
+# ── auth ──
+add_test(NAME test_auth COMMAND test_auth)
+set_tests_properties(test_auth PROPERTIES LABELS "auth;middleware")
+
+# ── middleware (chain mechanics + individual middlewares) ──
+add_test(NAME test_middleware_chain COMMAND test_middleware_chain)
+set_tests_properties(test_middleware_chain PROPERTIES LABELS "middleware")
+
+if(TARGET test_mw_acl)
+  add_test(NAME test_mw_acl COMMAND test_mw_acl)
+  set_tests_properties(test_mw_acl PROPERTIES LABELS "middleware")
+endif()
+if(TARGET test_mw_cors)
+  add_test(NAME test_mw_cors COMMAND test_mw_cors)
+  set_tests_properties(test_mw_cors PROPERTIES LABELS "middleware")
+endif()
+if(TARGET test_mw_compress)
+  add_test(NAME test_mw_compress COMMAND test_mw_compress)
+  set_tests_properties(test_mw_compress PROPERTIES LABELS "middleware")
+endif()
+if(TARGET test_mw_ratelimit)
+  add_test(NAME test_mw_ratelimit COMMAND test_mw_ratelimit)
+  set_tests_properties(test_mw_ratelimit PROPERTIES LABELS "middleware")
+endif()
+
+# ── metrics ──
+add_test(NAME test_metrics COMMAND test_metrics)
+set_tests_properties(test_metrics PROPERTIES LABELS "metrics")
+
+if(TARGET test_metrics_behavior)
+  add_test(NAME test_metrics_behavior COMMAND test_metrics_behavior WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(test_metrics_behavior PROPERTIES LABELS "metrics")
+endif()
+
+# ── config ──
+add_test(NAME test_config COMMAND test_config WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+set_tests_properties(test_config PROPERTIES LABELS "config")
+
+if(TARGET test_config_behavior)
+  add_test(NAME test_config_behavior COMMAND test_config_behavior WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(test_config_behavior PROPERTIES LABELS "config")
+endif()
+
+# ── compliance (file_cache correctness is part of serving-real-files
+# compliance, not a distinct category of its own) ──
+add_test(NAME test_file_cache COMMAND test_file_cache)
+set_tests_properties(test_file_cache PROPERTIES LABELS "compliance")

@@ -1,5 +1,6 @@
 #include "http/mw_acl.h"
 #include "http/response.h"
+#include "util/metrics.h"
 #include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
@@ -110,6 +111,7 @@ void mw_acl(middleware_chain_t *chain, const http_request_t *req,
            http_response_t *resp, next_fn_t next, void *ctx, int current) {
     const acl_config_t *cfg = (const acl_config_t *)ctx;
     if (!acl_check(cfg, req->remote_ip)) {
+        ROUTA_METRIC_INC(acl_denied_total);
         http_response_set_status(resp, 403, "Forbidden");
         http_response_set_header(resp, "Content-Type", "text/plain");
         http_response_set_body(resp, "Forbidden\n", 10);

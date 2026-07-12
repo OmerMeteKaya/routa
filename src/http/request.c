@@ -276,6 +276,7 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
         if (!req->body) { ret = -1; goto done; }
         memcpy(req->body, buf_data(buf) + body_start, content_length);
         req->body_len = content_length;
+        routa_metrics_record_bytes_received(content_length);
     }
     req->headers_owned = 1;
     *consumed = body_start + content_length;

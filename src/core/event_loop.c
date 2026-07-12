@@ -1694,6 +1694,8 @@ static void worker_apply_reload(worker_t *w) {
         return;
     }
 
+    ROUTA_METRIC_INC(config_reload_total);
+
     routa_config_t new_cfg;
     /* current has port/workers preserved by routa_config_reload() */
     routa_config_t current;
@@ -1703,6 +1705,7 @@ static void worker_apply_reload(worker_t *w) {
 
     if (routa_config_reload(w->loop->config_path, &current, &new_cfg) < 0) {
         LOG_ERROR("hot reload: config load/validate failed, ignoring SIGHUP");
+        ROUTA_METRIC_INC(config_reload_failures_total);
         return;
     }
 

@@ -2,6 +2,9 @@
 #define _GNU_SOURCE
 #endif
 #include "util/metrics.h"
+#include "core/server.h"
+#include "lb/lb.h"
+#include "lb/upstream.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -84,7 +87,8 @@ void routa_metrics_record(const char *method_str,
                           int         status,
                           uint64_t    start_us,
                           size_t      bytes_sent) {
-    (void)bytes_sent;   /* reserved for future bytes_sent histogram */
+    if (bytes_sent > 0)
+        ROUTA_METRIC_ADD(bytes_sent_total, (uint64_t)bytes_sent);
 
     /* Request counter */
     routa_method_idx_t  mi = method_to_idx(method_str);
@@ -127,6 +131,18 @@ void routa_metrics_conn_open(void) {
 
 void routa_metrics_conn_close(void) {
     ROUTA_METRIC_DEC(active_connections);
+}
+
+/* ── Request body bytes received ────────────────────────────────────────
+ * Separate from routa_metrics_record() because body bytes are known as
+ * they're read (potentially streamed), not only once at request
+ * completion -- callers (H1 body read loop, H2 DATA frame handling, proxy
+ * request-body relay) call this incrementally or once with the final
+ * total, whichever fits their code path; either way the counter is a
+ * simple running total either way. */
+void routa_metrics_record_bytes_received(size_t bytes) {
+    if (bytes > 0)
+        ROUTA_METRIC_ADD(bytes_received_total, (uint64_t)bytes);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -293,6 +309,195 @@ int routa_metrics_prometheus(char *buf, size_t buf_sz) {
         (unsigned long long)ROUTA_METRIC_GET(memory_soft_limit_exceeded_total),
         (unsigned long long)ROUTA_METRIC_GET(memory_hard_limit_exceeded_total)
     );
+
+    /* ── Traffic volume ── */
+    PROM_APPEND(
+        "# HELP routa_bytes_sent_total Total response body bytes sent\n"
+        "# TYPE routa_bytes_sent_total counter\n"
+        "routa_bytes_sent_total %llu\n"
+        "# HELP routa_bytes_received_total Total request body bytes received\n"
+        "# TYPE routa_bytes_received_total counter\n"
+        "routa_bytes_received_total %llu\n",
+        (unsigned long long)ROUTA_METRIC_GET(bytes_sent_total),
+        (unsigned long long)ROUTA_METRIC_GET(bytes_received_total)
+    );
+
+    /* ── Middleware rejection counters ── */
+    PROM_APPEND(
+        "# HELP routa_rate_limit_rejected_total Requests rejected by rate limiting (429)\n"
+        "# TYPE routa_rate_limit_rejected_total counter\n"
+        "routa_rate_limit_rejected_total %llu\n"
+        "# HELP routa_acl_denied_total Requests denied by ACL rules (403)\n"
+        "# TYPE routa_acl_denied_total counter\n"
+        "routa_acl_denied_total %llu\n"
+        "# HELP routa_auth_basic_failures_total Basic Auth failures (401)\n"
+        "# TYPE routa_auth_basic_failures_total counter\n"
+        "routa_auth_basic_failures_total %llu\n"
+        "# HELP routa_auth_jwt_failures_total JWT Auth failures (401)\n"
+        "# TYPE routa_auth_jwt_failures_total counter\n"
+        "routa_auth_jwt_failures_total %llu\n",
+        (unsigned long long)ROUTA_METRIC_GET(rate_limit_rejected_total),
+        (unsigned long long)ROUTA_METRIC_GET(acl_denied_total),
+        (unsigned long long)ROUTA_METRIC_GET(auth_basic_failures_total),
+        (unsigned long long)ROUTA_METRIC_GET(auth_jwt_failures_total)
+    );
+
+    /* ── File cache ── */
+    PROM_APPEND(
+        "# HELP routa_file_cache_hits_total File stat/content cache hits\n"
+        "# TYPE routa_file_cache_hits_total counter\n"
+        "routa_file_cache_hits_total %llu\n"
+        "# HELP routa_file_cache_misses_total File stat/content cache misses\n"
+        "# TYPE routa_file_cache_misses_total counter\n"
+        "routa_file_cache_misses_total %llu\n",
+        (unsigned long long)ROUTA_METRIC_GET(file_cache_hits_total),
+        (unsigned long long)ROUTA_METRIC_GET(file_cache_misses_total)
+    );
+
+    /* ── Config hot-reload ── */
+    PROM_APPEND(
+        "# HELP routa_config_reload_total Config hot-reloads triggered (SIGHUP)\n"
+        "# TYPE routa_config_reload_total counter\n"
+        "routa_config_reload_total %llu\n"
+        "# HELP routa_config_reload_failures_total Config hot-reloads that failed validation/load\n"
+        "# TYPE routa_config_reload_failures_total counter\n"
+        "routa_config_reload_failures_total %llu\n",
+        (unsigned long long)ROUTA_METRIC_GET(config_reload_total),
+        (unsigned long long)ROUTA_METRIC_GET(config_reload_failures_total)
+    );
+
+    return (int)(p - buf);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Per-pool / per-upstream Prometheus metrics
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
+static const char *node_state_name(node_state_t st) {
+    switch (st) {
+        case NODE_UP:        return "up";
+        case NODE_DOWN:      return "down";
+        case NODE_HALF_OPEN: return "half_open";
+        default:             return "unknown";
+    }
+}
+
+int routa_metrics_prometheus_lb(char *buf, size_t buf_sz, void *srv_ptr) {
+    if (!buf || buf_sz == 0) return -1;
+    server_t *s = (server_t *)srv_ptr;
+    if (!s) return 0;
+
+    size_t used = strlen(buf);
+    char  *p    = buf + used;
+    char  *end  = buf + buf_sz;
+
+    if (s->lb_pool_count <= 0) return 0;
+
+    PROM_APPEND(
+        "# HELP routa_upstream_requests_total Requests sent to this upstream node\n"
+        "# TYPE routa_upstream_requests_total counter\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_requests_total{pool=\"%s\",upstream=\"%s:%u\"} %u\n",
+                pool_name, node->host, (unsigned)node->port, node->total_requests
+            );
+        }
+    }
+
+    PROM_APPEND(
+        "# HELP routa_upstream_errors_total Failed requests to this upstream node\n"
+        "# TYPE routa_upstream_errors_total counter\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_errors_total{pool=\"%s\",upstream=\"%s:%u\"} %u\n",
+                pool_name, node->host, (unsigned)node->port, node->total_errors
+            );
+        }
+    }
+
+    PROM_APPEND(
+        "# HELP routa_upstream_up Whether this upstream node is currently considered healthy (1) or not (0)\n"
+        "# TYPE routa_upstream_up gauge\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            /* NODE_HALF_OPEN is a brief transient state for the one
+             * request currently on trial -- report it as "not yet up"
+             * (0) for the gauge, since it isn't confirmed healthy until
+             * that trial succeeds; the routa_upstream_state series below
+             * (state name as a label) is where half_open is visible. */
+            int up_val = (node->state == NODE_UP) ? 1 : 0;
+            PROM_APPEND(
+                "routa_upstream_up{pool=\"%s\",upstream=\"%s:%u\"} %d\n",
+                pool_name, node->host, (unsigned)node->port, up_val
+            );
+        }
+    }
+
+    PROM_APPEND(
+        "# HELP routa_upstream_state Current health-state of this upstream node, as a label (state=\"up\"|\"down\"|\"half_open\"); value is always 1, this is a label-only info series\n"
+        "# TYPE routa_upstream_state gauge\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_state{pool=\"%s\",upstream=\"%s:%u\",state=\"%s\"} 1\n",
+                pool_name, node->host, (unsigned)node->port, node_state_name(node->state)
+            );
+        }
+    }
+
+    PROM_APPEND(
+        "# HELP routa_upstream_inflight Requests currently in flight to this upstream node\n"
+        "# TYPE routa_upstream_inflight gauge\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_inflight{pool=\"%s\",upstream=\"%s:%u\"} %u\n",
+                pool_name, node->host, (unsigned)node->port, node->inflight
+            );
+        }
+    }
 
     return (int)(p - buf);
 }

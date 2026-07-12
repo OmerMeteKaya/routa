@@ -30,7 +30,12 @@ int routa_metrics_handler(const http_request_t *req,
                            http_response_t      *resp,
                            void                 *ctx) {
     (void)req;
-    (void)ctx;
+    /* ctx, if set, is the owning server_t* -- passed through so
+     * routa_metrics_prometheus_lb() can walk its configured LB pools for
+     * per-upstream metrics. NULL ctx (e.g. a server built directly via
+     * server_new() rather than server_from_config()) just means the LB
+     * section is skipped -- see routa_metrics_prometheus_lb()'s doc
+     * comment. */
 
     char *buf = malloc(METRICS_BUF_SZ);
     if (!buf) {
@@ -45,6 +50,16 @@ int routa_metrics_handler(const http_request_t *req,
         http_response_set_status(resp, 500, "Internal Server Error");
         http_response_set_body(resp, "metrics buffer overflow\n", 24);
         return 0;
+    }
+
+    int n2 = routa_metrics_prometheus_lb(buf, METRICS_BUF_SZ, ctx);
+    if (n2 < 0) {
+        /* LB section didn't fit -- not fatal, the base metrics rendered
+         * fine above; just serve what we have rather than erroring out
+         * the whole endpoint over an optional section. */
+        n = (int)strlen(buf);
+    } else {
+        n = n2;
     }
 
     http_response_set_status(resp, 200, "OK");

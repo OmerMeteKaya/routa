@@ -114,6 +114,36 @@ test-msan: msan
 test-all: test-asan test-ubsan test-tsan test-msan
 	@echo "All sanitizer test suites passed."
 
+# ── Category-scoped ctest targets ──────────────────────────────────────────
+# Run a LABEL-filtered subset of the ctest suite against the release build.
+# e.g. `make ctest-ws` runs only the websocket-labeled tests.
+# `make ctest-all` runs everything (equivalent to plain `make test` but
+# named consistently alongside the category targets below).
+ctest-all: release
+	cd build_release && ctest --output-on-failure
+ctest-core: release
+	cd build_release && ctest --output-on-failure -L core
+ctest-http1: release
+	cd build_release && ctest --output-on-failure -L http1
+ctest-http2: release
+	cd build_release && ctest --output-on-failure -L http2
+ctest-ws: release
+	cd build_release && ctest --output-on-failure -L websocket
+ctest-tls: release
+	cd build_release && ctest --output-on-failure -L tls
+ctest-lb: release
+	cd build_release && ctest --output-on-failure -L proxy_lb
+ctest-auth: release
+	cd build_release && ctest --output-on-failure -L auth
+ctest-middleware: release
+	cd build_release && ctest --output-on-failure -L middleware
+ctest-metrics: release
+	cd build_release && ctest --output-on-failure -L metrics
+ctest-config: release
+	cd build_release && ctest --output-on-failure -L config
+ctest-compliance: release
+	cd build_release && ctest --output-on-failure -L compliance
+
 # ── Cleanup ────────────────────────────────────────────────────────────────
 clean:
 	rm -rf build_release build_debug build_asan build_ubsan build_tsan build_msan build_numa
