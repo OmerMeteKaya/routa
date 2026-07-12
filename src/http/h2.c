@@ -421,22 +421,29 @@ h2_conn_t *h2_conn_new(struct conn *conn, const routa_h2_config_t *cfg) {
 
     buf_init(&hc->write_buf);
 
-    uint16_t ids[5] = {
+    /* RFC 8441 3: always advertise SETTINGS_ENABLE_CONNECT_PROTOCOL=1.
+     * Harmless for clients that never attempt WebSocket-over-H2 (they
+     * simply ignore an unrecognized-to-them capability), and required
+     * for any that do -- browsers will not attempt Extended CONNECT for
+     * WS without seeing this advertised first. */
+    uint16_t ids[6] = {
         H2_SETTINGS_HEADER_TABLE_SIZE,
         H2_SETTINGS_MAX_CONCURRENT_STREAMS,
         H2_SETTINGS_INITIAL_WINDOW_SIZE,
         H2_SETTINGS_MAX_FRAME_SIZE,
         H2_SETTINGS_MAX_HEADER_LIST_SIZE,
+        H2_SETTINGS_ENABLE_CONNECT_PROTOCOL,
     };
-    uint32_t vals[5] = {
+    uint32_t vals[6] = {
         cfg->header_table_size,
         cfg->max_concurrent_streams,
         cfg->initial_window_size,
         cfg->max_frame_size,
         cfg->max_header_list_size,
+        1,
     };
     hc->our_max_frame_size = cfg->max_frame_size;
-    if (write_settings(&hc->write_buf, ids, vals, 5) < 0) goto fail;
+    if (write_settings(&hc->write_buf, ids, vals, 6) < 0) goto fail;
     hc->settings_ack_pending = 1;
 
     /* Connection-level recv window advertisement (one-time)               */
@@ -1022,7 +1029,8 @@ static int handle_goaway(h2_conn_t *hc, const uint8_t *payload,
  * only validates). */
 static int validate_request_headers(h2_stream_t *s) {
     int seen_method = 0, seen_scheme = 0, seen_path = 0, seen_authority = 0;
-    int seen_regular_header = 0;
+    int seen_protocol = 0, seen_regular_header = 0;
+    int is_connect = 0;
     const char *path_value = NULL;
 
     for (int i = 0; i < s->header_count; i++) {
@@ -1046,6 +1054,7 @@ static int validate_request_headers(h2_stream_t *s) {
             if (strcmp(name, ":method") == 0) {
                 if (seen_method) return -1;
                 seen_method = 1;
+                if (value && strcmp(value, "CONNECT") == 0) is_connect = 1;
             } else if (strcmp(name, ":scheme") == 0) {
                 if (seen_scheme) return -1;
                 seen_scheme = 1;
@@ -1056,6 +1065,12 @@ static int validate_request_headers(h2_stream_t *s) {
             } else if (strcmp(name, ":authority") == 0) {
                 if (seen_authority) return -1;
                 seen_authority = 1;
+            } else if (strcmp(name, ":protocol") == 0) {
+                /* RFC 8441 4: the Extended CONNECT pseudo-header --
+                 * legality relative to :method is checked after this
+                 * loop, once the whole block (and is_connect) is known. */
+                if (seen_protocol) return -1;
+                seen_protocol = 1;
             } else {
                 /* Unknown pseudo-header, or a response-only one (:status)
                  * appearing on a request -- both forbidden. */
@@ -1082,9 +1097,29 @@ static int validate_request_headers(h2_stream_t *s) {
         }
     }
 
-    /* RFC 7540 8.1.2.3: :method, :scheme, :path are required (:authority
-     * is not, Host can substitute). :path additionally MUST NOT be empty. */
-    if (!seen_method || !seen_scheme || !seen_path) return -1;
+    /* RFC 7540 8.1.2.3: :method, :scheme, :path are required for ordinary
+     * requests (:authority is not, Host can substitute). :path
+     * additionally MUST NOT be empty.
+     *
+     * RFC 8441 4 changes this for Extended CONNECT (:method: CONNECT
+     * WITH a :protocol pseudo-header present): unlike plain CONNECT
+     * (RFC 7540 8.3, which forbids :scheme/:path entirely -- a raw TCP
+     * tunnel has no HTTP semantics), Extended CONNECT REQUIRES
+     * :scheme/:path, since the tunneled protocol (WebSocket here) is
+     * itself an HTTP-shaped exchange. :protocol without CONNECT, or
+     * plain CONNECT with :scheme/:path/:protocol present, are both
+     * protocol violations. */
+    if (is_connect && seen_protocol) {
+        /* Extended CONNECT: :scheme and :path become required. */
+        if (!seen_method || !seen_scheme || !seen_path) return -1;
+    } else if (is_connect) {
+        /* Plain CONNECT: :scheme/:path/:protocol must be ABSENT. */
+        if (seen_scheme || seen_path || seen_protocol) return -1;
+    } else {
+        /* Ordinary request: :protocol only ever makes sense on CONNECT. */
+        if (seen_protocol) return -1;
+        if (!seen_method || !seen_scheme || !seen_path) return -1;
+    }
     if (path_value && path_value[0] == '\0') return -1;
 
     return 0;
@@ -1111,6 +1146,21 @@ static int stream_to_request(h2_stream_t *s, http_request_t *req) {
             else if (strcmp(value, "HEAD")    == 0) req->method = HTTP_HEAD;
             else if (strcmp(value, "PATCH")   == 0) req->method = HTTP_PATCH;
             else if (strcmp(value, "OPTIONS") == 0) req->method = HTTP_OPTIONS;
+            /* RFC 8441: Extended CONNECT (:method: CONNECT with a
+             * :protocol pseudo-header, validated in
+             * validate_request_headers()) is how WebSocket-over-H2 is
+             * bootstrapped -- this needs to reach dispatch_stream() as
+             * HTTP_CONNECT so it can be routed to a WS handler instead
+             * of the normal HTTP route table. */
+            else if (strcmp(value, "CONNECT") == 0) req->method = HTTP_CONNECT;
+        } else if (strcmp(name, ":protocol") == 0) {
+            /* Stashed in req->query is a hack -- but :protocol's value
+             * ("websocket") needs to survive into dispatch_stream()
+             * somehow, and adding a whole new http_request_t field for a
+             * single H2-only pseudo-header felt like overkill for what
+             * is, in practice, always exactly one value. Revisit if a
+             * second Extended CONNECT protocol ever needs supporting. */
+            req->query = strdup(value);
         } else if (strcmp(name, ":path") == 0) {
             const char *q = strchr(value, '?');
             if (q) {
@@ -1247,8 +1297,21 @@ static int send_response(h2_conn_t *hc, uint32_t stream_id, h2_stream_t *s,
 
     int has_body = (resp->body && resp->body_len > 0) ||
                    (resp->body_fd >= 0 && resp->body_fd_len > 0);
+    /* RFC 8441: a WebSocket-over-H2 upgrade response (the 200 OK
+     * confirming an Extended CONNECT) has no body in the ordinary sense
+     * -- but MUST NOT set END_STREAM either, since the stream stays
+     * open for the WS connection's entire lifetime (DATA frames keep
+     * flowing bidirectionally as WS traffic afterward). The
+     * has_body-implies-END_STREAM logic below is correct for every
+     * OTHER response type, but was incorrectly closing the stream
+     * immediately after the 200 OK for WS upgrades -- confirmed live: a
+     * client saw ResponseReceived+StreamEnded on the 200 OK, so by the
+     * time the server's subsequent WS echo DATA frame arrived, the
+     * client's own H2 stack had already torn the stream down and
+     * reported it as StreamReset instead of DataReceived, discarding a
+     * perfectly valid echo. */
     uint8_t hflags = H2_FLAG_END_HEADERS |
-                     (has_body ? 0 : H2_FLAG_END_STREAM);
+                     ((has_body || s->is_websocket) ? 0 : H2_FLAG_END_STREAM);
 
     if (write_frame_hdr(&hc->write_buf, (uint32_t)hdr_len,
                         H2_FRAME_HEADERS, hflags, stream_id) < 0) {
@@ -1579,6 +1642,59 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
     req.start_us = dispatch_start;
     strncpy(req.remote_ip, hc->conn->remote_ip, sizeof(req.remote_ip) - 1);
     req.remote_ip[sizeof(req.remote_ip) - 1] = '\0';
+
+    /* RFC 8441: Extended CONNECT bootstrapping WebSocket-over-H2. The
+     * :protocol value ("websocket") was stashed into req.query by
+     * stream_to_request() (see the :protocol parsing there for why).
+     * This is intercepted BEFORE normal route matching -- a WS route
+     * lives in a separate table (ws_handler_find(), shared with the H1
+     * upgrade path in event_loop.c) from the regular HTTP router,
+     * exactly mirroring how the H1 WS upgrade path never touches the
+     * normal router either. */
+    if (req.method == HTTP_CONNECT && req.query &&
+        strcmp(req.query, "websocket") == 0) {
+        ws_handler_t *wsh = ws_handler_find(req.path ? req.path : "/");
+        if (!wsh) {
+            http_response_init(&resp);
+            http_response_set_status(&resp, 404, "Not Found");
+            http_response_set_body(&resp, "Not Found\n", 10);
+            int rc = send_response(hc, stream_id, s, &resp);
+            http_response_destroy(&resp);
+            http_request_free(&req);
+            return rc;
+        }
+        /* Confirm the upgrade with a normal :status 200 -- H2 has no
+         * "101 Switching Protocols" equivalent (there is no protocol
+         * switch at the H2 framing level; this stream just continues
+         * exchanging DATA frames, whose payload is now WS frames
+         * instead of a request/response body -- RFC 8441 5).
+         *
+         * CRITICAL ORDERING: s->is_websocket MUST be set to 1 BEFORE
+         * calling send_response(), not after -- send_response() reads
+         * it to decide whether to suppress END_STREAM on this 200 OK's
+         * HEADERS frame (see send_response()'s has_body/is_websocket
+         * flag logic). Setting it after send_response() returns meant
+         * send_response() always saw is_websocket==0 and closed the
+         * stream immediately (END_STREAM on the 200 OK), which made
+         * RFC 8441-aware clients tear the stream down right after the
+         * handshake -- confirmed live: a client saw
+         * ResponseReceived+StreamEnded on the 200 OK, so the server's
+         * subsequent WS echo DATA frame arrived on an already-closed
+         * stream and was reported as StreamReset instead of
+         * DataReceived, discarding a perfectly valid echo. */
+        s->is_websocket = 1;
+        s->ws_handler   = wsh;
+        ws_frame_state_init(&s->ws_fs);
+        http_response_init(&resp);
+        http_response_set_status(&resp, 200, "OK");
+        int rc = send_response(hc, stream_id, s, &resp);
+        http_response_destroy(&resp);
+        if (rc < 0) { http_request_free(&req); return rc; }
+        if (wsh->on_open) wsh->on_open((conn_t *)hc->conn, wsh->ctx);
+        http_request_free(&req);
+        return 0;
+    }
+
     http_response_init(&resp);
 
     int allowed = 0;
@@ -1819,7 +1935,33 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
     memcpy(s->headers, headers, (size_t)n * sizeof(hpack_header_t));
     s->header_count = n;
 
-    if (flags & H2_FLAG_END_STREAM) {
+    /* RFC 8441: Extended CONNECT (:method CONNECT + :protocol) has a
+     * fundamentally different exchange shape than a normal request --
+     * the "response" (confirming or rejecting the upgrade) must be sent
+     * as soon as the HEADERS frame arrives, NOT after END_STREAM,
+     * because for a bootstrapped WebSocket there IS no END_STREAM on
+     * the request side until the WS connection itself closes (DATA
+     * frames keep flowing bidirectionally for the connection's whole
+     * lifetime). The general dispatch_stream()-on-END_STREAM path below
+     * would simply never fire for this case, since the client never
+     * sends END_STREAM on a still-open WS stream -- confirmed via a
+     * live RFC 8441 client test that timed out waiting for any response
+     * at all before this fix, despite the HEADERS frame having been
+     * parsed and validated successfully. Detect this case up front by
+     * checking the still-raw header block for :method=CONNECT (a full,
+     * generic "is this an Extended CONNECT" check happens inside
+     * dispatch_stream() itself via stream_to_request() -- this is just
+     * routing the call to happen at the right TIME). */
+    int is_connect_request = 0;
+    for (int hi = 0; hi < n; hi++) {
+        if (headers[hi].name && strcmp(headers[hi].name, ":method") == 0 &&
+            headers[hi].value && strcmp(headers[hi].value, "CONNECT") == 0) {
+            is_connect_request = 1;
+            break;
+        }
+    }
+
+    if ((flags & H2_FLAG_END_STREAM) || is_connect_request) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         int drc = dispatch_stream(hc, s, stream_id, router, chain);
         if (hc->write_buf.len > 0) {
@@ -1830,6 +1972,14 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
         }
         if (drc == H2_DISPATCH_PROXY) {
             return 0;  /* stream kept alive; upstream response will close it */
+        }
+        /* A successfully upgraded WS stream must NOT be torn down here --
+         * it's about to start receiving DATA frames as WS traffic for
+         * potentially its entire (long) lifetime. Only fall through to
+         * the normal close-if-nothing-pending logic for requests that
+         * really did end (flags & END_STREAM) or failed to upgrade. */
+        if (s->is_websocket) {
+            return drc;
         }
         buf_reset(&s->body);
         if (s->pending_data.len == 0 && s->pending_body_fd < 0) {
@@ -1915,6 +2065,128 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
 }
 
 /* ── DATA frame handler ──────────────────────────────────────────────────── */
+/* RFC 8441: process a chunk of WS-frame bytes carried in an H2 DATA
+ * frame's payload, for a stream already confirmed as a bootstrapped
+ * WebSocket (dispatch_stream()'s CONNECT+:protocol=websocket handling).
+ *
+ * ws_recv() (ws.c) is the single source of truth for WS frame parsing
+ * and expects to work against a conn_t's ws_state/ws_fs/read_buf/
+ * write_buf/ws_pmd_enabled fields directly -- rather than duplicating
+ * that (substantial, easy to let drift out of sync) logic here, this
+ * temporarily swaps hc->conn's WS-related fields for this stream's own
+ * (s->ws_fs, and a throwaway buf_t pair for read/write), calls the real
+ * ws_recv() unmodified, then restores hc->conn's original fields and
+ * forwards whatever ws_recv() queued into the throwaway write_buf as
+ * H2 DATA frame(s) on this stream. This keeps H1 WS's own state
+ * (whichever connection that actually is) completely untouched even
+ * though we're borrowing the same conn_t struct's fields as scratch
+ * space -- H1 and H2-WS never share a live conn_t at the same time
+ * (an H2 connection's conn_t doesn't have its OWN ws_state used for
+ * anything else, since routa's H1 WS upgrade path only ever runs on
+ * an H1 conn_t, never one that's also carrying H2 streams). */
+static int h2_ws_process_data(h2_conn_t *hc, h2_stream_t *s,
+                               const uint8_t *data, size_t len) {
+    conn_t *conn = (conn_t *)hc->conn;
+
+    ws_conn_state_t   saved_state = conn->ws_state;
+    ws_frame_state_t  saved_fs    = conn->ws_fs;
+    int               saved_pmd  = conn->ws_pmd_enabled;
+    buf_t             saved_read = conn->read_buf;
+    buf_t             saved_write = conn->write_buf;
+
+    conn->ws_state       = WS_STATE_OPEN;
+    conn->ws_fs          = s->ws_fs;
+    conn->ws_pmd_enabled = 0;  /* permessage-deflate over H2-WS: not yet supported */
+
+    buf_init(&conn->read_buf);
+    buf_init(&conn->write_buf);
+    if (len > 0) buf_append(&conn->read_buf, data, len);
+
+    /* handler->ctx is threaded through so on_message()/on_open() work
+     * identically to the H1 path -- ws_recv() reads it off
+     * conn->ws_handler, so stash it there for the duration of this call. */
+    conn->ws_handler = (ws_handler_t *)s->ws_handler;
+
+    /* BUG FIX: this used to pass NULL for cfg unconditionally (a copy-
+     * paste mistake -- "hc->conn->tls ? NULL : NULL" is NULL either way),
+     * which made ws_recv() return -1 immediately from its own `if (!conn
+     * || !handler || !cfg) return -1;` guard, before ever looking at the
+     * frame data. Every single WS-over-H2 message was silently dropped
+     * as a result -- confirmed via a live client test where the Extended
+     * CONNECT handshake succeeded (200 OK) but no echo ever came back.
+     * Use the same per-route-config-or-worker-default resolution pattern
+     * as handle_ws_read() (event_loop.c) uses for the H1 WS path. */
+    const ws_config_t *ws_cfg = (s->ws_handler && s->ws_handler->cfg.max_frame_size > 0)
+                                ? &s->ws_handler->cfg
+                                : (hc->worker ? &((worker_t *)hc->worker)->ws_cfg : NULL);
+    int rc = ws_recv(conn, s->ws_handler, ws_cfg);
+    (void)rc;  /* ws_recv()'s own error signaling is via conn->ws_state below */
+
+    /* Persist this stream's WS parser state back for the next DATA frame. */
+    s->ws_fs = conn->ws_fs;
+
+    /* Anything ws_recv() queued (echoes, pongs, close frames) needs to go
+     * out as H2 DATA frame(s) on this stream, gated by this stream's
+     * actual H2 send_window/peer_max_frame_size -- NOT written raw to
+     * the socket the way H1's conn->write_buf normally would be. */
+    int result = 0;
+    if (conn->write_buf.len > 0) {
+        const uint8_t *out_ptr = buf_data(&conn->write_buf);
+        size_t         out_rem = conn->write_buf.len;
+        while (out_rem > 0) {
+            int32_t conn_win   = hc->send_window;
+            int32_t stream_win = s->send_window;
+            int32_t win        = conn_win < stream_win ? conn_win : stream_win;
+            if (win <= 0) {
+                /* Flow-control stalled -- stash the rest for later via
+                 * the existing pending_data resume mechanism
+                 * (flush_pending()), same as any other stalled stream. */
+                buf_append(&s->pending_data, out_ptr, out_rem);
+                s->pending_offset = 0;
+                break;
+            }
+            size_t chunk = out_rem;
+            if ((size_t)win < chunk) chunk = (size_t)win;
+            if (chunk > hc->peer_max_frame_size) chunk = hc->peer_max_frame_size;
+            if (write_frame_hdr(&hc->write_buf, (uint32_t)chunk,
+                                H2_FRAME_DATA, 0, s->id) < 0) { result = -1; break; }
+            if (buf_append(&hc->write_buf, out_ptr, chunk) < 0) { result = -1; break; }
+            hc->send_window   -= (int32_t)chunk;
+            s->send_window    -= (int32_t)chunk;
+            out_ptr += chunk;
+            out_rem -= chunk;
+        }
+    }
+
+    int closed = (conn->ws_state == WS_STATE_CLOSED);
+
+    buf_free(&conn->read_buf);
+    buf_free(&conn->write_buf);
+
+    conn->ws_state       = saved_state;
+    conn->ws_fs          = saved_fs;
+    conn->ws_pmd_enabled = saved_pmd;
+    conn->read_buf       = saved_read;
+    conn->write_buf      = saved_write;
+
+    if (closed && result == 0) {
+        if (s->ws_handler && s->ws_handler->on_close)
+            s->ws_handler->on_close(conn, WS_CLOSE_NORMAL, NULL, s->ws_handler->ctx);
+        write_rst_stream(&hc->write_buf, s->id, H2_ERR_NO_ERROR);
+        s->state = H2_STREAM_CLOSED;
+        stream_remove(hc, s->id);
+        if (hc->worker) worker_conn_flush((worker_t *)hc->worker, hc->conn);
+        return 0;
+    }
+
+    /* Flush whatever DATA frame(s) were just queued above. */
+    if (hc->write_buf.len > 0 && hc->worker) {
+        worker_conn_flush((worker_t *)hc->worker, hc->conn);
+    }
+
+    return result;
+}
+
 static int handle_data(h2_conn_t *hc, uint32_t stream_id,
                         const uint8_t *payload, uint32_t length,
                         uint8_t flags,
@@ -1954,6 +2226,35 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
         return conn_error(hc, H2_ERR_FLOW_CONTROL_ERROR);
     }
     hc->recv_window -= (int32_t)dlen;
+
+    /* RFC 8441 5: on a bootstrapped WebSocket stream, DATA frame
+     * payloads are WS frames, not a normal request body -- do NOT
+     * accumulate them into s->body (never drained for a long-lived WS
+     * stream, would grow unbounded). Feed the raw bytes directly to the
+     * WS frame parser instead. Flow-control window accounting still
+     * applies identically either way (RFC 8441 doesn't exempt
+     * WS-carrying streams from ordinary H2 flow control). */
+    if (s->is_websocket) {
+        if (dlen > 0) {
+            hc->recv_window += (int32_t)dlen;
+            hc->recv_pending_update += dlen;
+            if (hc->recv_pending_update >= (uint32_t)(hc->recv_window / 2)) {
+                write_window_update(&hc->write_buf, 0, hc->recv_pending_update);
+                hc->recv_pending_update = 0;
+            }
+            write_window_update(&hc->write_buf, stream_id, dlen);
+        }
+        int wrc = h2_ws_process_data(hc, s, data, dlen);
+        if (flags & H2_FLAG_END_STREAM) {
+            if (s->ws_handler && s->ws_handler->on_close)
+                s->ws_handler->on_close((conn_t *)hc->conn, WS_CLOSE_NORMAL, NULL,
+                                        s->ws_handler->ctx);
+            s->state = H2_STREAM_CLOSED;
+            stream_remove(hc, stream_id);
+            return 0;
+        }
+        return wrc;
+    }
 
     if (buf_append(&s->body, data, dlen) < 0)
         return conn_error(hc, H2_ERR_INTERNAL_ERROR);

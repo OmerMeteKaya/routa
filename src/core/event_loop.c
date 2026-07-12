@@ -195,7 +195,11 @@ void event_loop_add_ws_route(event_loop_t *loop, const char *path,
 }
 
 /* Lookup a WS handler by path.  Linear scan — handler count is small.    */
-static ws_handler_t *ws_handler_find(const char *path) {
+/* Made non-static so h2.c's RFC 8441 (WebSocket-over-HTTP/2) Extended
+ * CONNECT handling can look up the same WS route table the H1 upgrade
+ * path uses -- see dispatch_stream()'s CONNECT+:protocol=websocket
+ * handling in h2.c. */
+ws_handler_t *ws_handler_find(const char *path) {
     for (int i = 0; i < g_ws_handler_count; i++) {
         if (strcmp(g_ws_handlers[i].path, path) == 0)
             return &g_ws_handlers[i];

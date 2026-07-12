@@ -8,6 +8,7 @@
 #include "core/config.h"
 #include "http/request.h"
 #include "http/response.h"
+#include "http/ws.h"
 
 /* ── Frame types (RFC 7540 §6) ───────────────────────────────────────────── */
 typedef enum {
@@ -55,6 +56,13 @@ typedef enum {
 #define H2_SETTINGS_INITIAL_WINDOW_SIZE    0x4
 #define H2_SETTINGS_MAX_FRAME_SIZE         0x5
 #define H2_SETTINGS_MAX_HEADER_LIST_SIZE   0x6
+/* RFC 8441 3: signals support for Extended CONNECT (the mechanism used
+ * to bootstrap WebSocket-over-HTTP/2). A server that supports it MUST
+ * advertise this SETTINGS parameter with value 1 -- clients (browsers in
+ * particular) will not attempt a WebSocket-over-H2 handshake at all
+ * without seeing it first, falling back to either a separate HTTP/1.1
+ * connection for the WS handshake or failing outright. */
+#define H2_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x8
 
 /* ── Stream states (RFC 7540 §5.1) ──────────────────────────────────────── */
 typedef enum {
@@ -113,6 +121,22 @@ typedef struct h2_stream {
      * HEADERS frame. */
     hpack_header_t    trailer_headers[16];
     int               trailer_count;
+    /* RFC 8441: WebSocket-over-HTTP/2 (Extended CONNECT). Once a stream
+     * is confirmed to be carrying a bootstrapped WebSocket (see
+     * dispatch_stream()'s CONNECT+:protocol=websocket handling), DATA
+     * frames on it are WebSocket frames rather than a normal request
+     * body, and this stream's send_window-gated DATA-frame-writing path
+     * doubles as the WS frame transport (outbound WS frames get wrapped
+     * in DATA frames the same way any other response body would, since
+     * from H2's perspective this is just an ordinary, very long-lived
+     * response stream -- RFC 8441 5). ws_fs holds the WS frame parser's
+     * state across multiple DATA frames/h2_conn_recv() calls, exactly
+     * analogous to how conn_t.ws_fs works for the H1 WS path (see
+     * conn.h), and ws_handler/ws_cfg mirror conn_t's ws_handler/per-route
+     * cfg selection in event_loop.c's handle_ws_read(). */
+    int               is_websocket;
+    ws_frame_state_t  ws_fs;
+    const ws_handler_t *ws_handler;
     uint64_t start_us;
 } h2_stream_t;
 

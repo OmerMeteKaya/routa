@@ -125,6 +125,9 @@ void          event_loop_add_route(event_loop_t *loop, const char *path,
  * The handler is copied — caller may free the original after this call.  */
 void          event_loop_add_ws_route(event_loop_t *loop, const char *path,
                                       const ws_handler_t *handler);
+/* Look up a registered WS handler by path -- used by both the H1 upgrade
+ * path (event_loop.c) and h2.c's RFC 8441 Extended CONNECT handling. */
+ws_handler_t *ws_handler_find(const char *path);
 
 void          event_loop_set_tls(event_loop_t *loop,
                                  const char *cert_file, const char *key_file);
