@@ -491,6 +491,25 @@ static int huffman_decode(const uint8_t *src, size_t src_len,
                 }
             }
 
+            /* RFC 7541 Appendix B / 5.2: the EOS (End-of-String) code
+             * is 30 bits, all 1s (0x3FFFFFFF). It is never a real symbol
+             * -- it exists purely so an encoder can pad the final byte
+             * of a Huffman string with 1-bits, and RFC 7541 5.2 REQUIRES
+             * treating it as a decoding error if it appears as if it
+             * were real content. Before this check, huffman_decode()'s
+             * symbol table only covered symbols 0-255 (real characters)
+             * -- 30 bits of 1s matched nothing in either the fast-path
+             * LUT or the slow-path scan below, so `progress` stayed 0
+             * and those bits were silently discarded (not decoded to
+             * anything, not rejected either) -- confirmed by direct
+             * reproduction: a 4-byte Huffman-encoded name of all 0xFF
+             * (a 30-bit EOS code + 2 bits of legitimate padding)
+             * silently decoded to a 1-byte name containing 0x0a ('\n')
+             * instead of being rejected (h2spec 5.2#3). */
+            if (n_bits >= 30) {
+                uint32_t top30 = (uint32_t)(bits >> (n_bits - 30)) & 0x3fffffffu;
+                if (top30 == 0x3fffffffu) return -1;
+            }
             /*
              * Slow path: linear scan for codes that need more than a byte.
              * When n_bits >= 8 the LUT already tried all codes ≤ 8 bits,

@@ -141,6 +141,16 @@ void lb_record_retry(lb_t *lb) {
     if (lb) __sync_fetch_and_add(&lb->stat_retries, 1);
 }
 
+uint64_t lb_get_stat_requests(const lb_t *lb) {
+    return lb ? lb->stat_requests : 0;
+}
+uint64_t lb_get_stat_failed(const lb_t *lb) {
+    return lb ? lb->stat_failed : 0;
+}
+uint64_t lb_get_stat_retries(const lb_t *lb) {
+    return lb ? lb->stat_retries : 0;
+}
+
 const char *lb_sticky_cookie_name(const lb_t *lb) {
     return (lb && lb->cfg.sticky_cookie_name[0]) ? lb->cfg.sticky_cookie_name : "routa_sticky";
 }

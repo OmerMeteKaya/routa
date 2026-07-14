@@ -179,6 +179,16 @@ static int lb_route_handler(const http_request_t *req,
      * what allows the request to actually reach the upstream. */
     if (hctx && hctx->acl) {
         if (!acl_check((const acl_config_t *)hctx->acl, req->remote_ip)) {
+            /* Pool-scoped ACL denial -- a separate code path from
+             * mw_acl.c's global ACL middleware (this one lives in the
+             * proxy route handler, checked via server_lb_set_acl()), but
+             * the same acl_denied_total counter applies: an operator
+             * scraping /metrics doesn't need to know WHICH of the two
+             * ACL layers rejected a request, just that ACL did. Found
+             * missing during Faz D observability testing -- the global
+             * mw_acl.c path was instrumented but this one was initially
+             * overlooked. */
+            ROUTA_METRIC_INC(acl_denied_total);
             http_response_set_status(resp, 403, "Forbidden");
             http_response_set_header(resp, "Content-Type", "text/plain");
             http_response_set_body(resp, "Forbidden\n", 10);

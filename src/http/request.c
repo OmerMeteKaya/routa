@@ -66,7 +66,18 @@ static char *normalize_path(const char *path) {
             while (i < len && path[i] == '/') i++;
             out[j++] = '/';
         } else if (path[i] == '.' && (i + 1 >= len || path[i+1] == '/')) {
-            i++;
+            /* BUG FIX: previously this only skipped the '.' character
+             * itself (i++), leaving a following '/' (if any) for the
+             * NEXT loop iteration -- which then emitted it as its own
+             * redundant '/' segment via the slash-collapsing branch
+             * above, turning e.g. "/a/./b" into "/a//b" (a stray double
+             * slash) instead of the correctly-normalized "/a/b". Now
+             * consumes the trailing '/' along with the '.' when present
+             * (i += 2), matching how the ".." branch just below already
+             * consumes its own trailing '/'. At end-of-string (i+1 >=
+             * len) there's no '/' to consume, so i++ alone is correct
+             * there (unchanged). */
+            i += (i + 1 < len && path[i+1] == '/') ? 2 : 1;
         } else if (path[i] == '.' && i + 1 < len && path[i+1] == '.'
                    && (i + 2 >= len || path[i+2] == '/')) {
             i += 2;

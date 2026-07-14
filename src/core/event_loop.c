@@ -443,7 +443,11 @@ static void conn_close_and_free(worker_t *w, conn_t *conn) {
  * the view passed to io_writev_response doesn't need status/headers.
  * Body is stolen from resp (zero extra malloc).
  */
-void conn_prepare_writev(conn_t *conn, http_response_t *resp) {
+/* Forward declaration -- defined below, needed here for the
+ * observability stash added to conn_prepare_writev() (Faz D bug fix). */
+static const char *req_method_str(http_method_t m);
+
+void conn_prepare_writev(conn_t *conn, http_response_t *resp, const http_request_t *req) {
     conn_reset_write_state(conn);
 
     /* Global response header manipulation, applied to every response
@@ -478,6 +482,34 @@ void conn_prepare_writev(conn_t *conn, http_response_t *resp) {
         conn->resp_body_len = resp->body_len;
         resp->body          = NULL;
         resp->body_len      = 0;
+    }
+
+    /* ── Observability stash (Faz D bug fix) ──────────────────────
+     * Previously this stash (conn->last_status etc, consumed later by the
+     * access-log + routa_metrics_record() call in CONN_WRITING completion)
+     * was only ever performed manually in ONE call site out of what were
+     * then 6 separate conn_prepare_writev() callers -- the 405 Method Not
+     * Allowed path. Every other response (200/3xx/401/403/429/static-file/
+     * sendfile) silently never recorded a metric or access-log entry.
+     * Centralizing the stash here, keyed on whether a live req was
+     * passed, fixes all 6 call sites in event_loop.c at once. req == NULL
+     * is used by the proxy/upstream response call sites in proxy.c and
+     * h2_client.c, which don't have a live http_request_t at their call
+     * point -- those remain unfixed for now (tracked separately, see
+     * METRICS_STASH_FIX_PLAN.md Faz 2); passing NULL there preserves
+     * their exact previous (also-broken) behavior rather than crashing. */
+    if (req) {
+        strncpy(conn->last_trace_id,
+                req->trace_id[0] ? req->trace_id : "0000000000000000",
+                sizeof(conn->last_trace_id) - 1);
+        strncpy(conn->last_method_str,
+                req_method_str(req->method),
+                sizeof(conn->last_method_str) - 1);
+        strncpy(conn->last_path,
+                req->path ? req->path : "/",
+                sizeof(conn->last_path) - 1);
+        conn->last_status   = resp->status;
+        conn->last_start_us = req->start_us;
     }
 }
 static const char *req_method_str(http_method_t m) {
@@ -979,7 +1011,7 @@ static void handle_events_worker(worker_t *w) {
                     if (resp.status != 0) {
                         http_response_set_header(&resp, "Connection",
                                                  conn->keep_alive ? "keep-alive" : "close");
-                        conn_prepare_writev(conn, &resp);
+                        conn_prepare_writev(conn, &resp, &req);
                         http_response_destroy(&resp);
                         http_request_free(&req);
                         conn->state = CONN_WRITING;
@@ -1008,19 +1040,12 @@ static void handle_events_worker(worker_t *w) {
                 }
                 http_response_set_header(&resp, "Allow", allow_hdr);
                 http_response_set_body(&resp, "Method Not Allowed\n", 20);
-                conn_prepare_writev(conn, &resp);
-                /* ── Observability stash ── */
-                strncpy(conn->last_trace_id,
-                        req.trace_id[0] ? req.trace_id : "0000000000000000",
-                        sizeof(conn->last_trace_id) - 1);
-                strncpy(conn->last_method_str,
-                        req_method_str(req.method),
-                        sizeof(conn->last_method_str) - 1);
-                strncpy(conn->last_path,
-                        req.path ? req.path : "/",
-                        sizeof(conn->last_path) - 1);
-                conn->last_status   = resp.status;
-                conn->last_start_us = req.start_us;
+                /* Observability stash (last_trace_id/last_method_str/
+                 * last_path/last_status/last_start_us) now happens
+                 * centrally inside conn_prepare_writev() itself -- see
+                 * its doc comment (Faz D bug fix). The manual duplicate
+                 * that used to live here was removed. */
+                conn_prepare_writev(conn, &resp, &req);
 
                 http_response_destroy(&resp);
                 http_request_free(&req);
@@ -1114,7 +1139,7 @@ static void handle_events_worker(worker_t *w) {
                         resp.body_fd = -1;
                         io_cork(conn->fd);
                         /* Headers via writev, then CONN_SENDFILE */
-                        conn_prepare_writev(conn, &resp);
+                        conn_prepare_writev(conn, &resp, &req);
                     } else {
                         /* TLS: no async sendfile() equivalent, so this path
                          * is blocking -- but headers MUST reach the peer
@@ -1133,7 +1158,7 @@ static void handle_events_worker(worker_t *w) {
                          * requests). Fix: flush conn->hdr_buf to the TLS
                          * session synchronously first, THEN send the file
                          * body. */
-                        conn_prepare_writev(conn, &resp);
+                        conn_prepare_writev(conn, &resp, &req);
                         if (conn->hdr_buf.len > 0) {
                             if (tls_write(conn->tls, buf_data(&conn->hdr_buf),
                                          buf_len(&conn->hdr_buf)) < 0) {
@@ -1150,7 +1175,7 @@ static void handle_events_worker(worker_t *w) {
                     }
                 } else {
                     /* In-memory body: writev (header + body, zero extra copy) */
-                    conn_prepare_writev(conn, &resp);
+                    conn_prepare_writev(conn, &resp, &req);
                 }
 
                 http_response_destroy(&resp);

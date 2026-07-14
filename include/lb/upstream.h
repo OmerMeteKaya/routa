@@ -115,6 +115,19 @@ struct upstream_node {
     time_t              down_since;
     volatile uint32_t   half_open_probe_in_flight; /* 0 or 1, CAS-guarded */
 
+    /* Circuit-breaker observability counters (Faz D). Incremented in
+     * upstream_node_set_state() / upstream_node_is_selectable() --
+     * distinct from fail_count/success_count (consecutive-run counters
+     * used for the UP/DOWN decision itself) and from total_requests/
+     * total_errors (per-request outcome tallies): these two specifically
+     * count STATE-TRANSITION events, i.e. "how many times did this node
+     * actually trip the breaker" / "how many half-open recovery trials
+     * were attempted", which total_errors alone can't answer (a node
+     * could accumulate many total_errors while only tripping the
+     * breaker once, if passive_fail_threshold hasn't been reached). */
+    volatile uint32_t   circuit_breaker_trips_total;
+    volatile uint32_t   half_open_trials_total;
+
     /* Active health check */
     health_check_config_t hc;
     int                   hc_consec_ok;   /* consecutive probe successes    */

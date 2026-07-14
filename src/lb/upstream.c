@@ -236,6 +236,7 @@ void upstream_node_set_state(upstream_node_t *node, node_state_t state) {
          * in-flight guard from a previous half-open cycle. */
         node->down_since = time(NULL);
         node->half_open_probe_in_flight = 0;
+        __atomic_fetch_add(&node->circuit_breaker_trips_total, 1, __ATOMIC_RELAXED);
     }
     pthread_spin_unlock(&node->state_lock);
 
@@ -278,6 +279,7 @@ int upstream_node_is_selectable(upstream_node_t *node, upstream_pool_t *pool) {
     }
 
     upstream_node_set_state(node, NODE_HALF_OPEN);
+    __atomic_fetch_add(&node->half_open_trials_total, 1, __ATOMIC_RELAXED);
     return 1;
 }
 

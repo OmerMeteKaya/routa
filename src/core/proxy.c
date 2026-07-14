@@ -727,7 +727,12 @@ int proxy_on_upstream_readable(worker_t *w, conn_t *conn, proxy_ctx_t *ctx) {
     } else {
         http_response_set_header(&resp, "Connection",
             conn->keep_alive ? "keep-alive" : "close");
-        conn_prepare_writev(conn, &resp);
+        /* req=NULL: proxy responses don't have a live http_request_t
+         * at this call point -- this preserves the exact previous
+         * (also-broken, not-yet-fixed) behavior of not stashing
+         * observability data for proxy responses. See
+         * METRICS_STASH_FIX_PLAN.md Faz 2 for the follow-up fix. */
+        conn_prepare_writev(conn, &resp, NULL);
         http_response_destroy(&resp);
         conn->state = CONN_WRITING;
     }

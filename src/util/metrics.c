@@ -499,5 +499,169 @@ int routa_metrics_prometheus_lb(char *buf, size_t buf_sz, void *srv_ptr) {
         }
     }
 
+    /* ── Faz 3a: pool-level request/failure/retry counters ──────────────
+     * lb_t.stat_requests/stat_failed/stat_retries were already being
+     * incremented internally (stat_retries via lb_record_retry(), called
+     * from proxy.c's retry path) but were never exposed on /metrics --
+     * this is pool-level, not per-upstream, since that's how the
+     * underlying counters are actually kept (on lb_t, not per-node). */
+    PROM_APPEND(
+        "# HELP routa_lb_pool_requests_total Total requests dispatched through this pool\n"
+        "# TYPE routa_lb_pool_requests_total counter\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        PROM_APPEND(
+            "routa_lb_pool_requests_total{pool=\"%s\"} %llu\n",
+            pool_name, (unsigned long long)lb_get_stat_requests(lb)
+        );
+    }
+
+    PROM_APPEND(
+        "# HELP routa_lb_pool_failed_total Total requests that ultimately failed through this pool\n"
+        "# TYPE routa_lb_pool_failed_total counter\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        PROM_APPEND(
+            "routa_lb_pool_failed_total{pool=\"%s\"} %llu\n",
+            pool_name, (unsigned long long)lb_get_stat_failed(lb)
+        );
+    }
+
+    PROM_APPEND(
+        "# HELP routa_lb_pool_retries_total Total retry attempts issued by this pool (lb_max_retries/lb_retry_on_5xx/retry_on_connect_fail)\n"
+        "# TYPE routa_lb_pool_retries_total counter\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        PROM_APPEND(
+            "routa_lb_pool_retries_total{pool=\"%s\"} %llu\n",
+            pool_name, (unsigned long long)lb_get_stat_retries(lb)
+        );
+    }
+
+    /* ── Faz 3b: connection-pool occupancy (per upstream node) ──────────
+     * idle_count/active_count/pool_max already tracked on upstream_node_t
+     * (guarded by node->pool_lock for mutation) but never rendered.
+     * Read here without taking pool_lock -- same best-effort-snapshot
+     * approach already used for node->state/node->inflight above (a
+     * gauge that's briefly stale by a request or two is an acceptable
+     * tradeoff for a metrics scrape, consistent with the rest of this
+     * file's g_metrics fields all being read with relaxed ordering). */
+    PROM_APPEND(
+        "# HELP routa_upstream_pool_idle Idle pooled connections to this upstream node\n"
+        "# TYPE routa_upstream_pool_idle gauge\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_pool_idle{pool=\"%s\",upstream=\"%s:%u\"} %d\n",
+                pool_name, node->host, (unsigned)node->port, node->idle_count
+            );
+        }
+    }
+
+    PROM_APPEND(
+        "# HELP routa_upstream_pool_active Active (in-use) pooled connections to this upstream node\n"
+        "# TYPE routa_upstream_pool_active gauge\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_pool_active{pool=\"%s\",upstream=\"%s:%u\"} %d\n",
+                pool_name, node->host, (unsigned)node->port, node->active_count
+            );
+        }
+    }
+
+    PROM_APPEND(
+        "# HELP routa_upstream_pool_max Configured max pooled connections to this upstream node\n"
+        "# TYPE routa_upstream_pool_max gauge\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_pool_max{pool=\"%s\",upstream=\"%s:%u\"} %d\n",
+                pool_name, node->host, (unsigned)node->port, node->pool_max
+            );
+        }
+    }
+
+    /* ── Circuit-breaker observability ──────────────────────────────────
+     * circuit_breaker_trips_total: how many times this node transitioned
+     * INTO NODE_DOWN (a fresh trip, not re-counted while it stays down).
+     * half_open_trials_total: how many times a half-open recovery trial
+     * was attempted for this node. Both incremented in
+     * upstream_node_set_state()/upstream_node_is_selectable() -- see
+     * upstream.h's doc comment on these fields for why they're distinct
+     * from fail_count/total_errors. */
+    PROM_APPEND(
+        "# HELP routa_upstream_circuit_breaker_trips_total Times this upstream node's circuit breaker tripped (transitioned to DOWN)\n"
+        "# TYPE routa_upstream_circuit_breaker_trips_total counter\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_circuit_breaker_trips_total{pool=\"%s\",upstream=\"%s:%u\"} %u\n",
+                pool_name, node->host, (unsigned)node->port, node->circuit_breaker_trips_total
+            );
+        }
+    }
+
+    PROM_APPEND(
+        "# HELP routa_upstream_half_open_trials_total Half-open recovery trials attempted for this upstream node\n"
+        "# TYPE routa_upstream_half_open_trials_total counter\n"
+    );
+    for (int pi = 0; pi < s->lb_pool_count; pi++) {
+        lb_t *lb = s->lb_pools[pi].lb;
+        if (!lb) continue;
+        const char *pool_name = s->lb_pools[pi].name[0] ? s->lb_pools[pi].name : "default";
+        upstream_pool_t *up = lb_get_pool(lb);
+        if (!up) continue;
+        for (int ni = 0; ni < up->node_count; ni++) {
+            upstream_node_t *node = up->nodes[ni];
+            if (!node) continue;
+            PROM_APPEND(
+                "routa_upstream_half_open_trials_total{pool=\"%s\",upstream=\"%s:%u\"} %u\n",
+                pool_name, node->host, (unsigned)node->port, node->half_open_trials_total
+            );
+        }
+    }
+
     return (int)(p - buf);
 }

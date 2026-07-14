@@ -172,7 +172,18 @@ void event_loop_set_h2_config(event_loop_t *loop,
 void event_loop_set_ws_config(event_loop_t *loop, const ws_config_t *cfg);
 /* ── Write path helpers (also used by proxy.c and h2_client.c) ─────────── */
 void conn_reset_write_state(conn_t *conn);
-void conn_prepare_writev(conn_t *conn, http_response_t *resp);
+/* req may be NULL (e.g. a caller with no live http_request_t at this
+ * point, such as a proxy/upstream response path -- see the doc comment
+ * on the .c definition for the full explanation) -- when non-NULL, this
+ * function stashes req's method/path/trace_id/start_us plus resp->status
+ * into conn->last_* for the access-log + metrics recording that happens
+ * later in CONN_WRITING completion (see routa_metrics_record()'s call
+ * site). When NULL, conn->last_status is left untouched (0), so no
+ * metrics/access-log entry is produced for that response -- this was, in
+ * effect, ALWAYS the previous behavior for every call site except the
+ * 405 Method Not Allowed path, which is why routa_metrics_record() was
+ * found to almost never fire (see Faz D observability bug writeup). */
+void conn_prepare_writev(conn_t *conn, http_response_t *resp, const http_request_t *req);
 
 /* Flush a frontend conn's H2 write_buf (or arm write for H1) after an
  * h2up response has been delivered from a worker event.                    */

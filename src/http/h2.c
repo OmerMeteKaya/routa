@@ -620,6 +620,24 @@ static int handle_settings(h2_conn_t *hc,
     }
 
     if (write_settings_ack(&hc->write_buf) < 0) return -1;
+    /* BUG FIX (h2spec 6.9.2#1): a peer's SETTINGS_INITIAL_WINDOW_SIZE
+     * change can immediately unblock streams that were previously
+     * flow-control-stalled (send_window <= 0, data queued in
+     * s->pending_data waiting for room) -- the case block above already
+     * grows every stream's send_window by the resulting delta, but
+     * nothing was ever queued to actually FLUSH that now-unblocked
+     * pending data. It only went out later if/when a POLLER_WRITE event
+     * happened to fire independently (see h2_conn_flush_pending()'s
+     * other call site in event_loop.c) -- which, on a connection that's
+     * otherwise idle from the socket's point of view right after this
+     * SETTINGS frame, may not happen for a long time or at all within a
+     * test's timeout. Flushing here makes the unblock immediate, as RFC
+     * 7540 6.9.2 implies ("the endpoint MUST adjust the size of all
+     * stream flow-control windows that it maintains by the difference"
+     * -- adjusting the window without ever using the newly-available
+     * room to send is not a meaningful adjustment from the peer's
+     * observable point of view). */
+    h2_conn_flush_pending(hc);
     return 0;
 }
 

@@ -84,6 +84,15 @@ typedef struct lb lb_t;
 /* Returns the upstream pool for direct node state recording.
  * Used by proxy.c to call upstream_node_record_failure/success. */
 upstream_pool_t *lb_get_pool(lb_t *lb);
+
+/* Pool-level counters (lb_t.stat_requests/stat_failed/stat_retries) --
+ * already incremented internally by proxy.c/lb.c (stat_retries via
+ * lb_record_retry()), previously never exposed outside lb.c. Added for
+ * Prometheus rendering (routa_metrics_prometheus_lb() in metrics.c). */
+uint64_t lb_get_stat_requests(const lb_t *lb);
+uint64_t lb_get_stat_failed(const lb_t *lb);
+uint64_t lb_get_stat_retries(const lb_t *lb);
+
 void lb_get_upstream_timeouts(const lb_t *lb, int *read_timeout_ms, int *write_timeout_ms);
 int  lb_sticky_enabled(const lb_t *lb);
 const char *lb_sticky_cookie_name(const lb_t *lb);

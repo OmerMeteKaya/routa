@@ -687,7 +687,9 @@ static void deliver_response(h2up_conn_t *h2up, h2up_stream_t *s, worker_t *w)
     } else {
         http_response_set_header(&s->resp, "Connection",
             conn->keep_alive ? "keep-alive" : "close");
-        conn_prepare_writev(conn, &s->resp);
+        /* req=NULL: same reasoning as proxy.c's call site -- see
+         * METRICS_STASH_FIX_PLAN.md Faz 2. */
+        conn_prepare_writev(conn, &s->resp, NULL);
         http_response_destroy(&s->resp);
         proxy_stream_remove(conn, front_sid);   /* frees ctx */
         conn->state = CONN_WRITING;
