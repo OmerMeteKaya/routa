@@ -190,6 +190,66 @@ static int pmd_compress(const uint8_t *src, size_t src_len,
  * RFC 7692 §7.2.2: append 0x00 0x00 0xff 0xff before inflate.
  * Returns decompressed byte count, -1 on error.
  * Caller must free *dst_out.                                               */
+/* RFC 6455 8.1 / RFC 3629: validates that `data` is well-formed UTF-8.
+ * Required for TEXT frame payloads (fragmented or not) -- a TEXT message
+ * containing invalid UTF-8 MUST cause the connection to be closed with
+ * close code 1007 (WS_CLOSE_INVALID). This was entirely missing before
+ * this fix (confirmed via exhaustive grep: no "utf8" anywhere in this
+ * file) -- routa accepted TEXT frames with arbitrary binary payloads
+ * without validation, a real RFC 6455 compliance gap (this is also
+ * Autobahn|Testsuite's single largest test category, Case 6.x).
+ *
+ * Implementation: a standard byte-driven UTF-8 state machine (not a
+ * table-based DFA, for readability) that rejects: continuation bytes
+ * without a leading byte, truncated multi-byte sequences, overlong
+ * encodings (values encoded with more bytes than necessary), and code
+ * points outside the valid Unicode range (surrogates U+D800-U+DFFF,
+ * anything > U+10FFFF). Returns 1 if valid, 0 if invalid. */
+static int utf8_validate(const uint8_t *data, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        uint8_t b0 = data[i];
+        if (b0 <= 0x7F) {
+            /* 1-byte ASCII */
+            i += 1;
+        } else if ((b0 & 0xE0) == 0xC0) {
+            /* 2-byte sequence: 110xxxxx 10xxxxxx */
+            if (b0 < 0xC2) return 0; /* overlong: C0/C1 can only encode <0x80 */
+            if (i + 1 >= len) return 0;
+            uint8_t b1 = data[i+1];
+            if ((b1 & 0xC0) != 0x80) return 0;
+            i += 2;
+        } else if ((b0 & 0xF0) == 0xE0) {
+            /* 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx */
+            if (i + 2 >= len) return 0;
+            uint8_t b1 = data[i+1], b2 = data[i+2];
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) return 0;
+            /* Overlong check: E0 must be followed by A0-BF, not 80-9F */
+            if (b0 == 0xE0 && b1 < 0xA0) return 0;
+            /* Surrogate range U+D800-U+DFFF is invalid in UTF-8 (ED A0-BF) */
+            if (b0 == 0xED && b1 >= 0xA0) return 0;
+            i += 3;
+        } else if ((b0 & 0xF8) == 0xF0) {
+            /* 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
+            if (b0 > 0xF4) return 0; /* > U+10FFFF, out of Unicode range */
+            if (i + 3 >= len) return 0;
+            uint8_t b1 = data[i+1], b2 = data[i+2], b3 = data[i+3];
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80)
+                return 0;
+            /* Overlong check: F0 must be followed by 90-BF, not 80-8F */
+            if (b0 == 0xF0 && b1 < 0x90) return 0;
+            /* F4 must be followed by 80-8F (caps at U+10FFFF) */
+            if (b0 == 0xF4 && b1 > 0x8F) return 0;
+            i += 4;
+        } else {
+            /* Invalid leading byte: a continuation byte (10xxxxxx) with
+             * no preceding leader, or F8-FF (never valid in UTF-8). */
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int pmd_decompress(const uint8_t *src, size_t src_len,
                             uint8_t **dst_out, size_t *dst_len_out) {
     if (!src || src_len == 0) return -1;
@@ -465,6 +525,24 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
                 ws_close(conn, WS_CLOSE_PROTOCOL, "RSV1 without deflate");
                 return -1;
             }
+            /* RFC 6455 5.2: RSV2 and RSV3 MUST be 0 unless an extension
+             * negotiated during the handshake defines their meaning --
+             * routa negotiates no extension that uses either bit (only
+             * permessage-deflate, RSV1-only, is supported), so both must
+             * always be 0. Previously neither bit was even parsed, let
+             * alone checked -- a client could set RSV2/RSV3 freely with
+             * no protocol-error response, a real RFC 6455 compliance gap
+             * (and Autobahn|Testsuite Case 3.x/9.x territory). */
+            if ((b0 >> 5) & 1) {
+                LOG_WARN("ws: RSV2 set (no extension negotiates it) from %s", conn->remote_ip);
+                ws_close(conn, WS_CLOSE_PROTOCOL, "RSV2 without extension");
+                return -1;
+            }
+            if ((b0 >> 4) & 1) {
+                LOG_WARN("ws: RSV3 set (no extension negotiates it) from %s", conn->remote_ip);
+                ws_close(conn, WS_CLOSE_PROTOCOL, "RSV3 without extension");
+                return -1;
+            }
             fs->opcode = (ws_opcode_t)(b0 & 0x0F);
             fs->masked = (b1 >> 7) & 1;
 
@@ -581,11 +659,50 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
                 } else if (fs->opcode == WS_OP_CLOSE) {
                     ws_close_code_t code = WS_CLOSE_NORMAL;
                     const char     *reason = NULL;
+                    size_t          reason_len = 0;
                     if (fs->payload_len >= 2) {
                         code = (ws_close_code_t)(
                             ((uint16_t)payload_ptr[0] << 8) | payload_ptr[1]);
-                        if (fs->payload_len > 2)
-                            reason = (char *)payload_ptr + 2;
+                        if (fs->payload_len > 2) {
+                            reason     = (char *)payload_ptr + 2;
+                            reason_len = (size_t)fs->payload_len - 2;
+                        }
+                    }
+                    /* RFC 6455 7.4.1/7.4.2: certain close codes are
+                     * reserved and MUST NEVER appear on the wire (they
+                     * are internal/local-only status values): 1004
+                     * (reserved), 1005 (no status received -- a stand-in
+                     * for "no code was sent", never itself sendable),
+                     * 1006 (abnormal closure -- describes a TCP-level
+                     * disconnect, never an actual close frame), 1015 (TLS
+                     * handshake failure -- same idea, never sent). Codes
+                     * below 1000 or above 4999 are also invalid (the
+                     * valid range is 1000-1003, 1007-1011, and the
+                     * 3000-4999 registered/private-use range -- 1012-2999
+                     * beyond 1011 are reserved for future/registration
+                     * but this deliberately only hard-rejects the
+                     * unambiguously-forbidden set above plus the outer
+                     * bounds, rather than an exhaustive enumeration, to
+                     * avoid rejecting legitimate future IANA-registered
+                     * codes in the 1012-2999 range). Previously NONE of
+                     * this was checked -- any 16-bit value was accepted
+                     * and handed straight to on_close(). */
+                    if (fs->payload_len >= 2) {
+                        int bad_code = (code == 1004 || code == 1005 ||
+                                        code == 1006 || code == 1015 ||
+                                        (int)code < 1000 || (int)code > 4999);
+                        if (bad_code) {
+                            ws_close(conn, WS_CLOSE_PROTOCOL, "invalid close code");
+                            conn->ws_state = WS_STATE_CLOSED;
+                            return -1;
+                        }
+                    }
+                    /* RFC 6455 7.1.6: the close reason, if present, MUST
+                     * be valid UTF-8 -- previously never checked either. */
+                    if (reason && !utf8_validate((const uint8_t *)reason, reason_len)) {
+                        ws_close(conn, WS_CLOSE_INVALID, "invalid UTF-8 in close reason");
+                        conn->ws_state = WS_STATE_CLOSED;
+                        return -1;
                     }
                     if (handler->on_close)
                         handler->on_close(conn, code, reason, handler->ctx);
@@ -657,6 +774,18 @@ int ws_recv(conn_t *conn, const ws_handler_t *handler,
                         used_pmd  = 1;
                                        }
                     /* If decompression fails, pass raw data — handler decides */
+                }
+
+                /* RFC 6455 8.1: TEXT payloads (post-decompression, and
+                 * post-reassembly if this message was fragmented) MUST be
+                 * valid UTF-8. See utf8_validate()'s doc comment for the
+                 * full rationale -- this check was entirely absent before. */
+                if (fs->frag_opcode == WS_OP_TEXT && !utf8_validate(msg_data, msg_len)) {
+                    if (used_pmd) free(decomp);
+                    ws_close(conn, WS_CLOSE_INVALID, "invalid UTF-8");
+                    fs->frag_buf.len = 0;
+                    fs->in_fragment  = 0;
+                    return -1;
                 }
 
                 if (handler->on_message) {

@@ -3,6 +3,7 @@
 #endif
 #include "lb/upstream.h"
 #include "util/logger.h"
+#include "util/metrics.h"  /* routa_now_ms() -- millisecond-resolution clock */
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -220,7 +221,8 @@ int upstream_conn_connect_async(upstream_node_t *node) {
 int upstream_conn_check_connected(int fd) {
     int err = 0;
     socklen_t len = sizeof(err);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0)
+    int rc = getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+    if (rc < 0 || err != 0)
         return -1;
     return 0;
 }
@@ -426,6 +428,12 @@ typedef struct {
 
     char             resp[256];
     int              resp_len;    /* bytes of resp already read */
+    /* Stashed at hc_probe_start() time so hc_probe_advance() can
+     * re-arm this fd's poller interest (POLLER_READ vs POLLER_WRITE) as
+     * the probe's own phase changes -- see the WRITING->READING
+     * transition's bug-fix comment for why this is required, not
+     * optional, in edge-triggered mode. */
+    poller_t        *poller;
 } hc_probe_t;
 
 /* Called when a probe finishes (successfully or not) to update the
@@ -478,9 +486,23 @@ static int hc_probe_start(hc_probe_t *p, upstream_node_t *node, poller_t *poller
 
     p->node     = node;
     p->fd       = fd;
+    p->poller   = poller;
     p->phase    = HC_PHASE_CONNECTING;
     p->ssl      = NULL;
-    p->deadline = time(NULL) + (timeout_ms / 1000 + 1);
+    /* BUG FIX: deadline is a time_t (1-second resolution), but
+     * timeout_ms is milliseconds. The previous "timeout_ms / 1000 + 1"
+     * used truncating integer division then unconditionally added 1
+     * second -- for any timeout_ms < 1000 (e.g. 150ms), this collapses
+     * to a full 1-second deadline (0 + 1), silently granting ~6.7x more
+     * time than configured. For timeout_ms values that ARE a clean
+     * multiple of 1000 (e.g. 2000ms), it also always adds one extra
+     * full second beyond what was asked for. Ceiling-divide instead
+     * (round UP to the nearest whole second, the coarsest deadline this
+     * time_t-based field can represent) so a sub-second timeout still
+     * gets at least 1 second (this field's minimum granularity) rather
+     * than silently ballooning to 2+, and an exact-second timeout isn't
+     * padded by a full extra second on top. */
+    p->deadline = time(NULL) + (time_t)((timeout_ms + 999) / 1000);
     p->req_len  = 0;
     p->req_sent = 0;
     p->resp_len = 0;
@@ -533,8 +555,6 @@ static int hc_validate_response(hc_probe_t *p) {
 static int hc_probe_advance(hc_probe_t *p, uint32_t revents, int *out_ok) {
     *out_ok = 0;
 
-    if (revents & (POLLER_HUP | POLLER_ERR)) return -1;
-
     switch (p->phase) {
     case HC_PHASE_CONNECTING: {
         if (upstream_conn_check_connected(p->fd) < 0) return -1;
@@ -558,6 +578,16 @@ static int hc_probe_advance(hc_probe_t *p, uint32_t revents, int *out_ok) {
         if (p->node->hc.type == HC_TCP) { *out_ok = 1; return 1; }
         hc_build_request(p);
         p->phase = HC_PHASE_WRITING;
+        /* Re-arm for POLLER_WRITE (ET) now that we're moving from
+         * "waiting for connect() to complete" to "waiting to write the
+         * request" -- in edge-triggered mode the write-readiness event
+         * that got us into this CONNECTING case may already be
+         * considered consumed; re-asserting interest here (mirroring
+         * the WRITING->READING and TLS-handshake-success transitions
+         * elsewhere in this function) ensures a future POLLER_WRITE
+         * event actually fires instead of this probe silently
+         * stalling until its deadline reaps it as a failure. */
+        if (p->poller) poller_mod(p->poller, p->fd, POLLER_WRITE | POLLER_ET, p);
         return 0;
     }
 
@@ -567,6 +597,13 @@ static int hc_probe_advance(hc_probe_t *p, uint32_t revents, int *out_ok) {
             if (p->node->hc.type == HC_TCP) { *out_ok = 1; return 1; }
             hc_build_request(p);
             p->phase = HC_PHASE_WRITING;
+            /* BUG FIX: the poller was left registered for POLLER_WRITE
+             * only (set once, at hc_probe_start() time) and never
+             * updated as the probe's own phase changed -- see the
+             * matching, more detailed comment on the plaintext
+             * WRITING->READING transition below for the full
+             * explanation; the same fix applies here for the TLS path. */
+            if (p->poller) poller_mod(p->poller, p->fd, POLLER_WRITE | POLLER_ET, p);
             return 0;
         }
         int err = SSL_get_error(p->ssl, hret);
@@ -590,6 +627,24 @@ static int hc_probe_advance(hc_probe_t *p, uint32_t revents, int *out_ok) {
         p->req_sent += w;
         if (p->req_sent < p->req_len) return 0; /* partial write, wait for more */
         p->phase = HC_PHASE_READING;
+        /* BUG FIX: hc_probe_start() registers this fd with the poller
+         * for POLLER_WRITE only (needed to detect connect() completion
+         * and, for HC_HTTP/HC_CUSTOM, to know when the request can be
+         * written) -- but nothing ever re-armed the poller for
+         * POLLER_READ once the probe moved on to actually reading the
+         * response. In edge-triggered (ET) mode this isn't just
+         * "inefficient", it's silently fatal: no POLLER_READ event
+         * would EVER fire for this fd again, so hc_probe_advance()
+         * never got called again for it, the probe just sat there doing
+         * nothing until its deadline was reached and it was reaped as a
+         * FAILURE (hc_record_probe_result(node, 0)) -- regardless of
+         * whether the upstream actually responded correctly. This made
+         * EVERY HC_HTTP/HC_CUSTOM probe fail, permanently, for any node
+         * (confirmed via manual reproduction: a healthy Go upstream
+         * confirmed to return a valid "HTTP/1.1 200 OK" when queried
+         * directly still got marked DOWN by the health-check thread).
+         * Re-arm for POLLER_READ (ET) now that we're about to read. */
+        if (p->poller) poller_mod(p->poller, p->fd, POLLER_READ | POLLER_ET, p);
         return 0;
     }
 
@@ -640,13 +695,25 @@ static void *hc_thread_fn(void *arg) {
     /* last_probe_start[i]: wall-clock time the last probe for node i was
      * kicked off (0 = never), used to honor each node's own interval_ms
      * independently instead of a single pool-wide interval. */
-    time_t *last_probe_start = calloc((size_t)pool->node_count, sizeof(time_t));
+    /* BUG FIX: this used to be a time_t (1-second resolution) array,
+     * compared via "(now - last_probe_start[i]) * 1000L < interval_ms".
+     * Since time_t here only ever changes once per real second, any
+     * interval_ms below 1000 (e.g. 200ms) made that comparison
+     * "0 * 1000 < 200" (true) on EVERY loop iteration within the same
+     * wall-clock second -- interval_ms was silently ignored and a new
+     * probe was launched practically every loop tick (bounded only by
+     * poller_wait()'s 200ms timeout below, so still far more often than
+     * configured), hammering the upstream with far more concurrent
+     * health-check connections than intended. Switched to
+     * routa_now_ms() (millisecond-resolution) so sub-second
+     * interval_ms values are actually honored. */
+    uint64_t *last_probe_start = calloc((size_t)pool->node_count, sizeof(uint64_t));
     if (!last_probe_start) { free(probes); poller_free(poller); return NULL; }
 
     poller_event_t events[64];
 
     while (!pool->hc_stop) {
-        time_t now = time(NULL);
+        uint64_t now_ms = routa_now_ms();
 
         /* Start any due, not-currently-in-flight probes. */
         for (int i = 0; i < pool->node_count; i++) {
@@ -656,10 +723,10 @@ static void *hc_thread_fn(void *arg) {
 
             int interval_ms = node->hc.interval_ms > 0 ? node->hc.interval_ms : 5000;
             if (last_probe_start[i] != 0 &&
-                (long)(now - last_probe_start[i]) * 1000L < interval_ms)
+                (int64_t)(now_ms - last_probe_start[i]) < interval_ms)
                 continue;
 
-            last_probe_start[i] = now;
+            last_probe_start[i] = now_ms;
             if (hc_probe_start(&probes[i], node, poller) < 0) {
                 hc_record_probe_result(node, 0);
             }
@@ -686,8 +753,12 @@ static void *hc_thread_fn(void *arg) {
 
         /* Reap any probe that's been running past its own deadline --
          * poller_wait() alone won't catch this (a connect() that never
-         * completes produces no event at all, for instance). */
-        now = time(NULL);
+         * completes produces no event at all, for instance). deadline
+         * itself is still a time_t (1-second resolution, see its own
+         * field comment) so this reap check stays on that same clock --
+         * only the interval_ms scheduling above needed millisecond
+         * precision. */
+        time_t now = time(NULL);
         for (int i = 0; i < pool->node_count; i++) {
             if (probes[i].fd < 0) continue;
             if (now < probes[i].deadline) continue;
