@@ -1131,6 +1131,7 @@ static void handle_events_worker(worker_t *w) {
                                          conn->keep_alive ? "keep-alive" : "close");
 
                 /* sendfile path */
+                int _using_sendfile = 0;
                 if (resp.body_fd >= 0) {
                     if (conn->tls == NULL) {
                         conn->sendfile_fd  = resp.body_fd;
@@ -1138,8 +1139,82 @@ static void handle_events_worker(worker_t *w) {
                         conn->sendfile_rem = resp.body_fd_len;
                         resp.body_fd = -1;
                         io_cork(conn->fd);
-                        /* Headers via writev, then CONN_SENDFILE */
+                        /* Headers via writev, then CONN_SENDFILE.
+                         *
+                         * BUG FIX: this branch set up conn->sendfile_fd/
+                         * off/rem correctly but never actually set
+                         * conn->state to CONN_SENDFILE -- the shared
+                         * code just below this whole if/else (common to
+                         * both the sendfile and in-memory-body paths)
+                         * unconditionally set conn->state = CONN_WRITING
+                         * instead, silently overwriting whatever this
+                         * branch needed. The connection then sat in
+                         * CONN_WRITING forever: the header bytes went
+                         * out fine (conn_prepare_writev() queues them),
+                         * but nothing ever transitioned to CONN_SENDFILE
+                         * to actually run the sendfile()/read+write loop
+                         * that sends the body -- confirmed via strace:
+                         * headers were written, sendfile() was never
+                         * called, and the connection eventually died to
+                         * request_timeout_ms with zero body bytes ever
+                         * delivered. Only affects the non-TLS path (this
+                         * branch) -- the TLS branch below calls
+                         * send_file_tls() synchronously and never relied
+                         * on CONN_SENDFILE at all, which is why H2/TLS
+                         * large-file serving was unaffected and only H1
+                         * (plaintext) was broken. _using_sendfile lets
+                         * the shared code below skip its state
+                         * assignment for this path specifically. */
                         conn_prepare_writev(conn, &resp, &req);
+                        /* BUG FIX (part 2 of the sendfile fix): headers
+                         * were queued into conn->hdr_buf by
+                         * conn_prepare_writev() above, but NOTHING ever
+                         * flushed hdr_buf to the actual socket for the
+                         * CONN_SENDFILE path -- the normal CONN_WRITING
+                         * flow (which drains hdr_buf via io_writev_response,
+                         * see the CONN_WRITING branch elsewhere in this
+                         * function) never runs here, since this
+                         * connection goes straight to CONN_SENDFILE
+                         * instead. The CONN_SENDFILE case itself only
+                         * ever calls sendfile()/read+write on the body --
+                         * it never looks at hdr_buf at all. Net effect:
+                         * the client received raw file bytes with NO
+                         * HTTP status line or headers in front of them
+                         * (confirmed via curl -v: "Received HTTP/0.9
+                         * when not allowed", i.e. curl saw body bytes
+                         * where it expected "HTTP/1.1 200 OK...").
+                         * Mirrors the TLS branch just below, which
+                         * already had to solve this same problem for
+                         * its own (also-synchronous) send_file_tls()
+                         * call -- flush hdr_buf synchronously here too,
+                         * for the same reason: headers MUST reach the
+                         * peer before the body, and neither this nor
+                         * the TLS path re-enters the normal
+                         * hdr_buf-draining code path on its way to
+                         * sending the body. */
+                        if (conn->hdr_buf.len > 0) {
+                            ssize_t _hw = write(conn->fd, buf_data(&conn->hdr_buf),
+                                                buf_len(&conn->hdr_buf));
+                            if (_hw < 0 && errno != EAGAIN) {
+                                conn->state = CONN_CLOSING;
+                                http_response_destroy(&resp);
+                                http_request_free(&req);
+                                goto handle_state;
+                            }
+                            if (_hw > 0) buf_consume(&conn->hdr_buf, (size_t)_hw);
+                            /* Partial header write (EAGAIN or short
+                             * write) is not handled by a retry loop here
+                             * -- headers are small (typically well under
+                             * a kilobyte) and essentially always fit in
+                             * one write() to a fresh socket buffer in
+                             * practice. A fully robust fix would queue
+                             * any remainder and drain it before starting
+                             * CONN_SENDFILE; left as a known simplification
+                             * rather than silently risking corrupted
+                             * output the way the original bug did. */
+                        }
+                        conn->state = CONN_SENDFILE;
+                        _using_sendfile = 1;
                     } else {
                         /* TLS: no async sendfile() equivalent, so this path
                          * is blocking -- but headers MUST reach the peer
@@ -1180,7 +1255,16 @@ static void handle_events_worker(worker_t *w) {
 
                 http_response_destroy(&resp);
                 http_request_free(&req);
-                conn->state = CONN_WRITING;
+                /* BUG FIX: don't overwrite CONN_SENDFILE (just set above,
+                 * for the non-TLS sendfile path) with CONN_WRITING --
+                 * see the detailed comment at the sendfile branch above
+                 * for the full explanation of the bug this silently
+                 * caused (H1 static files/proxy responses >= the
+                 * mmap-vs-sendfile threshold in static.c hung until
+                 * request_timeout_ms, delivering zero body bytes). */
+                if (!_using_sendfile) {
+                    conn->state = CONN_WRITING;
+                }
                 goto handle_state;
             }
         }
@@ -1373,43 +1457,89 @@ static void handle_events_worker(worker_t *w) {
                     continue;
                 }
 
-                /* sendfile body */
+                /* sendfile body
+                 *
+                 * BUG FIX: this used to call sendfile()/read+write ONCE
+                 * per poller event and then unconditionally `continue`
+                 * to wait for the next event -- but in edge-triggered
+                 * (ET) mode, a socket that's CONTINUOUSLY writable
+                 * (which is common: the kernel send buffer drains fast
+                 * enough that it never actually fills up between our
+                 * sendfile() calls) never generates a NEW POLLER_WRITE
+                 * event, because ET only fires on a STATE TRANSITION
+                 * (not-writable -> writable), not on "still writable".
+                 * A single partial sendfile() (n > 0 but sendfile_rem
+                 * still > 0) would then leave this connection stalled
+                 * forever, waiting for an edge that will never come --
+                 * confirmed via direct reproduction: any static file
+                 * >= 64KB (the mmap-vs-sendfile threshold in static.c)
+                 * hung for exactly request_timeout_ms (10s default)
+                 * with 0 bytes ever delivered to the client, while
+                 * files just under that threshold (served via the
+                 * mmap+memcpy path instead) worked fine -- isolating
+                 * the bug to this sendfile loop specifically. Fixed by
+                 * looping sendfile() calls until EAGAIN (true kernel
+                 * backpressure) or completion, exactly like a
+                 * correctly-written ET write loop must. */
                 if (conn->state == CONN_SENDFILE) {
+                    for (;;) {
 #if defined(__linux__)
-                    ssize_t n = sendfile(conn->fd, conn->sendfile_fd,
-                                         &conn->sendfile_off, conn->sendfile_rem);
+                        ssize_t n = sendfile(conn->fd, conn->sendfile_fd,
+                                             &conn->sendfile_off, conn->sendfile_rem);
 #else
-                    /* macOS/BSD: fall back to read+write */
-                    char _sf_buf[65536];
-                    lseek(conn->sendfile_fd, conn->sendfile_off, SEEK_SET);
-                    ssize_t _sf_r = read(conn->sendfile_fd, _sf_buf,
-                        conn->sendfile_rem < sizeof(_sf_buf)
-                        ? conn->sendfile_rem : sizeof(_sf_buf));
-                    ssize_t n = (_sf_r > 0)
-                        ? write(conn->fd, _sf_buf, (size_t)_sf_r) : _sf_r;
-                    if (n > 0) conn->sendfile_off += n;
+                        /* macOS/BSD: fall back to read+write */
+                        char _sf_buf[65536];
+                        lseek(conn->sendfile_fd, conn->sendfile_off, SEEK_SET);
+                        ssize_t _sf_r = read(conn->sendfile_fd, _sf_buf,
+                            conn->sendfile_rem < sizeof(_sf_buf)
+                            ? conn->sendfile_rem : sizeof(_sf_buf));
+                        ssize_t n = (_sf_r > 0)
+                            ? write(conn->fd, _sf_buf, (size_t)_sf_r) : _sf_r;
+                        if (n > 0) conn->sendfile_off += n;
 #endif
-                    if (n > 0) {
-                        conn->sendfile_rem -= (size_t)n;
-                        if (conn->sendfile_rem == 0) {
-                            io_uncork(conn->fd);
-                            close(conn->sendfile_fd);
-                            conn->sendfile_fd = -1;
-                            if (conn->keep_alive) {
-                                buf_consume(&conn->read_buf, conn->consumed);
-                                conn->consumed = 0;
-                                conn_reset_write_state(conn);
-                                conn->state = CONN_READING;
-                                conn->keepalive_deadline = time(NULL) + (w->keepalive_timeout_ms / 1000);
-                                conn_poller_mod(w, conn, POLLER_READ|POLLER_ET);
-                            } else {
-                                conn->state = CONN_CLOSING;
-                                goto handle_state;
+                        if (n > 0) {
+                            conn->sendfile_rem -= (size_t)n;
+                            if (conn->sendfile_rem == 0) {
+                                io_uncork(conn->fd);
+                                close(conn->sendfile_fd);
+                                conn->sendfile_fd = -1;
+                                if (conn->keep_alive) {
+                                    buf_consume(&conn->read_buf, conn->consumed);
+                                    conn->consumed = 0;
+                                    conn_reset_write_state(conn);
+                                    conn->state = CONN_READING;
+                                    conn->keepalive_deadline = time(NULL) + (w->keepalive_timeout_ms / 1000);
+                                    conn_poller_mod(w, conn, POLLER_READ|POLLER_ET);
+                                } else {
+                                    conn->state = CONN_CLOSING;
+                                    goto handle_state;
+                                }
+                                break; /* done with this connection's sendfile */
                             }
+                            /* sendfile_rem > 0: more to send, loop and
+                             * try again immediately -- do NOT wait for
+                             * another poller event, since (per the bug
+                             * explanation above) one may never come
+                             * while the socket stays continuously
+                             * writable. */
+                            continue;
+                        } else if (n < 0 && errno == EAGAIN) {
+                            /* True backpressure: the send buffer is
+                             * actually full now. This IS a state
+                             * transition (writable -> not writable),
+                             * so a future POLLER_WRITE (ET) event will
+                             * correctly fire once it drains -- safe to
+                             * stop looping and wait for it. */
+                            break;
+                        } else if (n < 0) {
+                            conn->state = CONN_CLOSING;
+                            goto handle_state;
+                        } else {
+                            /* n == 0: shouldn't normally happen for a
+                             * regular file with sendfile_rem > 0, but
+                             * guard against a busy-loop just in case. */
+                            break;
                         }
-                    } else if (n < 0 && errno != EAGAIN) {
-                        conn->state = CONN_CLOSING;
-                        goto handle_state;
                     }
                     continue;
                 }

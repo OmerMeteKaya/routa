@@ -827,21 +827,70 @@ static void flush_pending(h2_conn_t *hc, h2_stream_t *s) {
         stream_remove(hc, s->id);
     }
 }
+/* BUG FIX (H2 stall investigation): this used to iterate hc->streams.pool
+ * (or .map) directly by index while calling flush_pending() -- but
+ * flush_pending() can, on completing a stream, call stream_remove() on
+ * it, which for the LINEAR/pool backend does a swap-with-last removal
+ * (pool_remove(): the struct at the last live index is copied down into
+ * the just-removed index to keep the array packed) and for the HASHMAP
+ * backend does a backward-shift deletion (map_remove()) -- both mutate
+ * the very container this loop is walking, out from under it, mid-sweep.
+ * Concretely (pool backend): if stream at index i finishes and gets
+ * removed, the stream that was previously at the LAST index (which this
+ * forward loop hasn't visited yet this pass) gets moved down into index
+ * i -- an index the loop already passed. The loop's `i < count` bound
+ * (re-read fresh each iteration, so it correctly shrinks) still lets it
+ * finish "normally", but it silently never revisits index i again this
+ * pass, so the just-moved-in stream's still-pending data (if any) never
+ * gets a flush_pending() call this sweep. If that stream has no other
+ * pending per-stream WINDOW_UPDATE incoming (the client, from its own
+ * point of view, is just waiting on bytes it already granted window
+ * for), NOTHING ever revisits it again -- confirmed live: with >=2
+ * concurrent large-file streams sharing one connection's flow-control
+ * window, this reliably (if intermittently -- exact timing-dependent)
+ * left a stream permanently stuck in H2_STREAM_HALF_CLOSED_REMOTE with
+ * unflushed pending_data/pending_body_fd: routa_h2_active_streams stayed
+ * elevated forever, with zero GOAWAY, zero protocol error, and (proving
+ * flush_pending() was never even CALLED for the stuck stream, as
+ * opposed to being called and stalling again inside it) zero hits on
+ * debug instrumentation placed inside every one of flush_pending()'s own
+ * `win <= 0` branches.
+ *
+ * Fix: snapshot every candidate stream's ID into a fixed-size array
+ * FIRST, while the container is still untouched, then re-look-up each
+ * ID (via the backend-agnostic stream_find()) and flush it. A stream
+ * that closes and is removed mid-sweep by an earlier flush_pending()
+ * call simply won't be found on its later turn (stream_find() returns
+ * NULL for a closed/removed ID) and is skipped safely -- no
+ * already-queued-but-not-yet-visited stream can ever be silently
+ * dropped, because the ID list itself doesn't change once captured,
+ * regardless of how the underlying pool/map array gets shuffled by
+ * removals during the sweep. */
 void h2_conn_flush_pending(h2_conn_t *hc) {
     if (!hc || hc->send_window <= 0) return;
+
+    uint32_t ids[H2_MAX_STREAMS];
+    int      n_ids = 0;
+
     if (hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR) {
-        for (int i = 0; i < hc->streams.pool.count; i++) {
+        for (int i = 0; i < hc->streams.pool.count && n_ids < H2_MAX_STREAMS; i++) {
             h2_stream_t *s = &hc->streams.pool.slots[i];
             if (s->pending_data.len > s->pending_offset || s->pending_body_fd >= 0)
-                flush_pending(hc, s);
+                ids[n_ids++] = s->id;
         }
     } else {
-        for (int i = 0; i < hc->streams.map.capacity; i++) {
+        for (int i = 0; i < hc->streams.map.capacity && n_ids < H2_MAX_STREAMS; i++) {
             if (!hc->streams.map.keys[i]) continue;
             h2_stream_t *s = hc->streams.map.buckets[i];
             if (s->pending_data.len > s->pending_offset || s->pending_body_fd >= 0)
-                flush_pending(hc, s);
+                ids[n_ids++] = s->id;
         }
+    }
+
+    for (int i = 0; i < n_ids; i++) {
+        h2_stream_t *s = stream_find(hc, ids[i]);
+        if (s && (s->pending_data.len > s->pending_offset || s->pending_body_fd >= 0))
+            flush_pending(hc, s);
     }
 }
 /* RFC 7540 5.1: a frame referencing a stream ID that has never been
@@ -936,20 +985,44 @@ static int handle_window_update(h2_conn_t *hc, const uint8_t *payload,
      * stalled forever even once the peer granted more flow-control
      * window (this was the actual root cause of large H2 responses
      * hanging indefinitely just past the write_buf soft limit). */
+    /* BUG FIX (H2 stall investigation): same sweep-vs-mutation bug as
+     * h2_conn_flush_pending() (see that function's doc comment for the
+     * full mechanism) -- this connection-level WINDOW_UPDATE branch is
+     * in fact the actual workhorse that was hitting it in practice: a
+     * multi-stream connection with a small shared connection-level
+     * send_window (H2_DEFAULT_WINDOW = 65535 bytes) stalls nearly every
+     * concurrent large-file stream almost immediately, and this sweep
+     * (triggered on every client WINDOW_UPDATE(stream=0) frame) is what
+     * drives ALL of their forward progress from then on -- making it the
+     * highest-traffic sweep site and the most likely to hit the
+     * skip-on-removal bug. Fixed the same way: snapshot stream IDs
+     * before flushing any of them, then re-look-up each by ID (safe
+     * against pool/hashmap mutation from an earlier flush_pending() call
+     * in this same loop removing a completed stream out from under a
+     * live index). */
     if (stream_id == 0) {
+        uint32_t ids[H2_MAX_STREAMS];
+        int      n_ids = 0;
+
         if (hc->lookup_mode == H2_STREAM_LOOKUP_LINEAR) {
-            for (int i = 0; i < hc->streams.pool.count; i++) {
+            for (int i = 0; i < hc->streams.pool.count && n_ids < H2_MAX_STREAMS; i++) {
                 h2_stream_t *ps = &hc->streams.pool.slots[i];
                 if (ps->pending_data.len > ps->pending_offset || ps->pending_body_fd >= 0)
-                    flush_pending(hc, ps);
+                    ids[n_ids++] = ps->id;
             }
         } else {
-            for (int i = 0; i < hc->streams.map.capacity; i++) {
+            for (int i = 0; i < hc->streams.map.capacity && n_ids < H2_MAX_STREAMS; i++) {
                 if (!hc->streams.map.keys[i]) continue;
                 h2_stream_t *ps = hc->streams.map.buckets[i];
                 if (ps->pending_data.len > ps->pending_offset || ps->pending_body_fd >= 0)
-                    flush_pending(hc, ps);
+                    ids[n_ids++] = ps->id;
             }
+        }
+
+        for (int i = 0; i < n_ids; i++) {
+            h2_stream_t *ps = stream_find(hc, ids[i]);
+            if (ps && (ps->pending_data.len > ps->pending_offset || ps->pending_body_fd >= 0))
+                flush_pending(hc, ps);
         }
     } else {
         h2_stream_t *ps = stream_find(hc, stream_id);
@@ -1932,11 +2005,22 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
          * completed and answered. */
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         int drc = dispatch_stream(hc, s, stream_id, router, chain);
-        if (hc->write_buf.len > 0) {
-            ssize_t wr = io_write_from_buf(hc->conn->fd,
-                                            &hc->write_buf,
-                                            hc->conn->tls);
-            (void)wr;
+        /* BUG FIX: this was a bare io_write_from_buf() call, which writes
+         * to the socket but -- unlike worker_conn_flush() -- never re-arms
+         * the connection's epoll registration for POLLER_WRITE if the
+         * write is partial (EAGAIN mid-buffer). Every other write_buf
+         * flush site in this file (flush_pending(), handle_window_update(),
+         * send_response()'s soft-limit checks) already learned this lesson
+         * and uses worker_conn_flush() instead -- this trailers-dispatch
+         * site was the one place that still didn't, so a response queued
+         * here (post-dispatch_stream()) that didn't fit in one write()
+         * call could sit in write_buf forever with nothing watching the
+         * socket for writability again. Especially likely for large
+         * (>=64KB-ish) H2 responses to trailers-bearing requests under any
+         * concurrency, since multiple streams sharing one connection's
+         * write_buf makes a full single-write flush far less reliable. */
+        if (hc->write_buf.len > 0 && hc->worker) {
+            worker_conn_flush((worker_t *)hc->worker, hc->conn);
         }
         if (drc == H2_DISPATCH_PROXY) return 0;
         return drc;
@@ -1983,11 +2067,19 @@ static int handle_headers(h2_conn_t *hc, uint32_t stream_id,
     if ((flags & H2_FLAG_END_STREAM) || is_connect_request) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         int drc = dispatch_stream(hc, s, stream_id, router, chain);
-        if (hc->write_buf.len > 0) {
-            ssize_t wr = io_write_from_buf(hc->conn->fd,
-                                            &hc->write_buf,
-                                            hc->conn->tls);
-            (void)wr;
+        /* BUG FIX: see the matching comment at the trailers-dispatch site
+         * above -- this was also a bare io_write_from_buf() call that
+         * silently dropped the poller re-arm on a partial write. This is
+         * the MAIN request-dispatch path (the common case for every
+         * ordinary H2 request), making it the primary suspect for
+         * intermittent large-response / high-concurrency H2 stalls: a
+         * response whose HEADERS+DATA frames didn't fit in a single
+         * write() here (very likely once several concurrent streams are
+         * all queuing into the same connection's write_buf) would leave
+         * its remaining bytes stuck in write_buf with no POLLER_WRITE
+         * interest registered to ever drain them. */
+        if (hc->write_buf.len > 0 && hc->worker) {
+            worker_conn_flush((worker_t *)hc->worker, hc->conn);
         }
         if (drc == H2_DISPATCH_PROXY) {
             return 0;  /* stream kept alive; upstream response will close it */
@@ -2064,11 +2156,19 @@ static int handle_continuation(h2_conn_t *hc, uint32_t stream_id,
         /* FIX: match handle_headers pending_data pattern                */
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         int drc = dispatch_stream(hc, s, stream_id, router, chain);
-        if (hc->write_buf.len > 0) {
-            ssize_t wr = io_write_from_buf(hc->conn->fd,
-                                            &hc->write_buf,
-                                            hc->conn->tls);
-            (void)wr;  /* partial flush OK — remainder handled by POLLER_WRITE */
+        /* BUG FIX: the old comment here ("partial flush OK -- remainder
+         * handled by POLLER_WRITE") was wrong -- a bare io_write_from_buf()
+         * call does NOT re-arm POLLER_WRITE on a partial write, it only
+         * writes to whatever the socket's CURRENT poller registration
+         * already covers. If this connection wasn't already registered
+         * for POLLER_WRITE at this exact moment, a partial write here left
+         * the remainder of write_buf stuck with nothing ever watching the
+         * socket for writability again -- see the matching fix (and
+         * fuller explanation) at the other two dispatch_stream() call
+         * sites in this file. worker_conn_flush() correctly re-arms the
+         * poller when needed. */
+        if (hc->write_buf.len > 0 && hc->worker) {
+            worker_conn_flush((worker_t *)hc->worker, hc->conn);
         }
         if (drc == H2_DISPATCH_PROXY) {
             return 0;  /* stream kept alive; upstream response will close it */
@@ -2291,6 +2391,24 @@ static int handle_data(h2_conn_t *hc, uint32_t stream_id,
     if (flags & H2_FLAG_END_STREAM) {
         s->state = H2_STREAM_HALF_CLOSED_REMOTE;
         int drc = dispatch_stream(hc, s, stream_id, router, chain);
+        /* BUG FIX: this call site had NO flush at all after
+         * dispatch_stream() -- not even a bare io_write_from_buf(), let
+         * alone worker_conn_flush(). dispatch_stream() -> send_response()
+         * queues the HEADERS+DATA frames of the reply into hc->write_buf,
+         * but nothing here ever wrote that buffer to the socket or armed
+         * POLLER_WRITE for it. This is the DATA-frame (request-body-
+         * bearing, e.g. POST) completion path -- the GET-only benchmark
+         * that surfaced the other three sites in handle_headers() never
+         * exercises this one, but any request with a body ending on a
+         * DATA frame's END_STREAM would have its response left sitting
+         * unsent in write_buf, relying entirely on some unrelated later
+         * event on the same connection to incidentally flush it (or
+         * never, if none came before the client's own timeout). Mirrors
+         * the same fix applied to the three dispatch_stream() call sites
+         * in handle_headers(). */
+        if (hc->write_buf.len > 0 && hc->worker) {
+            worker_conn_flush((worker_t *)hc->worker, hc->conn);
+        }
         if (drc == H2_DISPATCH_PROXY) {
             return 0;  /* stream kept alive; upstream response will close it */
         }

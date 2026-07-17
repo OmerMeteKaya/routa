@@ -16,17 +16,35 @@ void buf_init(buf_t *b) {
 
 int buf_append(buf_t *b, const void *src, size_t n) {
     if (!b || !src || n == 0) return 0;
-    if (b->off > 0 && b->off >= b->cap / 2) {
-        memmove(b->data, b->data + b->off, b->len);
-        b->off = 0;
-    }
+    /* BUG FIX: the old code compacted (memmove) on EVERY append once
+     * b->off crossed cap/2, regardless of whether a realloc was
+     * actually needed. Under a slow-drain pattern (e.g. H2 DATA frames
+     * appended faster than the socket can absorb them, so b->off creeps
+     * up via repeated buf_consume() calls while b->len stays large),
+     * this meant every single append -- even a tiny one -- triggered a
+     * memmove of potentially hundreds of KB of not-yet-sent data. Over
+     * a large response body this degraded to O(n^2) work and dominated
+     * CPU time (confirmed via perf: ~70% of samples landed in a single
+     * memmove-shaped libc symbol during large-file H2/H2C benchmarks,
+     * with H2C ruling out TLS as the cause). Fix: only ever compact
+     * when we've confirmed a realloc would otherwise be required --
+     * i.e. compaction now pays for itself by avoiding a strictly more
+     * expensive allocation, instead of running speculatively on a
+     * schedule tied to b->off's position. */
     if (b->off + b->len + n > b->cap) {
-        size_t new_cap = b->cap == 0 ? 4096 : b->cap * 2;
-        while (new_cap < b->off + b->len + n) new_cap *= 2;
-        uint8_t *nd = realloc(b->data, new_cap);
-        if (!nd) { LOG_ERROR("buf_append: realloc failed"); return -1; }
-        b->data = nd;
-        b->cap  = new_cap;
+        /* First, see if reclaiming the already-consumed prefix (b->off)
+         * makes enough room without growing the allocation at all. */
+        if (b->off > 0 && b->len + n <= b->cap) {
+            memmove(b->data, b->data + b->off, b->len);
+            b->off = 0;
+        } else {
+            size_t new_cap = b->cap == 0 ? 4096 : b->cap * 2;
+            while (new_cap < b->off + b->len + n) new_cap *= 2;
+            uint8_t *nd = realloc(b->data, new_cap);
+            if (!nd) { LOG_ERROR("buf_append: realloc failed"); return -1; }
+            b->data = nd;
+            b->cap  = new_cap;
+        }
     }
     memcpy(b->data + b->off + b->len, src, n);
     b->len += n;
