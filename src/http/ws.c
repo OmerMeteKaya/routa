@@ -367,6 +367,28 @@ int ws_handshake(conn_t *conn, const http_request_t *req,
     buf_append_str(out, "Connection: Upgrade\r\n");
     buf_append_str(out, "Sec-WebSocket-Accept: ");
     buf_append_str(out, accept);
+    /* BUG FIX: the \r\n terminating THIS header line was missing --
+     * previously, if pmd_ok was false (no permessage-deflate extension
+     * negotiated, the common case), execution fell straight through to
+     * the single buf_append_str(out, "\r\n") below intended as the
+     * header-block terminator (the blank line separating headers from
+     * body per RFC 7230 3), so the Sec-WebSocket-Accept line and the
+     * header-block terminator collapsed into ONE \r\n instead of two.
+     * The response was therefore never terminated by the required blank
+     * line at all -- confirmed via a raw socket capture: the server sent
+     * exactly "...Sec-WebSocket-Accept: <value>\r\n" (127 bytes) and
+     * then nothing further, an HTTP response with no blank line ever
+     * closing its header block. Every WS client that (correctly, per
+     * RFC 7230) waits for \r\n\r\n before treating the handshake
+     * response as complete -- including this codebase's own Go
+     * benchmarking client (configs/bench_ws_client.go) -- hung forever
+     * waiting for header-terminator bytes that were never coming. Only
+     * masked by pmd_ok's branch happening to append its own trailing
+     * "\r\n" (ws.c below) in the permessage-deflate case, which
+     * incidentally supplied the missing terminator for THAT header line
+     * -- so the bug was invisible whenever a client negotiated PMD, and
+     * only manifested for the (default, no-PMD) common case. */
+    buf_append_str(out, "\r\n");
     if (pmd_ok) {
         char pmd_hdr[256];
         pmd_response_header(pmd_hdr, sizeof(pmd_hdr), srv_no_ctx, cli_no_ctx);

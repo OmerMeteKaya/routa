@@ -31,6 +31,91 @@ static int hex_val(char c) {
     return c - 'a' + 10;
 }
 
+/* RFC 9110 5.6.2 token characters — header field names are tokens: no
+ * spaces, no separators, no control characters. */
+static int is_tchar(char c) {
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+        return 1;
+    switch (c) {
+        case '!': case '#': case '$': case '%': case '&': case '\'':
+        case '*': case '+': case '-': case '.': case '^': case '_':
+        case '`': case '|': case '~':
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* Decode an RFC 9112 6.1 chunked message body from [data, data+avail).
+ * Returns 0 on success (*out_body/*out_len/*out_consumed set, *out_consumed
+ * is the number of bytes from `data` consumed including the terminating
+ * chunk and any (discarded) trailer section), 1 if more data is needed,
+ * -1 on malformed chunked syntax. On 1 or -1, *out_body is freed/NULL. */
+static int decode_chunked_body(const char *data, size_t avail,
+                                char **out_body, size_t *out_len,
+                                size_t *out_consumed) {
+    char  *body     = NULL;
+    size_t body_len = 0;
+    size_t pos      = 0;
+
+    *out_body = NULL;
+    *out_len  = 0;
+
+    for (;;) {
+        /* find CRLF terminating the chunk-size line */
+        const char *line_end = NULL;
+        for (size_t k = pos; k + 1 < avail; k++) {
+            if (data[k] == '\r' && data[k+1] == '\n') { line_end = data + k; break; }
+        }
+        if (!line_end) { free(body); return 1; }
+
+        size_t line_len = (size_t)(line_end - (data + pos));
+        size_t sz = 0, hexlen = 0;
+        for (size_t k = 0; k < line_len; k++) {
+            char c = data[pos + k];
+            if (c == ';') break;               /* chunk-extension — ignored */
+            if (!is_hex(c)) { free(body); return -1; }
+            if (hexlen >= 16) { free(body); return -1; }  /* would overflow */
+            sz = (sz << 4) | (size_t)hex_val(c);
+            hexlen++;
+        }
+        if (hexlen == 0) { free(body); return -1; }  /* empty chunk-size token */
+
+        pos = (size_t)(line_end - data) + 2;
+
+        if (sz == 0) {
+            /* last-chunk: consume (and discard) the trailer section up to
+             * the terminating blank line */
+            for (;;) {
+                const char *t_end = NULL;
+                for (size_t k = pos; k + 1 < avail; k++) {
+                    if (data[k] == '\r' && data[k+1] == '\n') { t_end = data + k; break; }
+                }
+                if (!t_end) { free(body); return 1; }
+                size_t t_len = (size_t)(t_end - (data + pos));
+                pos = (size_t)(t_end - data) + 2;
+                if (t_len == 0) break;  /* empty line — end of trailers */
+            }
+            *out_body     = body;
+            *out_len      = body_len;
+            *out_consumed = pos;
+            return 0;
+        }
+
+        if (avail - pos < sz + 2) { free(body); return 1; }        /* incomplete */
+        if (data[pos + sz] != '\r' || data[pos + sz + 1] != '\n') { /* RFC 9112 6.1: chunk-data must be followed by CRLF */
+            free(body); return -1;
+        }
+
+        char *nb = realloc(body, body_len + sz);
+        if (!nb) { free(body); return -1; }
+        body = nb;
+        memcpy(body + body_len, data + pos, sz);
+        body_len += sz;
+        pos += sz + 2;
+    }
+}
+
 static char *url_decode(const char *src, size_t len) {
     char *out = malloc(len + 1);
     if (!out) return NULL;
@@ -228,6 +313,14 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
     req->version_major = (int)strtol(rl + vs, NULL, 10);
     req->version_minor = (int)strtol(dot + 1, NULL, 10);
 
+    /* Only HTTP/1.0 and HTTP/1.1 are handled on this parser (HTTP/2.0
+     * arrives via the h2c preface / Upgrade path, never here as a
+     * regular request line). */
+    if (req->version_major != 1 ||
+        (req->version_minor != 0 && req->version_minor != 1)) {
+        ret = -1; goto done;
+    }
+
     /* ---- headers ---- */
     char *hp = rl_end + 2; /* skip first \r\n */
     while (hp < hdr_end) {
@@ -238,21 +331,38 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
         if (req->header_count >= 64) { ret = -1; goto done; }
 
         size_t hl_len = (size_t)(le - hl);
-        char *colon   = memchr(hl, ':', hl_len);
-        if (colon) {
-            size_t klen = (size_t)(colon - hl);
-            size_t vi   = klen + 1;
-            while (vi < hl_len && (hl[vi] == ' ' || hl[vi] == '\t')) vi++;
-            size_t vlen = hl_len - vi;
 
-            req->headers[req->header_count].key   = strndup(hl, klen);
-            req->headers[req->header_count].value = strndup(hl + vi, vlen);
-            if (!req->headers[req->header_count].key ||
-                !req->headers[req->header_count].value) {
-                ret = -1; goto done;
-            }
-            req->header_count++;
+        /* Obsolete line folding (RFC 9112 5.2): a continuation line begins
+         * with SP/HTAB. This is a request-smuggling vector — reject it
+         * rather than silently treating it as a fold or dropping it. */
+        if (hl_len > 0 && (hl[0] == ' ' || hl[0] == '\t')) { ret = -1; goto done; }
+
+        /* NUL byte anywhere in the header line is never valid. */
+        if (memchr(hl, '\0', hl_len) != NULL) { ret = -1; goto done; }
+
+        char *colon = memchr(hl, ':', hl_len);
+        if (!colon) { ret = -1; goto done; } /* malformed header line */
+
+        size_t klen = (size_t)(colon - hl);
+        /* Header field names are tokens (RFC 9110 5.6.2) — no whitespace,
+         * no separators. This also rejects "Foo : bar" (space before the
+         * colon becomes part of the "name"). */
+        if (klen == 0) { ret = -1; goto done; }
+        for (size_t k = 0; k < klen; k++) {
+            if (!is_tchar(hl[k])) { ret = -1; goto done; }
         }
+
+        size_t vi   = klen + 1;
+        while (vi < hl_len && (hl[vi] == ' ' || hl[vi] == '\t')) vi++;
+        size_t vlen = hl_len - vi;
+
+        req->headers[req->header_count].key   = strndup(hl, klen);
+        req->headers[req->header_count].value = strndup(hl + vi, vlen);
+        if (!req->headers[req->header_count].key ||
+            !req->headers[req->header_count].value) {
+            ret = -1; goto done;
+        }
+        req->header_count++;
         hp = le + 2;
 
     }
@@ -265,10 +375,74 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
         req->keep_alive = (conn && strcasecmp(conn, "keep-alive") == 0);
     }
 
-    /* ---- body ---- */
+    /* ---- Host header (RFC 9112 3.2): mandatory on HTTP/1.1, duplicates
+     * and invalid values (embedded whitespace) are request-smuggling
+     * adjacent — some intermediaries pick the first, some the last. ---- */
+    {
+        int host_count = 0;
+        const char *host_val = NULL;
+        for (int hi = 0; hi < req->header_count; hi++) {
+            if (strcasecmp(req->headers[hi].key, "Host") == 0) {
+                host_count++;
+                if (!host_val) host_val = req->headers[hi].value;
+            }
+        }
+        if (req->version_major == 1 && req->version_minor == 1 && host_count == 0) {
+            ret = -1; goto done;
+        }
+        if (host_count > 1) { ret = -1; goto done; }
+        if (host_val) {
+            for (const unsigned char *p = (const unsigned char *)host_val; *p; p++) {
+                if (*p <= 0x20 || *p == 0x7f) { ret = -1; goto done; }
+            }
+        }
+    }
+
+    /* ---- Transfer-Encoding / Content-Length (RFC 9112 6.1, 6.3) ----
+     * Both present together, or an unrecognized/non-final transfer-coding,
+     * are request-smuggling vectors — reject outright rather than guess
+     * which framing an intermediary would have honored. */
+    const char *te_str = http_request_get_header(req, "Transfer-Encoding");
     const char *cl_str = http_request_get_header(req, "Content-Length");
-    size_t content_length = 0;
+    int te_chunked = 0;
+
+    if (te_str) {
+        const char *v = te_str;
+        while (*v == ' ' || *v == '\t') v++;
+        size_t vlen = strlen(v);
+        while (vlen > 0 && (v[vlen-1] == ' ' || v[vlen-1] == '\t')) vlen--;
+        if (vlen == 7 && strncasecmp(v, "chunked", 7) == 0) {
+            te_chunked = 1;
+        } else {
+            /* Unknown coding, or "chunked" isn't the final (and only)
+             * coding (e.g. "chunked, gzip") — RFC 9112 6.1 requires
+             * chunked be the final transfer-coding when present. */
+            ret = -1; goto done;
+        }
+    }
+
+    if (te_chunked && cl_str) { ret = -1; goto done; } /* smuggling vector */
+
+    if (te_chunked && !(req->version_major == 1 && req->version_minor == 1)) {
+        ret = -1; goto done; /* chunked is undefined for HTTP/1.0 */
+    }
+
+    /* Reject conflicting duplicate Content-Length headers (RFC 9112 6.1) —
+     * all instances must agree, or the request must be rejected. */
     if (cl_str) {
+        const char *first_cl = NULL;
+        for (int hi = 0; hi < req->header_count; hi++) {
+            if (strcasecmp(req->headers[hi].key, "Content-Length") == 0) {
+                if (!first_cl) first_cl = req->headers[hi].value;
+                else if (strcmp(first_cl, req->headers[hi].value) != 0) {
+                    ret = -1; goto done;
+                }
+            }
+        }
+    }
+
+    size_t content_length = 0;
+    if (cl_str && !te_chunked) {
         /* Reject negative or non-numeric Content-Length                  */
         const char *p = cl_str;
         while (*p == ' ') p++;
@@ -281,16 +455,29 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
     size_t body_start     = headers_len;
     size_t available      = buf->len > body_start ? buf->len - body_start : 0;
 
-    if (content_length > 0) {
-        if (available < content_length) goto done; /* incomplete */
-        req->body = malloc(content_length);
-        if (!req->body) { ret = -1; goto done; }
-        memcpy(req->body, buf_data(buf) + body_start, content_length);
-        req->body_len = content_length;
-        routa_metrics_record_bytes_received(content_length);
+    if (te_chunked) {
+        char *dec_body = NULL;
+        size_t dec_len = 0, dec_consumed = 0;
+        int dc = decode_chunked_body(data + body_start, available,
+                                      &dec_body, &dec_len, &dec_consumed);
+        if (dc == 1) goto done;          /* incomplete — need more data */
+        if (dc == -1) { ret = -1; goto done; } /* malformed chunked body */
+        req->body     = dec_body;
+        req->body_len = dec_len;
+        if (dec_len > 0) routa_metrics_record_bytes_received(dec_len);
+        *consumed = body_start + dec_consumed;
+    } else {
+        if (content_length > 0) {
+            if (available < content_length) goto done; /* incomplete */
+            req->body = malloc(content_length);
+            if (!req->body) { ret = -1; goto done; }
+            memcpy(req->body, buf_data(buf) + body_start, content_length);
+            req->body_len = content_length;
+            routa_metrics_record_bytes_received(content_length);
+        }
+        *consumed = body_start + content_length;
     }
     req->headers_owned = 1;
-    *consumed = body_start + content_length;
 
     /* ── Observability: trace ID + request start timestamp ── */
     {

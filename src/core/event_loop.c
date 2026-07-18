@@ -900,7 +900,43 @@ static void handle_events_worker(worker_t *w) {
             size_t consumed = 0;
             int pr = http_request_parse(&req, &conn->read_buf, &consumed);
 
-            if (pr == 1) continue;   /* incomplete */
+            if (pr == 1) {
+                /* RFC 9110 10.1.1: if the client sent "Expect: 100-continue"
+                 * and the header block has fully arrived but the body
+                 * hasn't, send the interim 100 Continue now so the client
+                 * (which is waiting for it before sending the body) isn't
+                 * left hanging. Done via a raw peek at the buffered bytes
+                 * rather than the parsed req, since http_request_parse()
+                 * frees req's fields before returning 1 (incomplete). */
+                if (!conn->expect_100_sent) {
+                    const char *rd  = (const char *)buf_data(&conn->read_buf);
+                    size_t      rdl = conn->read_buf.len;
+                    void *hdr_end = memmem(rd, rdl, "\r\n\r\n", 4);
+                    if (hdr_end) {
+                        size_t hdr_len = (size_t)((const char *)hdr_end - rd) + 4;
+                        char *hdrs = malloc(hdr_len + 1);
+                        if (hdrs) {
+                            memcpy(hdrs, rd, hdr_len);
+                            hdrs[hdr_len] = '\0';
+                            if (strcasestr(hdrs, "Expect:") &&
+                                strcasestr(hdrs, "100-continue")) {
+                                static const char cont100[] =
+                                    "HTTP/1.1 100 Continue\r\n\r\n";
+                                if (conn->tls) {
+                                    tls_write(conn->tls, cont100, sizeof(cont100) - 1);
+                                } else {
+                                    ssize_t __attribute__((unused)) wr =
+                                        write(conn->fd, cont100, sizeof(cont100) - 1);
+                                }
+                                conn->expect_100_sent = 1;
+                            }
+                            free(hdrs);
+                        }
+                    }
+                }
+                continue;   /* incomplete */
+            }
+            conn->expect_100_sent = 0;
             /* h2c — cleartext HTTP/2 direct connection (RFC 7540 §3.4)   */
             if (pr == -1 ) {
                 /* Peek: is this the H2 client preface?                   */

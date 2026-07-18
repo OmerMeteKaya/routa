@@ -107,6 +107,8 @@ typedef struct conn {
 
     uint8_t poller_mask;
     uint8_t from_slab; /* 1 = slab allocated, don't heap-free */
+    uint8_t expect_100_sent; /* 1 = interim 100 Continue already sent for
+                               * the request currently being read */
 } conn_t;
 
 /* ── Slab pool ──────────────────────────────────────────────────────────────

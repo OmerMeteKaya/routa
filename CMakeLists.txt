@@ -92,6 +92,18 @@ add_executable(routa src/main.c)
 target_link_libraries(routa PRIVATE routa_core)
 target_include_directories(routa PRIVATE include)
 
+# ── routa-orchestrate ─────────────────────────────────────────────────────
+# Standalone tool (NOT the routa binary itself): parses a multi-server
+# config (one or more [server NAME] blocks, see include/core/config_multi.h)
+# and generates a standalone single-server .conf per block plus a systemd
+# `routa@.service` template unit. routa's own core stays unaware that
+# "multiple servers" exists as a concept -- see src/tools/routa_orchestrate.c.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/routa_orchestrate.c")
+  add_executable(routa-orchestrate src/tools/routa_orchestrate.c)
+  target_link_libraries(routa-orchestrate PRIVATE routa_core)
+  target_include_directories(routa-orchestrate PRIVATE include)
+endif()
+
 # ── Examples ─────────────────────────────────────────────────────────────────
 foreach(example hello_world routa_bench_ws_server)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/${example}.c")
@@ -102,7 +114,7 @@ foreach(example hello_world routa_bench_ws_server)
 endforeach()
 
 # ── Tests ────────────────────────────────────────────────────────────────────
-foreach(test test_buf test_http1_request_parsing test_middleware_chain test_chunked test_file_cache test_ws test_config test_config_behavior test_h2_hpack test_h2 test_auth test_metrics test_metrics_behavior test_proxy_lb test_mw_acl test_mw_cors test_mw_compress test_mw_ratelimit)
+foreach(test test_buf test_http1_request_parsing test_middleware_chain test_chunked test_file_cache test_ws test_config test_config_behavior test_config_multiserver test_h2_hpack test_h2 test_auth test_metrics test_metrics_behavior test_proxy_lb test_mw_acl test_mw_cors test_mw_compress test_mw_ratelimit)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/${test}.c")
     add_executable(${test} tests/${test}.c)
     target_link_libraries(${test} PRIVATE routa_core)
@@ -226,6 +238,21 @@ set_tests_properties(test_config PROPERTIES LABELS "config")
 if(TARGET test_config_behavior)
   add_test(NAME test_config_behavior COMMAND test_config_behavior WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(test_config_behavior PROPERTIES LABELS "config")
+endif()
+
+if(TARGET test_config_multiserver)
+  add_test(NAME test_config_multiserver COMMAND test_config_multiserver WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(test_config_multiserver PROPERTIES LABELS "config")
+endif()
+
+# ── routa-orchestrate golden-output test (shell script: exercises the real
+# binary, diffs generated output against golden files, and runs
+# systemd-analyze verify on the generated unit if available) ──
+if(TARGET routa-orchestrate AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_orchestrate.sh")
+  add_test(NAME test_orchestrate
+           COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_orchestrate.sh $<TARGET_FILE:routa-orchestrate>
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(test_orchestrate PROPERTIES LABELS "config;orchestrate")
 endif()
 
 # ── compliance (file_cache correctness is part of serving-real-files

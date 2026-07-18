@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "../include/core/config.h"
+#include "../include/core/config_internal.h"
 #include "util/logger.h"
 #include "http/ws.h"
 #include <string.h>
@@ -414,10 +415,7 @@ static int parse_log_level(const char *val) {
  * resource_profile line is found or the file can't be read a second time
  * -- routa_config_load()'s own fopen() call right after this will
  * surface any real file-access error properly. */
-static void prescan_resource_profile(routa_config_t *cfg, const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-
+void prescan_resource_profile_stream(routa_config_t *cfg, FILE *f) {
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
         char *s = trim(line);
@@ -446,6 +444,16 @@ static void prescan_resource_profile(routa_config_t *cfg, const char *path) {
             break; /* only one resource_profile line is meaningful */
         }
     }
+}
+
+/* File-based wrapper around prescan_resource_profile_stream() -- see that
+ * function for the actual scan logic. Split out so routa_multi_config_load()
+ * (config_multi.c) can run the identical prescan against an in-memory
+ * [server NAME] block (via fmemopen()) without a real file on disk. */
+static void prescan_resource_profile(routa_config_t *cfg, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    prescan_resource_profile_stream(cfg, f);
     (void)fclose(f);
 }
 
@@ -491,13 +499,13 @@ static void handle_include_line(routa_config_t *cfg, const char *pattern,
     globfree(&g);
 }
 
-static int routa_config_parse_file(routa_config_t *cfg, const char *path, int depth) {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        LOG_ERROR("Cannot open config file: %s", path);
-        return -1;
-    }
-
+/* Parses an already-open stream line-by-line. `path` is used only for log
+ * messages (it need not correspond to a real file -- see
+ * routa_config_parse_file() below and routa_multi_config_load() in
+ * config_multi.c, which parses in-memory [server NAME] blocks via
+ * fmemopen() through this same entry point so a server block's syntax is
+ * handled by the exact same code as a normal standalone config file). */
+int routa_config_parse_stream(routa_config_t *cfg, FILE *f, const char *path, int depth) {
     char raw_line[1024];
     char line[1024];
     int lineno = 0;
@@ -1138,8 +1146,21 @@ static int routa_config_parse_file(routa_config_t *cfg, const char *path, int de
         }
     }
 
-    (void)fclose(f);
     return 0;
+}
+
+/* File-based wrapper around routa_config_parse_stream() -- opens `path` and
+ * closes it when done. This is the entry point used for every real file on
+ * disk (the top-level config, and every `include`d file, recursively). */
+static int routa_config_parse_file(routa_config_t *cfg, const char *path, int depth) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        LOG_ERROR("Cannot open config file: %s", path);
+        return -1;
+    }
+    int rc = routa_config_parse_stream(cfg, f, path, depth);
+    (void)fclose(f);
+    return rc;
 }
 
 int routa_config_load(routa_config_t *cfg, const char *path) {
