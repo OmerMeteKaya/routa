@@ -235,8 +235,14 @@ void upstream_node_set_state(upstream_node_t *node, node_state_t state) {
     node->state = state;
     if (state == NODE_DOWN && old != NODE_DOWN) {
         /* Freshly DOWN: start the half-open clock and clear any stale
-         * in-flight guard from a previous half-open cycle. */
-        node->down_since = time(NULL);
+         * in-flight guard from a previous half-open cycle. Millisecond
+         * CLOCK_MONOTONIC timestamp -- see down_since_ms's doc comment
+         * in upstream.h for why time_t's second resolution was wrong
+         * for this. */
+        struct timespec _ts;
+        clock_gettime(CLOCK_MONOTONIC, &_ts);
+        node->down_since_ms = (uint64_t)_ts.tv_sec * 1000ULL +
+                              (uint64_t)_ts.tv_nsec / 1000000ULL;
         node->half_open_probe_in_flight = 0;
         __atomic_fetch_add(&node->circuit_breaker_trips_total, 1, __ATOMIC_RELAXED);
     }
@@ -268,9 +274,12 @@ int upstream_node_is_selectable(upstream_node_t *node, upstream_pool_t *pool) {
     if (node->hc.type != HC_NONE) return 0;      /* hc thread owns recovery */
     if (pool->half_open_retry_after_ms <= 0) return 0; /* half-open disabled */
 
-    time_t now = time(NULL);
-    long elapsed_ms = (long)difftime(now, node->down_since) * 1000L;
-    if (elapsed_ms < pool->half_open_retry_after_ms) return 0;
+    struct timespec _now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &_now_ts);
+    uint64_t now_ms = (uint64_t)_now_ts.tv_sec * 1000ULL +
+                      (uint64_t)_now_ts.tv_nsec / 1000000ULL;
+    uint64_t elapsed_ms = now_ms - node->down_since_ms;
+    if (elapsed_ms < (uint64_t)pool->half_open_retry_after_ms) return 0;
 
     /* Try to win the trial slot -- only one caller may proceed. */
     uint32_t expected = 0;

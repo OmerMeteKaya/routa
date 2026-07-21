@@ -100,6 +100,7 @@ struct event_loop {
                                           * is also set -- see worker startup */
     int            keepalive_timeout_ms;
     int            request_timeout_ms;
+    size_t         max_request_size;   /* 0 = unlimited, from config */
     worker_t      *workers;
     tls_context_t *tls_ctx;
     lb_t          *lb;              /* legacy: == lbs[0] when lb_count > 0 */
@@ -919,7 +920,7 @@ static void handle_events_worker(worker_t *w) {
             /* Parse */
             http_request_t req;
             size_t consumed = 0;
-            int pr = http_request_parse(&req, &conn->read_buf, &consumed);
+            int pr = http_request_parse(&req, &conn->read_buf, &consumed, w->max_request_size);
 
             if (pr == 1) {
                 /* RFC 9110 10.1.1: if the client sent "Expect: 100-continue"
@@ -997,7 +998,17 @@ static void handle_events_worker(worker_t *w) {
 
             /* ── h2c Upgrade (RFC 7540 §3.2) ────────────────────────── */
             {
-                const char *upgrade = http_request_get_header(&req, "Upgrade");
+                /* BUG FIX (config ghost-key audit): h2_c_upgrade_enabled
+                 * was parsed into routa_h2_config_t.h2c_upgrade_enabled
+                 * (config.c/config.h) but nothing ever read it -- h2c
+                 * upgrade was unconditionally enabled with no way to
+                 * turn it off. Gate the actual upgrade path on it here;
+                 * default (h2c_upgrade_enabled=1, see config.c's
+                 * routa_config_init()) preserves prior always-on
+                 * behavior for anyone not explicitly setting this key. */
+                const char *upgrade = w->h2_cfg.h2c_upgrade_enabled
+                                    ? http_request_get_header(&req, "Upgrade")
+                                    : NULL;
                 if (upgrade && strcasecmp(upgrade, "h2c") == 0) {
                     conn->h2 = h2_conn_new(conn, &w->h2_cfg);
                     if (!conn->h2) {
@@ -2452,6 +2463,7 @@ void event_loop_run(event_loop_t *loop) {
         w->max_connections    = loop->max_connections;
         w->keepalive_timeout_ms = loop->keepalive_timeout_ms > 0 ? loop->keepalive_timeout_ms : 30000;
         w->request_timeout_ms   = loop->request_timeout_ms   > 0 ? loop->request_timeout_ms   : 10000;
+        w->max_request_size     = loop->max_request_size;
         w->socket_recv_buf_size  = loop->socket_recv_buf_size;
         w->socket_send_buf_size  = loop->socket_send_buf_size;
         w->tls_ctx            = loop->tls_ctx;
@@ -2573,6 +2585,21 @@ void event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
     if (!loop) return;
     loop->keepalive_timeout_ms = keepalive_timeout_ms > 0 ? keepalive_timeout_ms : 30000;
     loop->request_timeout_ms   = request_timeout_ms   > 0 ? request_timeout_ms   : 10000;
+}
+
+/* BUG FIX: max_request_size was previously parsed from config
+ * (routa_config_t.max_request_size) and stored there, but never actually
+ * read by anything at request-handling time -- confirmed via a full
+ * codebase grep, this was the ghost-key audit's highest-priority finding
+ * (a request-body size limit that appeared to exist in the config but
+ * was silently never enforced anywhere, allowing unbounded request
+ * bodies). Wired up the same way keepalive/request timeouts already
+ * are: event_loop_set_max_request_size() -> per-worker copy at worker
+ * init -> passed into http_request_parse()'s new max_body_size
+ * parameter at the actual enforcement point. */
+void event_loop_set_max_request_size(event_loop_t *loop, size_t max_request_size) {
+    if (!loop) return;
+    loop->max_request_size = max_request_size;
 }
 
 void event_loop_set_socket_buffers(event_loop_t *loop, int recv_buf_size, int send_buf_size) {

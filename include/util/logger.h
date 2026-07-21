@@ -14,6 +14,11 @@ typedef enum {
 } log_level_t;
 
 void log_set_level(log_level_t level);
+/* Redirect logging (log_msg()/log_access_json()) to the given file
+ * path (opened in append mode). Pass NULL or an empty string to
+ * fall back to stderr (the default if never called). Safe to call
+ * again later (e.g. on SIGHUP config reload) to switch targets. */
+void log_set_file(const char *path);
 void log_msg(log_level_t level, const char *file, int line, const char *fmt, ...);
 
 #define LOG_DEBUG(...) log_msg(LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)

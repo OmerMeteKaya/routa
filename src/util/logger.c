@@ -10,6 +10,32 @@
 
 static log_level_t g_log_level = LOG_INFO;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* BUG FIX (config ghost-key audit): log_file was parsed into
+ * routa_config_t.log_file but nothing ever opened it or redirected
+ * logging there -- log_msg()/log_access_json() both wrote to a
+ * hardcoded stderr unconditionally. g_log_fp defaults to stderr
+ * (preserving prior behavior for anyone not setting log_file) and is
+ * swapped by log_set_file() if a path is configured. */
+static FILE *g_log_fp = NULL;
+
+void log_set_file(const char *path) {
+    FILE *fp = path && path[0] ? fopen(path, "a") : NULL;
+    pthread_mutex_lock(&g_log_mutex);
+    if (fp) {
+        if (g_log_fp && g_log_fp != stderr) fclose(g_log_fp);
+        g_log_fp = fp;
+    } else if (path && path[0]) {
+        /* Requested a file but couldn't open it -- stay on stderr rather
+         * than silently discarding every subsequent log line. */
+        fprintf(stderr, "log_set_file: cannot open '%s' for append, "
+                        "continuing to log to stderr\n", path);
+    }
+    pthread_mutex_unlock(&g_log_mutex);
+}
+
+static FILE *log_target(void) {
+    return g_log_fp ? g_log_fp : stderr;
+}
 
 static const char *level_strings[] = {
     "DEBUG",
@@ -41,10 +67,10 @@ void log_msg(log_level_t level, const char *file, int line, const char *fmt, ...
     // Print message
     va_list args;
     va_start(args, fmt);
-    (void)vfprintf(stderr, fmt, args);
+    (void)vfprintf(log_target(), fmt, args);
     va_end(args);
 
-    (void)fflush(stderr);
+    (void)fflush(log_target());
     
     pthread_mutex_unlock(&g_log_mutex);
 }
@@ -78,7 +104,7 @@ void log_access_json(const char *trace_id,
     }
     safe_path[pi] = '\0';
 #ifdef ROUTA_ACCESS_LOG
-    fprintf(stderr,
+    fprintf(log_target(),
         "{\"ts\":%.3f,\"level\":\"ACCESS\","
         "\"trace_id\":\"%s\","
         "\"method\":\"%s\","

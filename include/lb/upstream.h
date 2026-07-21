@@ -112,7 +112,23 @@ struct upstream_node {
      * against multiple concurrent requests all trying to be "the" trial at
      * once -- only the request that wins the compare-and-swap gets routed;
      * everyone else still sees the node as DOWN. */
-    time_t              down_since;
+    /* BUG FIX (circuit breaker half-open recovery never triggering with
+     * sub-second half_open_retry_after_ms values): time_t has only
+     * SECOND resolution. The half-open elapsed-time check
+     * (upstream_node_is_selectable()) computed
+     * difftime(now, down_since) * 1000 to compare against
+     * half_open_retry_after_ms (a MILLISECOND config value) -- for any
+     * retry window under ~1 full second, down_since and "now" landing
+     * in the same wall-clock second (extremely likely for a sub-second
+     * window) made elapsed_ms read as 0, permanently failing the
+     * "enough time has passed" check and leaving the node stuck in
+     * NODE_DOWN forever (confirmed live: a 500ms half_open_retry_after_ms
+     * with the node's replacement upstream demonstrably healthy and
+     * reachable never received a single request even 700ms+ after
+     * coming back up). Switched to a CLOCK_MONOTONIC-based millisecond
+     * timestamp -- same class of fix as this session's H2 last_stream_ts
+     * timing bug, and immune to wall-clock adjustments besides. */
+    uint64_t            down_since_ms;
     volatile uint32_t   half_open_probe_in_flight; /* 0 or 1, CAS-guarded */
 
     /* Circuit-breaker observability counters (Faz D). Incremented in

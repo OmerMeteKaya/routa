@@ -27,6 +27,7 @@ struct worker {
     int             cpu_affinity_start_core;
     int             keepalive_timeout_ms;  /* default: 30000, from config */
     int             request_timeout_ms;    /* default: 10000, from config */
+    size_t          max_request_size;      /* 0 = unlimited, from config */
     int             should_stop;
     int             port;
     tls_context_t  *tls_ctx;
@@ -137,6 +138,11 @@ void          event_loop_set_max_connections(event_loop_t *loop,
                                              int max_connections);
 void          event_loop_set_timeouts(event_loop_t *loop, int keepalive_timeout_ms,
                                       int request_timeout_ms);
+/* max_request_size: 0 = unlimited. Caps the maximum accepted request
+ * body size (Content-Length or decoded chunked body) -- see
+ * http_request_parse()'s max_body_size parameter for the enforcement
+ * point. */
+void          event_loop_set_max_request_size(event_loop_t *loop, size_t max_request_size);
 void          event_loop_set_socket_buffers(event_loop_t *loop, int recv_buf_size, int send_buf_size);
 void          event_loop_set_cpu_affinity(event_loop_t *loop, int enabled, int start_core);
 /* Opt into NUMA-aware core selection on top of cpu_affinity_enabled (has

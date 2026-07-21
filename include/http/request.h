@@ -51,7 +51,16 @@ typedef struct {
 
 // Parse from buf_t. Returns 0 on success, -1 on error, 1 if incomplete
 // (need more data). Does NOT modify the buffer — works on a copy internally.
-int  http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed);
+/* max_body_size: 0 = unlimited, otherwise the maximum allowed
+ * Content-Length / decoded chunked-body size (RFC 9110 doesn't
+ * mandate a specific limit, but an unbounded body is a resource-
+ * exhaustion vector). Rejected as soon as the size is known --
+ * for Content-Length this is BEFORE waiting for the body to fully
+ * arrive, so an oversized declared length is rejected immediately
+ * rather than after buffering it. Returns -1, same as any other
+ * malformed-request rejection. */
+int  http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed,
+                        size_t max_body_size);
 void http_request_free(http_request_t *req);
 int  http_request_clone(const http_request_t *src, http_request_t *dst);
 const char *http_request_get_header(const http_request_t *req, const char *key);

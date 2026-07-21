@@ -199,7 +199,8 @@ const char *http_request_get_query(const http_request_t *req, const char *key) {
     return NULL;
 }
 
-int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) {
+int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed,
+                        size_t max_body_size) {
     if (!req || !buf || !consumed) return -1;
 
     memset(req, 0, sizeof(*req));
@@ -451,6 +452,17 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
         unsigned long long val = strtoull(p, &endptr, 10);
         if (endptr == p) { ret = -1; goto done; }   /* no digits */
         content_length = (size_t)val;
+        /* Reject an oversized DECLARED length immediately -- before
+         * waiting for the body to actually arrive. Without this, a
+         * client can send a huge Content-Length and either (a) actually
+         * send that much data, exhausting memory once buffered, or (b)
+         * send the header and nothing else, tying up the connection
+         * (and its read_buf) indefinitely since http_request_parse()
+         * would otherwise just keep returning "incomplete" (1) forever
+         * waiting for bytes that may never come. */
+        if (max_body_size > 0 && content_length > max_body_size) {
+            ret = -1; goto done;
+        }
     }
     size_t body_start     = headers_len;
     size_t available      = buf->len > body_start ? buf->len - body_start : 0;
@@ -462,6 +474,15 @@ int http_request_parse(http_request_t *req, const buf_t *buf, size_t *consumed) 
                                       &dec_body, &dec_len, &dec_consumed);
         if (dc == 1) goto done;          /* incomplete — need more data */
         if (dc == -1) { ret = -1; goto done; } /* malformed chunked body */
+        /* Same oversized-body rejection as the Content-Length path above
+         * -- chunked bodies have no declared total length to check
+         * up front, so this can only be caught once decoding finishes,
+         * but it still prevents an oversized body from ever reaching
+         * the application/route handlers. */
+        if (max_body_size > 0 && dec_len > max_body_size) {
+            free(dec_body);
+            ret = -1; goto done;
+        }
         req->body     = dec_body;
         req->body_len = dec_len;
         if (dec_len > 0) routa_metrics_record_bytes_received(dec_len);

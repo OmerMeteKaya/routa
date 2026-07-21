@@ -349,6 +349,12 @@ server_t *server_from_config(const routa_config_t *cfg) {
     if (routa_config_validate(cfg) < 0) return NULL;
 
     log_set_level((log_level_t)cfg->log_level);
+    /* BUG FIX (config ghost-key audit): log_file was parsed but
+     * never actually opened/redirected to -- see log_set_file()'s
+     * doc comment in logger.h. Empty string (the default when the
+     * key isn't set) is handled by log_set_file() itself (stays on
+     * stderr). */
+    log_set_file(cfg->log_file);
 
     server_t *s = server_new(cfg->port, cfg->n_workers);
     if (!s) return NULL;
@@ -367,6 +373,20 @@ server_t *server_from_config(const routa_config_t *cfg) {
                                    cfg->max_connections);
     event_loop_set_timeouts((event_loop_t *)s->loop,
                             cfg->keepalive_timeout_ms, cfg->request_timeout_ms);
+    /* BUG FIX (config ghost-key audit): max_request_size was parsed into
+     * routa_config_t but never actually wired to anything that enforced
+     * it -- see http_request_parse()'s max_body_size parameter and
+     * event_loop_set_max_request_size() for the actual enforcement
+     * chain this now completes. cfg->max_request_size is declared `int`
+     * (see config.h) but represents a byte SIZE, which is unsigned by
+     * nature -- cast to size_t here at the boundary into the
+     * size_t-typed setter/worker field/parser parameter. A negative
+     * config value (which cfg_size_mb()'s parsing shouldn't produce, but
+     * defensively) would wrap to a huge size_t and effectively disable
+     * the limit -- treat that as "unlimited" explicitly via the <= 0
+     * check rather than let it silently wrap. */
+    event_loop_set_max_request_size((event_loop_t *)s->loop,
+        cfg->max_request_size > 0 ? (size_t)cfg->max_request_size : 0);
     event_loop_set_global_response_headers(
         cfg->response_header_add, cfg->response_header_add_count,
         cfg->response_header_remove, cfg->response_header_remove_count);
@@ -389,17 +409,29 @@ server_t *server_from_config(const routa_config_t *cfg) {
 
     if (cfg->tls_enabled) {
         server_enable_tls(s, cfg->tls_cert, cfg->tls_key);
-        if (cfg->sni_cert_count > 0) {
-            tls_context_t *tls_ctx = event_loop_get_tls_ctx((event_loop_t *)s->loop);
-            if (!tls_ctx) {
-                LOG_ERROR("server_from_config: TLS context missing, cannot register SNI certs");
-            } else {
-                for (int i = 0; i < cfg->sni_cert_count; i++) {
-                    tls_context_add_sni_cert(tls_ctx,
-                        cfg->sni_certs[i].hostname,
-                        cfg->sni_certs[i].cert,
-                        cfg->sni_certs[i].key);
-                }
+        /* BUG FIX (config ghost-key audit): tls_session_timeout and
+         * tls_ocsp_response were both parsed into routa_config_t but
+         * never actually applied anywhere -- tls_context_enable_
+         * session_cache() and server_enable_ocsp_stapling() already
+         * existed and did exactly what these keys imply, they were just
+         * never called from config-driven startup. Wire both up here,
+         * next to the SNI registration this same block already does
+         * via the same tls_ctx lookup pattern. */
+        tls_context_t *tls_ctx = event_loop_get_tls_ctx((event_loop_t *)s->loop);
+        if (!tls_ctx) {
+            LOG_ERROR("server_from_config: TLS context missing, cannot apply TLS options");
+        } else {
+            if (cfg->tls_session_timeout > 0) {
+                tls_context_enable_session_cache(tls_ctx, cfg->tls_session_timeout);
+            }
+            if (cfg->tls_ocsp_response[0]) {
+                server_enable_ocsp_stapling(s, cfg->tls_ocsp_response);
+            }
+            for (int i = 0; i < cfg->sni_cert_count; i++) {
+                tls_context_add_sni_cert(tls_ctx,
+                    cfg->sni_certs[i].hostname,
+                    cfg->sni_certs[i].cert,
+                    cfg->sni_certs[i].key);
             }
         }
     }
