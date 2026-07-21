@@ -531,14 +531,46 @@ ssize_t tls_read(tls_conn_t *tc, void *buf, size_t len) {
 ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len) {
     if (!tc || !buf || !tc->handshake_done) return -2;
 
-    int n = SSL_write(tc->ssl, buf, (int)len);
-    if (n > 0) return n;
+    /* BUG FIX: honor OpenSSL's SSL_write() retry contract -- see the
+     * detailed comment on tls_conn_t.pending_write_len in tls.h for the
+     * full investigation/root-cause writeup. If a previous call on this
+     * SSL* returned WANT_READ/WANT_WRITE, the retry MUST use the exact
+     * same length as that failed call -- not whatever `len` the caller
+     * (whose buffer may have grown since, e.g. hc->write_buf gaining new
+     * H2 frames from an unrelated stream/flush) happens to pass now.
+     * Clamp down to the pending length; `buf`'s pointer is allowed to
+     * have moved (SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER covers that) but
+     * its first pending_write_len bytes MUST be unchanged, which holds
+     * here because callers only ever APPEND to write_buf, never mutate
+     * already-buffered bytes ahead of the current read offset. */
+    size_t call_len = len;
+    if (tc->pending_write_len > 0) {
+        if (tc->pending_write_len < call_len) {
+            call_len = tc->pending_write_len;
+        }
+        /* If the caller's buffer somehow shrank below what we're still
+         * retrying (shouldn't happen given write_buf is append-only, but
+         * guard rather than pass a length OpenSSL never asked for), fall
+         * through with call_len == len and let SSL_write's own bounds
+         * checking handle it -- this is a defensive fallback, not the
+         * expected path. */
+    }
 
+    int n = SSL_write(tc->ssl, buf, (int)call_len);
+    if (n > 0) {
+        tc->pending_write_len = 0;
+        return n;
+    }
     switch (SSL_get_error(tc->ssl, n)) {
         case SSL_ERROR_WANT_READ:
-        case SSL_ERROR_WANT_WRITE:  return -1;
-        case SSL_ERROR_ZERO_RETURN: return  0;
+        case SSL_ERROR_WANT_WRITE:
+            tc->pending_write_len = call_len;
+            return -1;
+        case SSL_ERROR_ZERO_RETURN:
+            tc->pending_write_len = 0;
+            return  0;
         default: {
+            tc->pending_write_len = 0;
             unsigned long ssl_err = ERR_peek_last_error();
             /* Treat a genuinely empty error queue the same as a syscall-level
              * disconnect: log nothing and just drain/clear. Calling

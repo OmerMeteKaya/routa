@@ -2706,6 +2706,36 @@ int h2_conn_flush(h2_conn_t *hc) {
     ssize_t n = io_write_from_buf(hc->conn->fd,
                                    &hc->write_buf,
                                    hc->conn->tls);
+    /* BUG FIX (H2-over-TLS large-file stream-idle-timeout false positive):
+     * last_stream_ts was only ever updated in h2_conn_recv() when a frame
+     * arrived FROM the client -- never when this server was actively
+     * SENDING a response (e.g. streaming a large file's DATA frames over
+     * several io_write_from_buf() calls under TLS, where per-write TLS
+     * record framing/encryption overhead plus concurrent-stream socket
+     * contention can make a single response take longer than
+     * stream_timeout_ms, default 30s, to fully drain -- confirmed via
+     * live instrumentation: h2_conn_check_timeouts()'s "stream idle
+     * timeout" fired and GOAWAY'd connections that were, at that exact
+     * moment, mid-flight actively writing DATA frames for an open
+     * stream's response, with the client having sent nothing further
+     * simply because it was still waiting on that same in-progress
+     * response). h2_conn_check_timeouts()'s idle check
+     * ((now_ms - last_stream_ts) > stream_timeout_ms) treats "no frames
+     * received" as "idle" -- but a connection that's busy SENDING is
+     * exactly as alive as one that's busy RECEIVING, and needs the same
+     * exemption. Any attempted write here (n >= 0, i.e. the write call
+     * didn't hard-fail) is evidence of that activity -- update the same
+     * way the receive side already does. This did not reproduce over
+     * H2C because a plain write() syscall has none of TLS's per-record
+     * encrypt/memcpy overhead, so large-file drains there almost never
+     * approach the 30s threshold in the first place -- masking this gap
+     * rather than avoiding the underlying bug. */
+    if (n >= 0 && hc->conn) {
+        struct timespec _fts;
+        clock_gettime(CLOCK_MONOTONIC, &_fts);
+        hc->last_stream_ts = (uint64_t)_fts.tv_sec * 1000 +
+                             (uint64_t)_fts.tv_nsec / 1000000;
+    }
     if (n < 0) return -1;
     return 0;
 }

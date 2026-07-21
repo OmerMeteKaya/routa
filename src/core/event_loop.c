@@ -759,6 +759,27 @@ static void handle_events_worker(worker_t *w) {
                         goto handle_state;
                     }
                     int rrc = h2_conn_recv(conn->h2, w->router, w->chain);
+                    /* BUG FIX (H2-over-TLS large-file concurrent-stream
+                     * stall, part 2 -- see the matching, more detailed
+                     * comment at the POLLER_WRITE handler's partial-flush
+                     * branch for the full root-cause writeup): this read
+                     * loop's own write_buf flush never called
+                     * h2_conn_flush_pending() either, only a bare
+                     * h2_conn_flush(). If a stream stalls mid-read-loop
+                     * (send_response()'s H2_WRITE_BUF_SOFT_LIMIT check
+                     * parking it in s->pending_body_fd) and the socket
+                     * happens to stay writable afterward (very likely on
+                     * loopback under edge-triggered epoll -- no fresh
+                     * POLLER_WRITE edge may ever arrive to give the
+                     * POLLER_WRITE handler's own fix a chance to run),
+                     * this was the OTHER place such a stream could be
+                     * permanently forgotten. flush_pending() is always
+                     * safe to call regardless of write_buf's current
+                     * fullness -- see the POLLER_WRITE comment for why. */
+                    if (conn->h2->write_buf.len > 0) {
+                        h2_conn_flush(conn->h2);
+                    }
+                    h2_conn_flush_pending(conn->h2);
                     if (conn->h2->write_buf.len > 0) {
                         h2_conn_flush(conn->h2);
                     }
@@ -1314,7 +1335,42 @@ static void handle_events_worker(worker_t *w) {
                     goto handle_state;
                 }
                 if (conn->h2->write_buf.len > 0) {
-                    /* Partial flush — keep watching for write             */
+                    /* BUG FIX (H2-over-TLS large-file concurrent-stream
+                     * stall): this branch used to ONLY re-arm POLLER_WRITE
+                     * and wait -- it never called h2_conn_flush_pending()
+                     * the way the fully-drained ("All flushed") branch
+                     * just below does. On a connection where write_buf
+                     * stays partially full turn after turn (very likely
+                     * under TLS: per-record encrypt/memcpy overhead plus
+                     * several concurrent streams competing for the same
+                     * shared write_buf means the socket rarely drains it
+                     * all the way to zero between POLLER_WRITE wakeups),
+                     * this branch fired on EVERY wakeup instead of the
+                     * "All flushed" one -- so flush_pending() (the only
+                     * thing that resumes a stream parked in
+                     * s->pending_body_fd after hitting send_response()'s
+                     * H2_WRITE_BUF_SOFT_LIMIT stall) was never reached at
+                     * all for such a connection. Confirmed via live
+                     * instrumentation: streams observed stuck at
+                     * pending_offset=0, pending_body_fd_remaining ==
+                     * the full response size (i.e. never even started
+                     * draining) for the entire 30s stream_timeout_ms
+                     * window, on a connection whose write side was
+                     * demonstrably still making progress (other streams'
+                     * data was actively being written) -- these stuck
+                     * streams were simply never revisited to feed their
+                     * body_fd's next chunk into write_buf in the first
+                     * place. flush_pending() is always safe to call here
+                     * regardless of how full write_buf currently is: it
+                     * has its own H2_WRITE_BUF_SOFT_LIMIT check internally
+                     * and simply no-ops (returns without queuing more)
+                     * if there still isn't room, so this cannot make a
+                     * genuinely-full write_buf worse -- it only lets a
+                     * stalled stream detect and use newly-freed room the
+                     * instant this wakeup created any, instead of waiting
+                     * for a lucky future wakeup where write_buf happens to
+                     * hit exactly zero. */
+                    h2_conn_flush_pending(conn->h2);
                     conn_poller_mod(w, conn,
                                POLLER_READ | POLLER_WRITE | POLLER_ET);
                 } else {

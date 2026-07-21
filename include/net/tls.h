@@ -36,6 +36,34 @@ typedef struct {
     int  fd;
     int  handshake_done;
     int  resumed;          /* 1 if session was resumed */
+    /* BUG FIX (H2-over-TLS large-file concurrent-stream stall):
+     * OpenSSL's SSL_write() retry contract requires that after a call
+     * returns SSL_ERROR_WANT_READ/WANT_WRITE, the NEXT call on this SSL*
+     * must be made with the exact same buffer contents and the exact
+     * same length as the failed attempt (SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
+     * only relaxes the pointer-identity requirement, not length/content).
+     * This codebase flushes hc->write_buf (a single shared, freely-growing
+     * buffer) from many independent call sites in h2.c, each of which can
+     * append more H2 frames to it and then call tls_write() again -- with
+     * a LARGER length than a still-outstanding WANT_WRITE retry expected.
+     * Confirmed via live instrumentation: tls_write() was observed being
+     * called repeatedly on one connection with a monotonically growing
+     * `len` (e.g. 1104512, then 1104605, then 1104698, ... each ~93 bytes
+     * larger than the last) while every call kept returning WANT_WRITE --
+     * i.e. the retry was never actually satisfied with consistent
+     * arguments, so forward progress on that connection's write side
+     * silently stalled forever (until a 30s stream idle timeout fired),
+     * while write_buf kept growing unboundedly in the meantime (this is
+     * also the root cause of the ~400-450MB RSS spikes observed in
+     * concurrent-H2-over-TLS large-file benchmarks -- the buffer that
+     * should have drained as fast as it filled instead only ever grew).
+     * Fix: remember the length that was actually handed to the last
+     * failed SSL_write() call, and ignore any larger `len` a caller
+     * passes on a subsequent tls_write() call until that exact pending
+     * write succeeds -- honoring OpenSSL's retry contract regardless of
+     * how much unrelated code appended to the caller's buffer in the
+     * meantime. 0 means no retry is currently pending. */
+    size_t pending_write_len;
 } tls_conn_t;
 
 /* ── Library init (call once at startup) ───────────────────────────────────*/
