@@ -49,6 +49,14 @@ void routa_config_init(routa_config_t *cfg) {
     cfg->file_cache_max_entries = 512;
     cfg->file_cache_ttl         = 5;
     cfg->file_cache_strategy    = 1; /* stat_ttl */
+    cfg->file_cache_mode             = 1; /* shared_metadata */
+    cfg->file_cache_lock             = 1; /* sharded */
+    cfg->file_cache_shards           = 16;
+    cfg->file_cache_eviction         = 0; /* lru */
+    cfg->file_cache_negative_ttl     = 0; /* off */
+    cfg->file_cache_mmap_threshold   = 64 * 1024;
+    cfg->file_cache_max_memory_mb    = 0; /* off */
+    cfg->file_cache_watch            = 0; /* none */
     cfg->h2.enabled                = 1;
     cfg->h2.header_table_size      = 4096;
     cfg->h2.huffman_encoding       = 1;
@@ -129,6 +137,7 @@ void apply_resource_profile(routa_config_t *cfg, resource_profile_t profile) {
         cfg->cache_memory_mb              = 16;
         cfg->max_connections              = 1000;
         cfg->file_cache_max_entries       = 128;
+        cfg->file_cache_shards            = 4;   /* fewer shards, low core count */
         cfg->socket_recv_buf_size         = 0;   /* OS default */
         cfg->socket_send_buf_size         = 0;   /* OS default */
         cfg->cpu_affinity_enabled         = 0;   /* not worth it on few cores */
@@ -148,6 +157,7 @@ void apply_resource_profile(routa_config_t *cfg, resource_profile_t profile) {
         cfg->cache_memory_mb              = 512;
         cfg->max_connections              = 100000;
         cfg->file_cache_max_entries       = 4096;
+        cfg->file_cache_shards            = 64;  /* more shards, less lock contention */
         cfg->socket_recv_buf_size         = 262144;
         cfg->socket_send_buf_size         = 262144;
         cfg->cpu_affinity_enabled         = 1;
@@ -950,6 +960,37 @@ int routa_config_parse_stream(routa_config_t *cfg, FILE *f, const char *path, in
             else if (strcasecmp(val, "stat_ttl") == 0) cfg->file_cache_strategy = 1;
             else if (strcasecmp(val, "inotify") == 0)  cfg->file_cache_strategy = 2;
             else cfg->file_cache_strategy = cfg_atoi(val, 1);
+        } else if (strcmp(key, "file_cache_mode") == 0) {
+            if (strcasecmp(val, "local") == 0)             cfg->file_cache_mode = 0;
+            else if (strcasecmp(val, "shared_metadata") == 0) cfg->file_cache_mode = 1;
+            else if (strcasecmp(val, "shared_content") == 0)  cfg->file_cache_mode = 2;
+            else cfg->file_cache_mode = cfg_atoi(val, 1);
+        } else if (strcmp(key, "file_cache_lock") == 0) {
+            if (strcasecmp(val, "global") == 0)       cfg->file_cache_lock = 0;
+            else if (strcasecmp(val, "sharded") == 0) cfg->file_cache_lock = 1;
+            else cfg->file_cache_lock = cfg_atoi(val, 1);
+        } else if (strcmp(key, "file_cache_shards") == 0) {
+            int shards = cfg_atoi(val, 16);
+            if (shards < 1) shards = 1;
+            /* round up to next power of 2 */
+            int p = 1;
+            while (p < shards) p <<= 1;
+            cfg->file_cache_shards = p;
+        } else if (strcmp(key, "file_cache_eviction") == 0) {
+            if (strcasecmp(val, "lru") == 0)            cfg->file_cache_eviction = 0;
+            else if (strcasecmp(val, "lfu") == 0)       cfg->file_cache_eviction = 1;
+            else if (strcasecmp(val, "ttl_only") == 0)  cfg->file_cache_eviction = 2;
+            else cfg->file_cache_eviction = cfg_atoi(val, 0);
+        } else if (strcmp(key, "file_cache_negative_ttl") == 0) {
+            cfg->file_cache_negative_ttl = cfg_duration_s(val, 0);
+        } else if (strcmp(key, "file_cache_mmap_threshold") == 0) {
+            cfg->file_cache_mmap_threshold = cfg_atoi(val, 64 * 1024);
+        } else if (strcmp(key, "file_cache_max_memory_mb") == 0) {
+            cfg->file_cache_max_memory_mb = cfg_atoi(val, 0);
+        } else if (strcmp(key, "file_cache_watch") == 0) {
+            if (strcasecmp(val, "none") == 0)     cfg->file_cache_watch = 0;
+            else if (strcasecmp(val, "inotify") == 0) cfg->file_cache_watch = 1;
+            else cfg->file_cache_watch = cfg_atoi(val, 0);
         } else if (strcmp(key, "tls_session_timeout") == 0) {
             cfg->tls_session_timeout = cfg_duration_s(val, 3600);
         } else if (strcmp(key, "tls_ocsp_response") == 0) {

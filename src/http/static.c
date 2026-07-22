@@ -111,7 +111,7 @@ int static_serve(const http_request_t *req, http_response_t *resp,
 
     /* ── Cache lookup ── */
     file_cache_entry_t cached;
-    if (file_cache_get(req->path, &cached)) {
+    if (file_cache_get(req->worker_id, req->path, &cached)) {
         memcpy(resolved,      cached.resolved,      sizeof(resolved));
         memcpy(etag,          cached.etag,          sizeof(etag));
         memcpy(last_modified, cached.last_modified, sizeof(last_modified));
@@ -147,7 +147,7 @@ int static_serve(const http_request_t *req, http_response_t *resp,
 
         /* ── mmap small files and cache the pointer ── */
         if ((size_t)st.st_size > 0 &&
-            (size_t)st.st_size < (size_t)FILE_CACHE_MMAP_THRESHOLD) {
+            (size_t)st.st_size < file_cache_get_mmap_threshold()) {
 
             int fd = open(resolved, O_RDONLY);
             if (fd >= 0) {
@@ -179,7 +179,7 @@ int static_serve(const http_request_t *req, http_response_t *resp,
         new_entry.valid    = 1;
         new_entry.data     = mmap_ptr;
         new_entry.data_len = mmap_ptr ? (size_t)st.st_size : 0;
-        file_cache_put(req->path, &new_entry);
+        file_cache_put(req->worker_id, req->path, &new_entry);
     }
 
     /* ── Conditional request: ETag / If-None-Match ── */

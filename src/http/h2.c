@@ -1732,6 +1732,10 @@ static int dispatch_stream(h2_conn_t *hc, h2_stream_t *s,
         return 0;
     }
     req.start_us = dispatch_start;
+    /* Execution context: tell file_cache (and any other worker-aware
+     * subsystem) which worker this stream is being processed on. See
+     * request.h's doc comment on this field. */
+    if (hc->worker) req.worker_id = ((worker_t *)hc->worker)->worker_id;
     strncpy(req.remote_ip, hc->conn->remote_ip, sizeof(req.remote_ip) - 1);
     req.remote_ip[sizeof(req.remote_ip) - 1] = '\0';
 

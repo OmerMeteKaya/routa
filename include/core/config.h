@@ -261,6 +261,27 @@ typedef struct {
     int  file_cache_ttl;
     int  file_cache_strategy;   /* 0=ttl, 1=stat_ttl, 2=inotify */
 
+    /* file_cache_mode: 0=local (thread-local, legacy), 1=shared_metadata
+     * (shared hash table for path/etag/mtime/generation, mmap stays
+     * per-worker), 2=shared_content (shared refcounted content -- not
+     * implemented in this revision, reserved for future work). */
+    int  file_cache_mode;
+    /* file_cache_lock: 0=global (single lock, n_shards forced to 1),
+     * 1=sharded (file_cache_shards independent locks). Only meaningful
+     * when file_cache_mode != local. */
+    int  file_cache_lock;
+    int  file_cache_shards;        /* must be a power of 2 */
+    /* file_cache_eviction: 0=lru, 1=lfu, 2=ttl_only (no active eviction
+     * ordering, entries just expire/get overwritten oldest-first) */
+    int  file_cache_eviction;
+    int  file_cache_negative_ttl;  /* seconds; 0 = negative caching off */
+    int  file_cache_mmap_threshold; /* bytes; replaces the old hardcoded
+                                        FILE_CACHE_MMAP_THRESHOLD constant */
+    int  file_cache_max_memory_mb;  /* 0 = off (entry-count limit only) */
+    /* file_cache_watch: 0=none (pure TTL/stat_ttl behavior), 1=inotify
+     * (Linux only; real inotify-based invalidation) */
+    int  file_cache_watch;
+
     /* ── Load balancer ──────────────────────────────────────────────────── */
     /* ── Load balancer pools ────────────────────────────────────────────────
      * One or more independently configured upstream pools, each bound to

@@ -17,6 +17,7 @@
 #include "http/mw_auth.h"
 #include "http/mw_ratelimit.h"
 #include "http/mw_compress.h"
+#include "http/file_cache.h"
 #include "util/logger.h"
 #if defined(__linux__)
 #include <sys/sendfile.h>
@@ -551,6 +552,16 @@ static void handle_events_worker(worker_t *w) {
                                            &w->ws_broadcast_queue);
             continue;
         }
+        // file_cache inotify: a watched file changed on disk. See
+        // file_cache_inotify_drain()'s doc comment -- this bumps
+        // shared generation counters (shared_metadata/shared_content
+        // mode) or directly invalidates this worker's own thread-local
+        // slots (local mode), depending on which mode is active.
+        if (w->file_cache_inotify_fd >= 0 &&
+            events[i].ptr == (void *)(uintptr_t)w->file_cache_inotify_fd) {
+            file_cache_inotify_drain(w->file_cache_inotify_fd);
+            continue;
+        }
 
         /* ── Accept ── */
         if (events[i].ptr == NULL) {
@@ -995,6 +1006,12 @@ static void handle_events_worker(worker_t *w) {
 
             conn->consumed  = consumed;
             conn->keep_alive = req.keep_alive;
+            /* Execution context: tell file_cache (and any other
+             * worker-aware subsystem) which worker this request is being
+             * processed on. Not part of the wire protocol, so not set by
+             * http_request_parse() itself -- see request.h's doc comment
+             * on this field. */
+            req.worker_id = w->worker_id;
 
             /* ── h2c Upgrade (RFC 7540 §3.2) ────────────────────────── */
             {
@@ -2107,6 +2124,28 @@ static void worker_apply_reload(worker_t *w) {
     LOG_INFO("hot reload complete");
 }
 
+/* ── file_cache inotify ownership (single decision point) ─────────────────
+ * In file_cache_mode=local, every worker independently owns its own
+ * inotify fd (each only watches paths it personally cached, so there's
+ * no coordination problem -- see file_cache_watch_is_centralized()).
+ * In shared_metadata/shared_content mode, exactly one worker must own
+ * the fd (a single inotify watch centrally bumps the shared generation
+ * counters every worker already checks against on file_cache_get()).
+ *
+ * Currently: worker 0, unconditionally, for the lifetime of the
+ * process. No failover -- if worker 0's thread were to crash, the
+ * whole process dies with it (routa's workers are pthreads sharing one
+ * address space, not separate processes; see the project roadmap notes
+ * on this being deferred to the Rust rewrite, where a supervised
+ * process-per-worker model could make failover meaningful without the
+ * "a segfault takes the whole process down anyway" caveat this has
+ * today). Deliberately kept as the single call site for this decision
+ * so a future failover scheme only has to change this function's body,
+ * not any of its call sites. */
+static int worker_should_own_inotify(worker_t *w) {
+    return w->worker_id == 0;
+}
+
 /* ── epoll worker thread ────────────────────────────────────────────────────*/
 static void *worker_run(void *arg) {
     worker_t *w = (worker_t *)arg;
@@ -2135,6 +2174,23 @@ static void *worker_run(void *arg) {
     if (w->ws_notify_fd >= 0) {
         poller_add(w->poller, w->ws_notify_fd, POLLER_READ,
                    (void *)(uintptr_t)w->ws_notify_fd);
+    }
+
+    /* file_cache per-worker init (mirrors ws_registry_init() above --
+     * every worker must call this once before serving requests,
+     * regardless of mode; see file_cache_worker_init()'s doc comment). */
+    file_cache_worker_init(w->worker_id);
+    w->file_cache_inotify_fd = -1;
+    if (file_cache_watch_is_centralized() ? worker_should_own_inotify(w) : 1) {
+        /* local mode: every worker opens its own (the ternary's "1"
+         * branch); shared_metadata/shared_content: only the single
+         * designated owner does (see worker_should_own_inotify()'s doc
+         * comment for why no failover exists yet). */
+        w->file_cache_inotify_fd = file_cache_inotify_open(w->worker_id);
+        if (w->file_cache_inotify_fd >= 0) {
+            poller_add(w->poller, w->file_cache_inotify_fd, POLLER_READ,
+                       (void *)(uintptr_t)w->file_cache_inotify_fd);
+        }
     }
 
     /* Pre-warm H2 upstream connections so the first request burst doesn't
@@ -2535,6 +2591,7 @@ event_loop_t *event_loop_new(int port, int n_threads) {
     for (int i = 0; i < n_threads; i++) {
         loop->workers[i].ws_notify_fd = -1;
         loop->workers[i].ws_notify_write_fd = -1;
+        loop->workers[i].file_cache_inotify_fd = -1;
     }
     pthread_rwlock_init(&loop->tls_reload_lock, NULL);
     return loop;

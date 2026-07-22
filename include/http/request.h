@@ -47,6 +47,15 @@ typedef struct {
      * treat it exactly like "no trailers were sent," not as an error. */
     http_header_t  trailers[16];
     int            trailer_count;
+
+    /* ── Execution context (NOT part of the parsed protocol data) ──────
+     * Set by the worker thread immediately after http_request_parse()
+     * returns success, before dispatch. Not filled by http_request_parse()
+     * itself -- parsing has no notion of which worker it runs on. Used by
+     * file_cache (and potentially other worker-aware subsystems) to know
+     * which thread-local/shard context to use without relying on a
+     * thread-local global. */
+    int            worker_id;
 } http_request_t;
 
 // Parse from buf_t. Returns 0 on success, -1 on error, 1 if incomplete

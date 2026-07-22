@@ -83,6 +83,16 @@ struct worker {
     struct h2up_conn **h2up_conns;
     int                h2up_count;
     int                h2up_cap;
+
+    /* ── File cache: inotify watch (see http/file_cache.h) ─────────────
+     * -1 = not this worker's responsibility / watch disabled.
+     * In file_cache_mode=local, every worker may own its own fd (each
+     * watches only the paths it has cached). In shared_metadata/
+     * shared_content mode, only the single designated owner (see
+     * worker_should_own_inotify() in event_loop.c) opens this -- one
+     * inotify fd centrally bumps the shared generation counters that
+     * all workers check against. */
+    int             file_cache_inotify_fd;
 };
 
 event_loop_t *event_loop_new(int port, int n_threads);

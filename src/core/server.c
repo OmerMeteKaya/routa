@@ -320,12 +320,26 @@ void server_run(server_t *s) {
     if (s->chain)
         event_loop_set_chain((event_loop_t *)s->loop, s->chain);
 
-    file_cache_config_t fc_cfg = {
-        .enabled     = 1,
-        .max_entries = 512,
-        .ttl_seconds = 5,
-        .strategy    = FILE_CACHE_STAT_TTL,
-    };
+    /* Default file_cache config for programmatic use (server_new()
+     * called directly, without a routa_config_t -- e.g. hello_world.c,
+     * test_proxy_lb.c's test harnesses). server_from_config() below
+     * re-initializes this with real config values when a config file
+     * is used; this is only the fallback for callers that skip that
+     * path entirely. shared_metadata + sharded lock + LRU is a safe,
+     * reasonable default even without explicit tuning. */
+    file_cache_config_t fc_cfg = {0};
+    fc_cfg.enabled          = 1;
+    fc_cfg.max_entries      = 512;
+    fc_cfg.ttl_seconds      = 5;
+    fc_cfg.strategy         = FILE_CACHE_STAT_TTL;
+    fc_cfg.mode             = FILE_CACHE_MODE_SHARED_METADATA;
+    fc_cfg.lock_kind        = FILE_CACHE_LOCK_SHARDED;
+    fc_cfg.n_shards         = 16;
+    fc_cfg.eviction         = FILE_CACHE_EVICT_LRU;
+    fc_cfg.negative_ttl_seconds = 0;
+    fc_cfg.mmap_threshold   = FILE_CACHE_DEFAULT_MMAP_THRESHOLD;
+    fc_cfg.max_memory_mb    = 0;
+    fc_cfg.watch            = FILE_CACHE_WATCH_NONE;
     file_cache_init(&fc_cfg);
 
     /* ── Observability ── */
@@ -387,6 +401,34 @@ server_t *server_from_config(const routa_config_t *cfg) {
      * check rather than let it silently wrap. */
     event_loop_set_max_request_size((event_loop_t *)s->loop,
         cfg->max_request_size > 0 ? (size_t)cfg->max_request_size : 0);
+    /* BUG FIX (cache revision follow-up): file_cache_init() was
+     * previously only ever called once, from server_new(), with
+     * hardcoded values -- every file_cache_* config key
+     * (file_cache_enabled, file_cache_max_entries, file_cache_ttl,
+     * file_cache_strategy, and all the new mode/lock/shards/eviction/
+     * negative_ttl/mmap_threshold/max_memory_mb/watch keys added in
+     * this revision) was parsed into routa_config_t but never actually
+     * reached file_cache_init(). Re-initializing here with the real
+     * parsed config is safe: file_cache_free() tears down whatever
+     * server_new()'s default init set up (shards, worker mmap tables,
+     * any inotify fd) before the real one takes over, and this runs
+     * once at startup before any worker thread exists, so there's no
+     * concurrent access to the structures being replaced. */
+    file_cache_free();
+    file_cache_config_t fc_cfg2 = {0};
+    fc_cfg2.enabled              = cfg->file_cache_enabled;
+    fc_cfg2.max_entries          = cfg->file_cache_max_entries;
+    fc_cfg2.ttl_seconds          = cfg->file_cache_ttl;
+    fc_cfg2.strategy             = (file_cache_strategy_t)cfg->file_cache_strategy;
+    fc_cfg2.mode                 = (file_cache_mode_t)cfg->file_cache_mode;
+    fc_cfg2.lock_kind            = (file_cache_lock_t)cfg->file_cache_lock;
+    fc_cfg2.n_shards             = cfg->file_cache_shards;
+    fc_cfg2.eviction             = (file_cache_eviction_t)cfg->file_cache_eviction;
+    fc_cfg2.negative_ttl_seconds = cfg->file_cache_negative_ttl;
+    fc_cfg2.mmap_threshold       = (size_t)cfg->file_cache_mmap_threshold;
+    fc_cfg2.max_memory_mb        = (size_t)cfg->file_cache_max_memory_mb;
+    fc_cfg2.watch                = (file_cache_watch_t)cfg->file_cache_watch;
+    file_cache_init(&fc_cfg2);
     event_loop_set_global_response_headers(
         cfg->response_header_add, cfg->response_header_add_count,
         cfg->response_header_remove, cfg->response_header_remove_count);

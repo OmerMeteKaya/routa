@@ -95,6 +95,28 @@ static const char *file_cache_strategy_name(int s) {
         default: return "stat_ttl";
     }
 }
+static const char *file_cache_mode_name(int m) {
+    switch (m) {
+        case 0: return "local";
+        case 1: return "shared_metadata";
+        case 2: return "shared_content";
+        default: return "shared_metadata";
+    }
+}
+static const char *file_cache_lock_name(int l) {
+    return l == 0 ? "global" : "sharded";
+}
+static const char *file_cache_eviction_name(int e) {
+    switch (e) {
+        case 0: return "lru";
+        case 1: return "lfu";
+        case 2: return "ttl_only";
+        default: return "lru";
+    }
+}
+static const char *file_cache_watch_name(int w) {
+    return w == 1 ? "inotify" : "none";
+}
 
 static const char *stream_lookup_name(h2_stream_lookup_t v) {
     return v == H2_STREAM_LOOKUP_HASHMAP ? "hashmap" : "linear";
@@ -244,6 +266,14 @@ static void write_server_conf(FILE *out, const char *server_name, const routa_co
     wi(out, "file_cache_entries", c->file_cache_max_entries);
     ws_(out, "file_cache_ttl", c->file_cache_ttl);
     fprintf(out, "file_cache_strategy = %s\n", file_cache_strategy_name(c->file_cache_strategy));
+    fprintf(out, "file_cache_mode = %s\n", file_cache_mode_name(c->file_cache_mode));
+    fprintf(out, "file_cache_lock = %s\n", file_cache_lock_name(c->file_cache_lock));
+    wi(out, "file_cache_shards", c->file_cache_shards);
+    fprintf(out, "file_cache_eviction = %s\n", file_cache_eviction_name(c->file_cache_eviction));
+    ws_(out, "file_cache_negative_ttl", c->file_cache_negative_ttl);
+    wi(out, "file_cache_mmap_threshold", c->file_cache_mmap_threshold);
+    wi(out, "file_cache_max_memory_mb", c->file_cache_max_memory_mb);
+    fprintf(out, "file_cache_watch = %s\n", file_cache_watch_name(c->file_cache_watch));
 
     fprintf(out, "\n# ── HTTP/2 ──\n");
     wb(out, "h2_enabled", c->h2.enabled);
