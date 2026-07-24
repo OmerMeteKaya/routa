@@ -349,6 +349,286 @@ fail:
     return NULL;
 }
 
+/* ── Async connection establishment (h2up_conn_create_async / advance) ──
+ *
+ * BUG FIX (H2/TLS failover): see h2up_async_state_t's doc comment in
+ * h2_client.h for the full root-cause writeup. Summary: the old
+ * h2up_conn_create() blocked the calling WORKER THREAD (not just the
+ * request) for the full duration of connect()+TLS handshake+H2 preface
+ * exchange -- routa is thread-per-worker, so a slow/dead upstream froze
+ * every other in-flight request on that worker too.
+ */
+
+/* -- internal: non-blocking connect() completion check -------------------- */
+static int h2up_check_connect_done(int fd) {
+    int serr = 0;
+    socklen_t slen = sizeof(serr);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &serr, &slen) < 0) return -1;
+    if (serr != 0) { errno = serr; return -1; }
+    return 0;
+}
+
+/* -- internal: build the preface+SETTINGS+WINDOW_UPDATE buffer once ------- */
+static void h2up_build_preface_buf(h2up_conn_t *h2up) {
+    buf_append(&h2up->preface_buf, h2_client_preface, H2_PREFACE_LEN);
+    uint8_t s[H2_FRAME_HDR_SZ] = {0, 0, 0, FRM_SETTINGS, 0, 0, 0, 0, 0};
+    buf_append(&h2up->preface_buf, s, H2_FRAME_HDR_SZ);
+    uint32_t inc = 0x3fffffff;
+    uint8_t wu[H2_FRAME_HDR_SZ + 4] = {
+        0, 0, 4, FRM_WINDOW_UPDATE, 0,
+        0, 0, 0, 0
+    };
+    wu[H2_FRAME_HDR_SZ + 0] = (uint8_t)((inc >> 24) & 0x7f);
+    wu[H2_FRAME_HDR_SZ + 1] = (uint8_t)((inc >> 16) & 0xff);
+    wu[H2_FRAME_HDR_SZ + 2] = (uint8_t)((inc >>  8) & 0xff);
+    wu[H2_FRAME_HDR_SZ + 3] = (uint8_t)( inc         & 0xff);
+    buf_append(&h2up->preface_buf, wu, H2_FRAME_HDR_SZ + 4);
+}
+
+/* -- internal: incrementally flush the preface buffer --------------------
+ * Returns 1 (in progress, caller should keep waiting), 0 (fully sent),
+ * -1 (hard error). */
+static int h2up_advance_preface_send(h2up_conn_t *h2up) {
+    if (h2up->preface_buf.len == 0) h2up_build_preface_buf(h2up);
+    while (h2up->preface_sent < h2up->preface_buf.len) {
+        /* tls_write(), not a raw SSL_write() -- honors the
+         * pending_write_len retry contract (see tls_conn_t's doc
+         * comment in tls.h) even though this call site only ever
+         * retries with a truly-unchanged remaining slice of
+         * preface_buf, so in practice it would already satisfy that
+         * contract on its own; using the wrapper keeps this call site
+         * consistent with the rest of the codebase rather than relying
+         * on that being incidentally true. */
+        ssize_t n = tls_write(h2up->tls,
+                              buf_data(&h2up->preface_buf) + h2up->preface_sent,
+                              h2up->preface_buf.len - h2up->preface_sent);
+        if (n > 0) { h2up->preface_sent += (size_t)n; continue; }
+        if (n == -1) return 1;
+        return -1;
+    }
+    return 0;
+}
+
+/* -- internal: incrementally read upstream's initial SETTINGS frame ------
+ * Returns 1 (in progress), 0 (SETTINGS applied + ACK sent), -1 (error).
+ * Mirrors h2up_exchange_settings()'s old blocking logic frame-for-frame,
+ * just resumable across multiple calls instead of looping internally. */
+static int h2up_advance_settings_read(h2up_conn_t *h2up) {
+    for (;;) {
+        if (h2up->settings_hdr_got < H2_FRAME_HDR_SZ) {
+            ssize_t n = tls_read(h2up->tls,
+                                 h2up->settings_hdr_buf + h2up->settings_hdr_got,
+                                 H2_FRAME_HDR_SZ - h2up->settings_hdr_got);
+            if (n > 0) { h2up->settings_hdr_got += (size_t)n; continue; }
+            if (n == -1) return 1;
+            return -1;
+        }
+
+        uint8_t *fhdr  = h2up->settings_hdr_buf;
+        uint32_t flen  = ((uint32_t)fhdr[0] << 16) | ((uint32_t)fhdr[1] << 8) | fhdr[2];
+        uint8_t  ftype = fhdr[3];
+        uint8_t  fflags= fhdr[4];
+
+        if (flen > 65536) {
+            LOG_WARN("h2up: server sent oversized frame type=%u len=%u during "
+                     "async settings exchange", ftype, flen);
+            return -1;
+        }
+
+        if (!h2up->settings_payload_buf && flen > 0) {
+            h2up->settings_payload_buf = malloc(flen);
+            if (!h2up->settings_payload_buf) return -1;
+            h2up->settings_payload_len = flen;
+            h2up->settings_payload_got = 0;
+        }
+
+        if (h2up->settings_payload_got < flen) {
+            ssize_t n = tls_read(h2up->tls,
+                                 h2up->settings_payload_buf + h2up->settings_payload_got,
+                                 flen - h2up->settings_payload_got);
+            if (n > 0) { h2up->settings_payload_got += (size_t)n; continue; }
+            if (n == -1) return 1;
+            return -1;
+        }
+
+        if (ftype == FRM_SETTINGS && !(fflags & FL_ACK)) {
+            const uint8_t *p = h2up->settings_payload_buf;
+            for (uint32_t i = 0; i + 6 <= flen; i += 6, p += 6) {
+                uint16_t id  = (uint16_t)(((uint32_t)p[0] << 8) | p[1]);
+                uint32_t val = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16)
+                             | ((uint32_t)p[4] <<  8) |  (uint32_t)p[5];
+                switch (id) {
+                case SETTINGS_MAX_CONCURRENT_STREAMS:
+                    h2up->peer_max_concurrent_streams = val;
+                    break;
+                case SETTINGS_INITIAL_WINDOW_SIZE:
+                    if (val > 0x7fffffffu) return -1;
+                    h2up->stream_init_window = (int32_t)val;
+                    for (int s = 0; s < H2UP_MAX_STREAMS; s++)
+                        h2up->streams[s].send_window = (int32_t)val;
+                    break;
+                case SETTINGS_MAX_FRAME_SIZE:
+                    if (val >= 16384 && val <= 16777215)
+                        h2up->peer_max_frame_size = val;
+                    break;
+                }
+            }
+            uint8_t ack[H2_FRAME_HDR_SZ] = {0, 0, 0, FRM_SETTINGS, FL_ACK,
+                                              0, 0, 0, 0};
+            ssize_t n = tls_write(h2up->tls, ack, H2_FRAME_HDR_SZ);
+            if (n <= 0) {
+                if (n == -1) return 1;
+                return -1;
+            }
+            return 0;
+        }
+
+        h2up->settings_frames_skipped++;
+        if (h2up->settings_frames_skipped >= 20) return -1;
+        h2up->settings_hdr_got = 0;
+        free(h2up->settings_payload_buf);
+        h2up->settings_payload_buf = NULL;
+        h2up->settings_payload_got = 0;
+        h2up->settings_payload_len = 0;
+    }
+}
+
+/* -- h2up_conn_create_async ------------------------------------------------
+ * Non-blocking equivalent of h2up_conn_create()'s step 1 (TCP connect)
+ * only -- everything else happens across subsequent h2up_conn_advance()
+ * calls, driven by poller events. */
+h2up_conn_t *h2up_conn_create_async(upstream_node_t *node)
+{
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(node->port);
+    if (inet_pton(AF_INET, node->host, &addr.sin_addr) != 1) {
+        LOG_ERROR("h2up: bad upstream IP '%s'", node->host);
+        return NULL;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    net_set_nonblocking(fd);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    int ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0 && errno != EINPROGRESS) {
+        LOG_WARN("h2up: connect to %s:%d failed: %s",
+                 node->host, node->port, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+
+    h2up_conn_t *h2up = calloc(1, sizeof(h2up_conn_t));
+    if (!h2up) { close(fd); return NULL; }
+    h2up->magic        = H2UP_MAGIC;
+    h2up->fd           = fd;
+    h2up->pending_node = node;
+    h2up->async_state  = H2UP_ASYNC_CONNECTING;
+    h2up->next_stream_id              = 1;
+    h2up->conn_send_window            = H2_DEFAULT_WINDOW;
+    h2up->stream_init_window          = H2_DEFAULT_WINDOW;
+    h2up->peer_max_concurrent_streams = 100;
+    h2up->peer_max_frame_size         = 16384;
+    buf_init(&h2up->write_buf);
+    buf_init(&h2up->read_buf);
+    buf_init(&h2up->preface_buf);
+    if (hpack_ctx_init(&h2up->hpack_tx, 4096, 1, 1, 0) < 0 ||
+        hpack_ctx_init(&h2up->hpack_rx, 4096, 0, 0, 0) < 0) {
+        hpack_ctx_free(&h2up->hpack_tx);
+        hpack_ctx_free(&h2up->hpack_rx);
+        buf_free(&h2up->write_buf);
+        buf_free(&h2up->read_buf);
+        buf_free(&h2up->preface_buf);
+        close(fd);
+        free(h2up);
+        return NULL;
+    }
+
+    return h2up;
+}
+
+/* -- h2up_conn_advance -------------------------------------------------- */
+int h2up_conn_advance(h2up_conn_t *h2up)
+{
+    if (h2up->async_state == H2UP_ASYNC_CONNECTING) {
+        if (h2up_check_connect_done(h2up->fd) < 0) {
+            LOG_WARN("h2up: async connect to %s:%d failed: %s",
+                     h2up->pending_node->host, h2up->pending_node->port,
+                     strerror(errno));
+            h2up->async_state = H2UP_ASYNC_FAILED;
+            return -1;
+        }
+
+        SSL_CTX *sctx = SSL_CTX_new(TLS_client_method());
+        if (!sctx) { h2up->async_state = H2UP_ASYNC_FAILED; return -1; }
+        SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, NULL);
+        SSL_CTX_set_mode(sctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+                               SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        static const unsigned char alpn_protos[] = "\x02h2\x08http/1.1";
+        SSL_CTX_set_alpn_protos(sctx, alpn_protos, sizeof(alpn_protos) - 1);
+        SSL *ssl = SSL_new(sctx);
+        SSL_CTX_free(sctx);
+        if (!ssl) { h2up->async_state = H2UP_ASYNC_FAILED; return -1; }
+        SSL_set_fd(ssl, h2up->fd);
+        SSL_set_connect_state(ssl);
+        SSL_set_tlsext_host_name(ssl, h2up->pending_node->host);
+
+        tls_conn_t *tc = calloc(1, sizeof(tls_conn_t));
+        if (!tc) { SSL_free(ssl); h2up->async_state = H2UP_ASYNC_FAILED; return -1; }
+        tc->ssl = ssl;
+        tc->fd  = h2up->fd;
+        h2up->tls = tc;
+
+        h2up->async_state = H2UP_ASYNC_TLS_HANDSHAKE;
+    }
+
+    if (h2up->async_state == H2UP_ASYNC_TLS_HANDSHAKE) {
+        int rc = tls_handshake(h2up->tls);
+        if (rc == 1 || rc == -1) return 1;
+        if (rc != 0) {
+            LOG_WARN("h2up: async TLS handshake to %s:%d failed",
+                     h2up->pending_node->host, h2up->pending_node->port);
+            h2up->async_state = H2UP_ASYNC_FAILED;
+            return -1;
+        }
+
+        const unsigned char *proto = NULL;
+        unsigned int plen = 0;
+        SSL_get0_alpn_selected(h2up->tls->ssl, &proto, &plen);
+        if (plen != 2 || memcmp(proto, "h2", 2) != 0) {
+            LOG_INFO("h2up: upstream %s:%d did not negotiate h2 (alpn len=%u)",
+                     h2up->pending_node->host, h2up->pending_node->port, plen);
+            h2up->async_state = H2UP_ASYNC_FAILED;
+            return -1;
+        }
+        h2up->async_state = H2UP_ASYNC_SENDING_PREFACE;
+    }
+
+    if (h2up->async_state == H2UP_ASYNC_SENDING_PREFACE) {
+        int rc = h2up_advance_preface_send(h2up);
+        if (rc < 0) { h2up->async_state = H2UP_ASYNC_FAILED; return -1; }
+        if (rc == 1) return 1;
+        h2up->async_state = H2UP_ASYNC_READING_SETTINGS;
+    }
+
+    if (h2up->async_state == H2UP_ASYNC_READING_SETTINGS) {
+        int rc = h2up_advance_settings_read(h2up);
+        if (rc < 0) { h2up->async_state = H2UP_ASYNC_FAILED; return -1; }
+        if (rc == 1) return 1;
+        h2up->async_state = H2UP_ASYNC_READY;
+        h2up->node = h2up->pending_node;
+        LOG_INFO("h2up: established H2 connection to %s:%d (async)",
+                 h2up->node->host, h2up->node->port);
+        return 0;
+    }
+
+    return h2up->async_state == H2UP_ASYNC_READY ? 0 : -1;
+}
+
 /* ── h2up_conn_free ──────────────────────────────────────────────────────── */
 
 void h2up_conn_free(h2up_conn_t *h2up)
@@ -369,11 +649,22 @@ void h2up_conn_free(h2up_conn_t *h2up)
     buf_free(&h2up->write_buf);
     buf_free(&h2up->read_buf);
 
+    /* BUG FIX (H2/TLS failover, async establishment): preface_buf and
+     * settings_payload_buf are new fields used only during the async
+     * connect/handshake/preface/settings sequence (see
+     * h2up_conn_create_async()/h2up_conn_advance()). A connection that
+     * fails partway through establishment (e.g. H2UP_ASYNC_FAILED from
+     * a dead upstream) still needs these freed -- without this, every
+     * failed async connection attempt would leak preface_buf's backing
+     * array and, if a SETTINGS frame header was ever parsed before
+     * failing, settings_payload_buf too. */
+    buf_free(&h2up->preface_buf);
+    free(h2up->settings_payload_buf);
     if (h2up->tls) {
-        SSL_shutdown(h2up->tls->ssl);
+        if (h2up->tls->handshake_done) SSL_shutdown(h2up->tls->ssl);
         tls_conn_free(h2up->tls);
     }
-    close(h2up->fd);
+    if (h2up->fd >= 0) close(h2up->fd);
     free(h2up);
 }
 
@@ -382,6 +673,21 @@ void h2up_conn_free(h2up_conn_t *h2up)
 int h2up_has_capacity(const h2up_conn_t *h2up)
 {
     if (!h2up || h2up->closed || h2up->goaway_received) return 0;
+    /* BUG FIX (H2/TLS failover, async establishment): a connection still
+     * being established (any state other than READY) has no negotiated
+     * peer_max_concurrent_streams yet and isn't safe to open a stream
+     * on (HPACK/H2 preface may not be fully exchanged). Rather than
+     * making new requests wait on a pending connection -- which would
+     * need a way to fan 502s out to every waiter if establishment later
+     * fails, and a way to open their streams once it succeeds --
+     * h2up_acquire_for_node() simply treats a non-READY connection as
+     * "no capacity" and opens another one. This matches nginx's own
+     * documented behavior for H2 upstream proxying (nginx opens a new
+     * upstream H2 connection per request rather than multiplexing onto
+     * an in-progress one; see nginx/nginx#1066), so this isn't a
+     * shortcut relative to industry practice, just a smaller-scale
+     * version of the same tradeoff. */
+    if (h2up->async_state != H2UP_ASYNC_READY) return 0;
     if (h2up->stream_count >= H2UP_MAX_STREAMS) return 0;
     if ((uint32_t)h2up->stream_count >= h2up->peer_max_concurrent_streams)
         return 0;
@@ -592,6 +898,7 @@ int h2up_begin_stream(h2up_conn_t *h2up, proxy_ctx_t *ctx,
 
     return (int)stream_id;
 }
+
 
 /* ── Response delivery helper ────────────────────────────────────────────── */
 

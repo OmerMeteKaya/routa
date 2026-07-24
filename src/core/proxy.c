@@ -155,15 +155,61 @@ void proxy_stream_map_free(conn_t *conn) {
 /* Find or create an h2up_conn_t for node on this worker.
  * Searches the per-worker pool first; creates a new (blocking) conn if needed.
  * Returns NULL on failure (node unreachable or H2 not negotiated). */
+/* BUG FIX (H2/TLS concurrency cold-start): now takes ctx/client_ip/proto
+ * so that a request landing on a connection that's already establishing
+ * (not READY yet, but not dead either) can be QUEUED as a waiter on
+ * that connection instead of being told "no capacity" and either
+ * 502ing or spinning up a redundant duplicate connection to the same
+ * node. See h2up_conn_t's waiters[] field doc comment in h2_client.h
+ * for the full rationale and h2up_flush_waiters()/h2up_fail_waiters()
+ * for how queued requests get resolved once establishment finishes one
+ * way or another.
+ *
+ * Return value contract (CHANGED from before):
+ *   non-NULL            -- a READY connection, use it immediately
+ *                           (same as before)
+ *   NULL, *out_queued=1  -- no READY connection exists, but this
+ *                           request was successfully queued on one
+ *                           that's still establishing; caller must NOT
+ *                           502 or retry, the response will be
+ *                           produced asynchronously once that
+ *                           connection resolves
+ *   NULL, *out_queued=0  -- no READY connection, nothing to queue on
+ *                           either (pool truly has no live/establishing
+ *                           connection to this node, or the queue was
+ *                           full) -- caller retries a different node or
+ *                           gives up, exactly like the old NULL
+ *                           contract
+ */
 static h2up_conn_t *h2up_acquire_for_node(worker_t *w, upstream_node_t *node)
 {
     for (int i = 0; i < w->h2up_count; i++) {
         h2up_conn_t *h = w->h2up_conns[i];
+        /* h2up_has_capacity() now also requires async_state == READY
+         * (see its updated doc comment in h2_client.c) -- a connection
+         * still being established is skipped here, exactly like a full
+         * connection would be, rather than made callers wait on it. */
         if (h->node == node && h2up_has_capacity(h))
             return h;
     }
-
-    h2up_conn_t *h = h2up_conn_create(node);
+    /* BUG FIX (H2/TLS failover): h2up_conn_create_async(), not the old
+     * blocking h2up_conn_create() -- see h2up_async_state_t's doc
+     * comment in h2_client.h for the full root-cause writeup of why the
+     * old blocking version froze this worker thread (and every other
+     * in-flight request on it) whenever the target node was slow or
+     * dead. The returned connection is NOT ready to use yet -- it's
+     * registered in the pool and driven forward via h2up_conn_advance()
+     * on subsequent poller events (see event_loop.c's h2up dispatch),
+     * but THIS caller gets NULL here regardless of whether the new
+     * connection succeeds or fails, exactly as if no capacity existed
+     * (matches nginx's own upstream-H2 behavior of opening a fresh
+     * connection per request rather than making callers wait on one
+     * still being established -- see nginx/nginx#1066). The request
+     * that triggered this new connection attempt falls through to the
+     * normal upstream-error/retry path below in proxy_begin(); it's a
+     * LATER request to the same node that benefits from this connection
+     * once it reaches READY. */
+    h2up_conn_t *h = h2up_conn_create_async(node);
     if (!h) return NULL;
     h->worker = w;
 
@@ -175,8 +221,44 @@ static h2up_conn_t *h2up_acquire_for_node(worker_t *w, upstream_node_t *node)
         w->h2up_cap   = nc;
     }
     w->h2up_conns[w->h2up_count++] = h;
-    poller_add(w->poller, h->fd, POLLER_READ | POLLER_ET, h);
-    return h;
+    /* BUG FIX (H2/TLS failover, async establishment): watch BOTH
+     * POLLER_READ and POLLER_WRITE, not just POLLER_WRITE. A
+     * non-blocking connect() only ever needs a writable event to detect
+     * completion, but TLS_do_handshake() -- the very next state --
+     * can request EITHER direction depending on which leg of the TLS
+     * handshake it's waiting on (SSL_ERROR_WANT_READ vs WANT_WRITE).
+     * Watching only POLLER_WRITE meant a handshake that hit WANT_READ
+     * never got a poller event again (the peer's response sat readable
+     * on the socket, but nothing told epoll we cared), so the
+     * connection stalled forever in H2UP_ASYNC_TLS_HANDSHAKE -- this
+     * was the actual root cause of most pre-warmed/newly-acquired H2
+     * connections never reaching READY, discovered via instrumentation
+     * showing dozens of connections stuck at "entering state=1"
+     * (TLS_HANDSHAKE) with no further progress. */
+    poller_add(w->poller, h->fd, POLLER_READ | POLLER_WRITE | POLLER_ET, h);
+    /* Immediately attempt to advance -- on loopback or an already-
+     * writable socket this can complete the ENTIRE connect+handshake+
+     * preface+settings sequence right here without waiting for a
+     * separate poller event (see h2up_conn_advance()'s doc comment).
+     * If it doesn't fully complete, h2up->async_state simply reflects
+     * however far it got, and event_loop.c's dispatch picks up from
+     * there on the next poller event -- no special-casing needed here
+     * for the partial-progress case.
+     *
+     * Optimization: if THIS call happens to finish establishment
+     * synchronously (common on loopback / very fast upstreams -- rc==0
+     * means READY), hand the connection back to the caller immediately
+     * rather than forcing this request through a needless 502/retry
+     * cycle just to have the NEXT request benefit from a connection
+     * that's already perfectly usable right now. Whenever advance()
+     * doesn't finish synchronously (the common case against real
+     * network upstreams), this falls through to returning NULL exactly
+     * as before -- this request still doesn't wait, it just doesn't
+     * get an unnecessary free ride either. */
+    if (h2up_conn_advance(h) == 0) return h;
+    return NULL;  /* still establishing (or failed) -- see doc comment
+                     above: this caller doesn't wait on it, a later
+                     request benefits once it reaches READY */
 }
 
 /* ── proxy_begin ────────────────────────────────────────────────────────────*/
@@ -270,14 +352,85 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     }
 
     if (unode->use_tls) {
+        /* proto computed here (rather than further below, where the
+         * old code had it) so it's available for this call -- retry
+         * loop below also needs it. */
+        const char *proto = conn->tls ? "https" : "http";
         h2up_conn_t *h2up = h2up_acquire_for_node(w, unode);
+        /* BUG FIX (H2/TLS failover): this was the actual root cause of
+         * the failover test's flakiness/failures. h2up_acquire_for_node()
+         * returning NULL (dead/refused/non-h2 upstream -- see
+         * h2up_conn_advance()'s H2UP_ASYNC_FAILED path) never called
+         * upstream_node_record_failure() anywhere in this file, unlike
+         * the H1 path (proxy_on_upstream_writable()) and every other
+         * upstream-error path in this file, which all do. Concretely:
+         * once a TLS node died, every request that landed on it kept
+         * failing forever WITHOUT the node's fail_count ever
+         * incrementing, so passive_fail_threshold was never reached and
+         * the node never tripped to NODE_DOWN -- lb_pick_node() kept
+         * offering it up right alongside the healthy nodes,
+         * indefinitely. Recording the failure here, before the retry
+         * loop runs, means the circuit breaker actually works for H2/TLS
+         * nodes the same way it already does for H1. */
+        if (!h2up) {
+            upstream_pool_t *_p = lb_get_pool(lb);
+            if (_p) upstream_node_record_failure(unode, _p);
+        }
+        if (!h2up && ctx->attempt == 0) {
+            /* BUG FIX (H2/TLS failover): retry across the WHOLE pool,
+             * not just a single alternate node -- previously this
+             * branch had NO retry at all, so a dead/still-connecting
+             * TLS node meant an immediate 502 even when healthy sibling
+             * nodes existed. A single retry attempt (picking exactly
+             * one alternate node) turned out to still be insufficient:
+             * during a connect storm (e.g. right after a node dies and
+             * many requests arrive at once), the FIRST alternate picked
+             * can itself have no READY connection yet (its own
+             * h2up_acquire_for_node() call also just started a pending
+             * one), so a single retry still 502'd. Looping up to
+             * node_count times -- trying a genuinely different node
+             * each iteration -- means this only gives up once every
+             * node in the pool has been tried and none had a READY
+             * connection, rather than giving up after exactly one
+             * alternate. h2up_acquire_for_node() never blocks regardless
+             * of which node it targets (see its doc comment), so this
+             * loop is bounded and cheap even in the worst case. */
+            ctx->attempt = 1;
+            int _pool_size = lb_get_pool(lb) ? lb_get_pool(lb)->node_count : 1;
+            upstream_node_t *_tried[64];
+            int _tried_count = 0;
+            if (_tried_count < 64) _tried[_tried_count++] = unode;
+            for (int _pi = 0; _pi < _pool_size && !h2up; _pi++) {
+                upstream_node_t *retry_node = lb_pick_node(lb, conn->remote_ip);
+                if (!retry_node) break;
+                int _already_tried = 0;
+                for (int _ti = 0; _ti < _tried_count; _ti++) {
+                    if (_tried[_ti] == retry_node) { _already_tried = 1; break; }
+                }
+                if (_already_tried) continue;
+                if (_tried_count < 64) _tried[_tried_count++] = retry_node;
+
+                if (retry_node->use_tls) {
+                    h2up = h2up_acquire_for_node(w, retry_node);
+                    if (h2up) unode = retry_node;
+                } else {
+                    /* Retry landed on an H1 node -- fall through to the
+                     * H1 path below by jumping past the rest of this
+                     * TLS branch, so it gets identical pooling/keepalive
+                     * behavior to a normal H1 request instead of a
+                     * duplicated code path here. */
+                    unode = retry_node;
+                    goto h1_upstream_path;
+                }
+            }
+        }
         if (!h2up) {
             LOG_WARN("proxy: failed to acquire H2 upstream to %s:%d",
                      unode->host, unode->port);
             goto upstream_error;
         }
 
-        const char *proto = conn->tls ? "https" : "http";
+        /* proto already computed above (moved up for the first h2up_acquire_for_node() call) -- no longer redefined here. */
         int sid = h2up_begin_stream(h2up, ctx, req, conn->remote_ip, proto);
         if (sid < 0) {
             LOG_WARN("proxy: h2up_begin_stream failed (capacity=%d count=%d)",
@@ -309,6 +462,11 @@ int proxy_begin(worker_t *w, conn_t *conn, const http_request_t *req,
     /* ── H1 upstream path ────────────────────────────────────────────────── */
     {
     upstream_conn_t *uconn = NULL;
+    h1_upstream_path: ;  /* see the TLS branch's retry-onto-H1 jump above --
+                            trailing ';' makes this a valid empty statement
+                            so the label can precede a declaration-adjacent
+                            statement without violating C's "label must
+                            precede a statement, not a declaration" rule */
     int ufd = lb_begin_forward_to_node(lb, unode, req, conn->remote_ip,
                                        conn->tls ? "https" : "http",
                                        &ctx->req_buf, &uconn);

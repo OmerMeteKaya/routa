@@ -644,6 +644,65 @@ static void handle_events_worker(worker_t *w) {
         /* ── H2 upstream fd event ──────────────────────────────────────── */
         if (((uint32_t *)events[i].ptr)[0] == H2UP_MAGIC) {
             h2up_conn_t *h2up = (h2up_conn_t *)events[i].ptr;
+            /* BUG FIX (H2/TLS failover, async establishment): a
+             * connection still being established (async_state !=
+             * H2UP_ASYNC_READY) must be driven forward via
+             * h2up_conn_advance(), NOT h2up_on_writable()/
+             * h2up_on_readable() -- those assume a fully negotiated H2
+             * connection (valid HPACK contexts, known peer settings)
+             * that an in-progress connect/handshake/preface/settings
+             * sequence doesn't have yet. See h2up_async_state_t's doc
+             * comment in h2_client.h for the full design. */
+            if (h2up->async_state != H2UP_ASYNC_READY) {
+                int rc = h2up_conn_advance(h2up);
+                if (rc == 0) {
+                    /* Just became ready: this fd was registered with
+                     * POLLER_WRITE (see h2up_acquire_for_node()'s
+                     * poller_add() call) -- switch it to the same
+                     * POLLER_READ | POLLER_ET the old synchronous path
+                     * used post-handshake, so normal H2 frame traffic
+                     * is observed from here on. */
+                    poller_mod(w->poller, h2up->fd, POLLER_READ | POLLER_ET, h2up);
+                } else if (rc < 0) {
+                    /* Establishment failed (dead/refused/non-h2 peer).
+                     * No in-flight streams exist yet on a connection
+                     * that never reached READY (h2up_acquire_for_node()
+                     * never hands out a non-READY connection to a
+                     * caller -- see its doc comment), so there's
+                     * nothing to fan a 502 out to here; just tear the
+                     * failed connection down. Removing it from the
+                     * worker's h2up_conns[] pool (swap-with-last, same
+                     * pattern used elsewhere in this codebase for
+                     * pool-array removal) prevents a future
+                     * h2up_acquire_for_node() call from ever matching
+                     * this dead entry by pointer. */
+                    /* BUG FIX (H2/TLS failover): a connection attempt
+                     * failing HERE (already in flight -- pre-warmed, or
+                     * started by an earlier request that didn't wait on
+                     * it, see h2up_acquire_for_node()'s doc comment) also
+                     * needs to count as a failure against the node, or a
+                     * dead node's fail_count only ever increments from
+                     * the synchronous-NULL path in proxy.c and can take
+                     * much longer (or never) to reach
+                     * passive_fail_threshold if requests keep landing on
+                     * newly-started pending connections instead. */
+                    if (h2up->pending_node && h2up->pending_node->pool) {
+                        upstream_node_record_failure(h2up->pending_node,
+                                                     h2up->pending_node->pool);
+                    }
+                    poller_del(w->poller, h2up->fd);
+                    for (int _hi = 0; _hi < w->h2up_count; _hi++) {
+                        if (w->h2up_conns[_hi] == h2up) {
+                            w->h2up_conns[_hi] = w->h2up_conns[--w->h2up_count];
+                            break;
+                        }
+                    }
+                    h2up_conn_free(h2up);
+                }
+                /* rc == 1: still in progress, wait for the next poller
+                 * event -- nothing more to do this turn. */
+                continue;
+            }
             /* Drain both directions in a flat loop on this single
              * epoll_wait turn, instead of nesting h2up_on_readable() and
              * h2up_on_writable() inside each other (as used to happen via
@@ -2212,7 +2271,27 @@ static void *worker_run(void *arg) {
                 upstream_node_t *_nd = _p->nodes[_ni];
                 if (!_nd->use_tls) continue;
                 for (int _k = 0; _k < pre_warm; _k++) {
-                    h2up_conn_t *_h = h2up_conn_create(_nd);
+                    /* BUG FIX (H2/TLS failover): h2up_conn_create_async(),
+                     * not the old blocking h2up_conn_create() -- pre-warming
+                     * with the blocking version defeated its own purpose
+                     * (this comment block's stated goal is "so the first
+                     * request burst doesn't block the event loop", but the
+                     * blocking connect+handshake+preface+settings sequence
+                     * blocked the WORKER THREAD ITSELF during pre-warm, at
+                     * worker startup, before any requests even existed).
+                     * It also produced h2up_conn_t entries whose
+                     * async_state was left at its zero-value default
+                     * (H2UP_ASYNC_CONNECTING) despite being fully
+                     * established -- h2up_has_capacity() then wrongly
+                     * treated every pre-warmed connection as "still
+                     * connecting" and never let real requests use them,
+                     * forcing h2up_acquire_for_node() to open brand new
+                     * connections for every request instead (visible as
+                     * TLS "unexpected message" errors when the new async
+                     * dispatch in this same function's event-handling code
+                     * later tried to advance a connection that was already
+                     * fully negotiated). */
+                    h2up_conn_t *_h = h2up_conn_create_async(_nd);
                     if (!_h) break;
                     _h->worker = w;
                     if (w->h2up_count >= w->h2up_cap) {
@@ -2224,7 +2303,18 @@ static void *worker_run(void *arg) {
                         w->h2up_cap   = _nc;
                     }
                     w->h2up_conns[w->h2up_count++] = _h;
-                    poller_add(w->poller, _h->fd, POLLER_READ, _h);
+                    /* Same fix as h2up_acquire_for_node() in proxy.c --
+                     * see its doc comment for why POLLER_WRITE alone
+                     * left TLS handshakes stuck forever whenever they
+                     * hit SSL_ERROR_WANT_READ. */
+                    poller_add(w->poller, _h->fd, POLLER_READ | POLLER_WRITE | POLLER_ET, _h);
+                    /* Attempt to advance immediately -- same rationale as
+                     * h2up_acquire_for_node()'s identical call: often
+                     * completes synchronously on loopback/fast upstreams,
+                     * otherwise the event loop's h2up dispatch (this same
+                     * file, see the H2UP_MAGIC branch) picks up from
+                     * whatever async_state this left it in. */
+                    h2up_conn_advance(_h);
                 }
             }
         }

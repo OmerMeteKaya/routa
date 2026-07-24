@@ -170,6 +170,16 @@ struct upstream_node {
 
     /* TLS upstream: 1 = connect with TLS, try ALPN h2 */
     int                use_tls;
+
+    /* Back-reference to the pool this node belongs to. Set once by
+     * upstream_pool_add_node() at pool construction time. Lets any code
+     * holding just an upstream_node_t* (e.g. event_loop.c's H2/TLS
+     * async-establishment dispatch, which only has h2up->pending_node,
+     * not the lb_t/pool the request came from) call
+     * upstream_node_record_failure()/record_success() without needing
+     * the caller to separately thread a pool pointer through -- see the
+     * H2/TLS failover circuit-breaker fix this was added for. */
+    struct upstream_pool *pool;
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════

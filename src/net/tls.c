@@ -490,6 +490,17 @@ int tls_handshake(tls_conn_t *tc) {
 
     if (tc->handshake_done) return 0;
 
+    /* BUG FIX (H2/TLS failover flakiness): SSL_get_error()'s contract
+     * requires the calling thread's OpenSSL error queue to be empty
+     * before the SSL_* I/O call, or it misreports what actually
+     * happened. In routa's thread-per-worker model, this worker thread
+     * may have just serviced a DIFFERENT (possibly dead/failing)
+     * connection and left a real error on the queue; without clearing
+     * it here, a benign WANT_READ/WANT_WRITE on THIS handshake can get
+     * misclassified as SSL_ERROR_SSL, causing an async H2 connection
+     * establishment to spuriously fail even though the peer is healthy
+     * and the handshake simply isn't done yet. */
+    ERR_clear_error();
     int ret = SSL_do_handshake(tc->ssl);
     if (ret == 1) {
         tc->handshake_done = 1;
@@ -512,6 +523,23 @@ int tls_handshake(tls_conn_t *tc) {
 ssize_t tls_read(tls_conn_t *tc, void *buf, size_t len) {
     if (!tc || !buf || !tc->handshake_done) return -2;
 
+    /* BUG FIX (H2/TLS failover flakiness -- root cause of nodes A/C
+     * being spuriously marked NODE_DOWN during the failover test even
+     * though only node B was ever killed): see tls_handshake()'s
+     * matching comment for the full contract explanation. Confirmed via
+     * instrumentation: SSL_read() returning -1 with errno==EAGAIN (a
+     * completely normal "no data yet" on a non-blocking socket) was
+     * being reported by SSL_get_error() as SSL_ERROR_SSL instead of
+     * SSL_ERROR_WANT_READ, whenever this worker thread's error queue
+     * still held a stale entry from a genuinely failed connection
+     * (e.g. the just-killed node) serviced earlier in the same epoll
+     * batch. That misclassification made tls_read() return -2
+     * ("permanent error") for a perfectly healthy connection, which
+     * h2up_on_readable() then force-closed, charging the healthy
+     * node's circuit breaker with a bogus failure -- three of those in
+     * a row tripped it to NODE_DOWN despite the node never having
+     * failed a single real request. */
+    ERR_clear_error();
     int n = SSL_read(tc->ssl, buf, (int)len);
     if (n > 0) return n;
 
@@ -556,6 +584,13 @@ ssize_t tls_write(tls_conn_t *tc, const void *buf, size_t len) {
          * expected path. */
     }
 
+    /* BUG FIX (H2/TLS failover flakiness): same OpenSSL error-queue
+     * contract issue as tls_read()/tls_handshake() -- see
+     * tls_handshake()'s comment for the full explanation. Clearing here
+     * does not interact with the pending_write_len retry-length clamp
+     * above (that's about matching the byte length OpenSSL expects on
+     * retry, unrelated to the error queue). */
+    ERR_clear_error();
     int n = SSL_write(tc->ssl, buf, (int)call_len);
     if (n > 0) {
         tc->pending_write_len = 0;

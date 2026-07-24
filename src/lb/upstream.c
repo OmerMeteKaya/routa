@@ -831,5 +831,10 @@ int upstream_pool_add_node(upstream_pool_t *pool, upstream_node_t *node) {
     if (!tmp) return -1;
     pool->nodes = tmp;
     pool->nodes[pool->node_count++] = node;
+    /* Back-reference so any code holding just an upstream_node_t* can
+     * reach its owning pool -- see the field's doc comment in
+     * upstream.h for why this was added (H2/TLS failover circuit-
+     * breaker fix). */
+    node->pool = pool;
     return 0;
 }

@@ -21,6 +21,33 @@ struct proxy_ctx;
  * Go's default SETTINGS_MAX_CONCURRENT_STREAMS is 250.                      */
 #define H2UP_MAX_STREAMS 256
 
+/* -- Async connection-establishment state machine ------------------------
+ * BUG FIX (H2/TLS failover): h2up_conn_create() used to do TCP connect,
+ * TLS handshake, H2 preface send, and initial SETTINGS read all
+ * SYNCHRONOUSLY on the calling worker thread. If the upstream node was
+ * unreachable or slow to respond (e.g. killed mid-connection, as in the
+ * "kill one node out of three" failover test), this blocked the ENTIRE
+ * worker thread for up to several seconds -- since routa is thread-per-
+ * worker (not process-per-worker), this froze every OTHER request that
+ * worker was handling too, not just requests to the dead node. This is
+ * why the failover test saw ~59/60 failures instead of the expected
+ * ~20/60 (only the dead node's own share): a single blocked worker
+ * thread starved all its other in-flight requests until the timeout.
+ *
+ * This enum tracks progress through the same phases h2up_conn_create()
+ * used to do blockingly, now driven one poller event at a time -- the
+ * same pattern already used for frontend TLS handshakes (see
+ * event_loop.c's CONN_TLS_HANDSHAKE) and H1 upstream connects (see
+ * proxy.h's PROXY_STATE_CONNECTING). */
+typedef enum {
+    H2UP_ASYNC_CONNECTING       = 0,  /* non-blocking connect() in flight */
+    H2UP_ASYNC_TLS_HANDSHAKE    = 1,  /* SSL_do_handshake() in progress */
+    H2UP_ASYNC_SENDING_PREFACE  = 2,  /* writing preface+SETTINGS+WINDOW_UPDATE */
+    H2UP_ASYNC_READING_SETTINGS = 3,  /* reading frames until peer SETTINGS seen */
+    H2UP_ASYNC_READY            = 4,  /* fully negotiated, can open streams */
+    H2UP_ASYNC_FAILED           = 5   /* terminal error state */
+} h2up_async_state_t;
+
 /* ── Per-stream state ────────────────────────────────────────────────────── */
 typedef struct {
     uint32_t          stream_id;   /* 0 = free slot                         */
@@ -72,6 +99,38 @@ typedef struct h2up_conn {
 
     /* Intrusive linked list for worker's h2up pool */
     struct h2up_conn *next;
+
+    /* -- Async establishment state (see h2up_async_state_t doc comment) -- */
+    h2up_async_state_t async_state;
+    struct upstream_node *pending_node;  /* target, valid from CONNECTING
+                                             through READY; ->node itself is
+                                             only set once fully established,
+                                             preserving old code's invariant
+                                             that a non-NULL ->node means a
+                                             usable connection */
+    void             *client_ssl_ctx;    /* SSL_CTX*, kept until handshake
+                                             completes then freed -- void* so
+                                             this header doesn't need to
+                                             pull in openssl/ssl.h */
+
+    /* Preface + initial SETTINGS + WINDOW_UPDATE, built once and flushed
+     * incrementally across possibly-multiple POLLER_WRITE events. */
+    buf_t             preface_buf;
+    size_t            preface_sent;
+
+    /* Upstream's initial SETTINGS frame, accumulated incrementally across
+     * possibly-multiple POLLER_READ events (mirrors ssl_read_exactly()'s
+     * old blocking behavior, but now resumable). Any non-SETTINGS frames
+     * seen first (e.g. a stray WINDOW_UPDATE) are read and discarded the
+     * same way the old blocking code skipped them, just one frame at a
+     * time instead of in a tight loop. */
+    uint8_t           settings_hdr_buf[9];  /* H2_FRAME_HDR_SZ, defined in .c */
+    size_t            settings_hdr_got;
+    uint8_t          *settings_payload_buf;   /* allocated once header is known */
+    size_t            settings_payload_got;
+    uint32_t          settings_payload_len;
+    int               settings_frames_skipped; /* mirrors old "attempts < 20" bound */
+
 } h2up_conn_t;
 
 /* ── API ─────────────────────────────────────────────────────────────────── */
@@ -79,6 +138,35 @@ typedef struct h2up_conn {
 /* Blocking: TCP connect + TLS handshake + H2 client-preface exchange.
  * Returns h2up_conn_t if ALPN negotiated "h2", NULL on error or no H2.      */
 h2up_conn_t *h2up_conn_create(struct upstream_node *node);
+
+/* Non-blocking: starts a TCP connect() and returns immediately with a
+ * h2up_conn_t in H2UP_ASYNC_CONNECTING state (or NULL if the initial
+ * socket()/connect() call fails synchronously, e.g. bad address).
+ * Caller must poller_add() the returned conn's fd with POLLER_WRITE and
+ * call h2up_conn_advance() on every subsequent poller event for that fd
+ * until it returns a definitive result (see h2up_conn_advance's doc
+ * comment). The returned h2up_conn_t is NOT yet usable for
+ * h2up_begin_stream() -- check ->async_state == H2UP_ASYNC_READY (or
+ * rely on h2up_conn_advance()'s return value) first. */
+h2up_conn_t *h2up_conn_create_async(struct upstream_node *node);
+
+/* Advances the async connection-establishment state machine by one
+ * step in response to a poller event (POLLER_READ and/or POLLER_WRITE
+ * -- pass whatever the poller reported, this function checks internally
+ * which one(s) it actually needs for the current state).
+ *
+ * Returns:
+ *    1  if still in progress (caller should keep waiting for more
+ *       poller events; may need poller_mod() to flip between
+ *       POLLER_READ/POLLER_WRITE interest depending on the new state --
+ *       see the implementation's per-state comments for exactly when)
+ *    0  if the connection just became fully ready (H2UP_ASYNC_READY) --
+ *       caller can now call h2up_begin_stream() on it
+ *   -1  if the connection failed (h2up->async_state is now
+ *       H2UP_ASYNC_FAILED) -- caller should treat this exactly like the
+ *       old h2up_conn_create() returning NULL: h2up_conn_free() this
+ *       conn and fail/retry the request(s) waiting on it. */
+int h2up_conn_advance(h2up_conn_t *h2up);
 
 void         h2up_conn_free(h2up_conn_t *h2up);
 
@@ -103,5 +191,6 @@ void h2up_stream_remove(h2up_conn_t *h2up, uint32_t stream_id);
 
 /* Returns 1 if there is room for another stream.                            */
 int  h2up_has_capacity(const h2up_conn_t *h2up);
+
 
 #endif /* ROUTA_NET_H2_CLIENT_H */
