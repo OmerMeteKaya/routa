@@ -1,0 +1,28 @@
+[package]
+name = "routa"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mio = { version = "1", features = ["os-poll", "net"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+slab = "0.4"
+socket2 = { version = "0.5", features = ["all"] }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+rcgen = "0.14"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "unwind"   # bilinçli: worker-failover panic=unwind'a dayanıyor, "abort" OLMAMALI
+
+[lib]
+name = "routa"
+path = "src/lib.rs"
+
+[[bin]]
+name = "routa"
+path = "src/main.rs"
