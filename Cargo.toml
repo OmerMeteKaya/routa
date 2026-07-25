@@ -10,6 +10,10 @@ rustls-pemfile = "2"
 slab = "0.4"
 socket2 = { version = "0.5", features = ["all"] }
 webpki-roots = "0.26"
+dashmap = "6"
+memmap2 = "0.9"
+lru = "0.12"
+notify = "6"
 
 [dev-dependencies]
 rcgen = "0.14"

@@ -199,7 +199,7 @@ const MONTHS: [&str; 12] = [
 /// RFC 9110 IMF-fixdate format. Implements the same civil-calendar
 /// arithmetic `gmtime` does, restricted to what formatting the `Date`
 /// header needs (no timezone handling -- always UTC).
-fn format_http_date(unix_secs: u64) -> String {
+pub(crate) fn format_http_date(unix_secs: u64) -> String {
     let days_since_epoch = unix_secs / 86400;
     let secs_of_day = unix_secs % 86400;
     let hour = secs_of_day / 3600;
