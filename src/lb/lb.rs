@@ -20,9 +20,8 @@
 //! (adding/removing/reordering upstreams), even though nothing about
 //! that specific node actually changed.
 
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::lb::upstream::{NodeState, UpstreamPool, UpstreamNode};
 
