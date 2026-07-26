@@ -20,7 +20,7 @@
 //! collection.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -153,8 +153,12 @@ pub struct UpstreamNode {
     /// `weight` each pick, the winner decremented by the pool's total
     /// weight -- nginx-style, so bursts of the same high-weight node
     /// get spread out rather than clustered. Owned by `lb::pick_wrr`,
-    /// not read/written anywhere else.
-    pub current_weight: AtomicU32,
+    /// not read/written anywhere else. Signed: this value legitimately
+    /// goes negative right after a node wins (it's immediately
+    /// decremented by the full total weight), so an unsigned type
+    /// would silently wrap to a huge positive value instead and make
+    /// that node win every subsequent pick forever.
+    pub current_weight: AtomicI32,
 
     state: AtomicU32, // encodes NodeStateCode
 
@@ -211,7 +215,7 @@ impl UpstreamNode {
             host,
             port,
             weight,
-            current_weight: AtomicU32::new(0),
+            current_weight: AtomicI32::new(0),
             state: AtomicU32::new(NodeStateCode::Up as u32),
             fail_count: AtomicU32::new(0),
             success_count: AtomicU32::new(0),
