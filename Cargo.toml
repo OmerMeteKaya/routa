@@ -15,7 +15,7 @@ memmap2 = "0.9"
 lru = "0.12"
 notify = "6"
 arc-swap = "1"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 subtle = "2"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
