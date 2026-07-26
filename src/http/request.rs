@@ -52,6 +52,11 @@ impl HttpMethod {
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
+    /// The client's address, if known. `None` for requests constructed
+    /// without a real connection (e.g. some tests) -- set by the
+    /// connection layer after `parse` returns, since parsing itself
+    /// has no notion of which socket a request arrived on.
+    pub remote_addr: Option<std::net::IpAddr>,
     /// URL-decoded, normalized (dot-segments resolved, duplicate
     /// slashes collapsed). Always starts with `/`.
     pub path: String,
@@ -619,6 +624,7 @@ pub fn parse(buf: &Buf, max_body_size: usize) -> ParseOutcome {
     ParseOutcome::Complete {
         request: HttpRequest {
             method,
+            remote_addr: None, // filled in by the connection layer
             path,
             query: query_owned,
             query_params,

@@ -237,6 +237,7 @@ mod tests {
     fn make_request(method: HttpMethod, path: &str) -> HttpRequest {
         HttpRequest {
             method,
+            remote_addr: None,
             path: path.to_string(),
             query: None,
             query_params: Vec::new(),
