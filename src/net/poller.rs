@@ -162,6 +162,15 @@ impl MioPoller {
     fn token_to_key(token: Token) -> PollKey {
         PollKey(token.0)
     }
+
+    /// Exposes the underlying `mio::Registry` so callers can build a
+    /// `mio::Waker` bound to this poller (see `http::ws::WsRegistry`,
+    /// which uses one to let a broadcast sent from another thread wake
+    /// this poller's `poll()` call promptly instead of waiting for its
+    /// next timeout).
+    pub fn registry(&self) -> &mio::Registry {
+        self.poll.registry()
+    }
 }
 
 impl EventPoller for MioPoller {
