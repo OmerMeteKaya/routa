@@ -899,6 +899,7 @@ dependencies = [
  "dashmap",
  "flate2",
  "jsonwebtoken",
+ "libc",
  "lru",
  "memmap2",
  "mio 1.2.2",

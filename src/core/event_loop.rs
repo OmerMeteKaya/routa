@@ -288,7 +288,7 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
             crate::http::request::ParseOutcome::Invalid(_) => {
                 let mut resp = crate::http::response::HttpResponse::new(400, "Bad Request");
                 resp.set_header("Connection", "close");
-                queue_http1_response(connections, idx, &resp);
+                queue_http1_response(connections, idx, resp);
                 connections[idx].closing = true;
                 return Ok(());
             }
@@ -321,15 +321,15 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                 );
 
                 if is_upgrade && response.status == 101 {
-                    queue_http1_response(connections, idx, &response);
                     let pmd = negotiate_pmd_from_response(&response);
+                    queue_http1_response(connections, idx, response);
                     connections[idx].protocol = ConnectionProtocol::WebSocket(WsConnection::new(pmd, 16 * 1024 * 1024));
                     flush_transport(connections, idx)?;
                     return Ok(());
                 }
 
                 let keep_alive = request.keep_alive && response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
-                queue_http1_response(connections, idx, &response);
+                queue_http1_response(connections, idx, response);
 
                 let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else {
                     unreachable!()
@@ -358,13 +358,23 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
     Ok(())
 }
 
-fn queue_http1_response(connections: &mut Slab<Connection>, idx: usize, response: &crate::http::response::HttpResponse) {
+fn queue_http1_response(connections: &mut Slab<Connection>, idx: usize, mut response: crate::http::response::HttpResponse) {
     let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else {
         return;
     };
+    let file_body = response.file_body.take();
+
     let mut serialized = crate::util::buf::Buf::new();
-    response.serialize(&mut serialized);
+    response.serialize(&mut serialized); // body is empty when file_body was Some, so this only writes headers
     h1.write_buf.push(serialized.as_slice());
+
+    if let Some(fb) = file_body {
+        h1.pending_file = Some(crate::core::conn::PendingFileSend {
+            file: fb.file,
+            offset: fb.offset,
+            remaining: fb.len,
+        });
+    }
 }
 
 /// Reads `Sec-WebSocket-Extensions` back off the handshake response
@@ -456,7 +466,7 @@ fn flush_transport(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
             ConnectionProtocol::Handshaking => &[],
         };
         if pending.is_empty() {
-            return Ok(());
+            break;
         }
 
         let write_result = match &mut conn.transport {
@@ -486,6 +496,77 @@ fn flush_transport(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
+        }
+    }
+
+    flush_pending_file(connections, idx)
+}
+
+/// Sends a queued file-backed response body (see `PendingFileSend`),
+/// preferring `sendfile(2)` on a plaintext transport (kernel-space
+/// file-to-socket copy, no userspace buffer) and falling back to an
+/// ordinary read-then-write on a TLS transport (which must encrypt in
+/// userspace before any byte reaches the kernel, so there's no file
+/// descriptor for the kernel to copy directly from). Only reached
+/// once `flush_transport`'s own header write_buf has fully drained --
+/// the headers must precede the body on the wire.
+fn flush_pending_file(connections: &mut Slab<Connection>, idx: usize) -> std::io::Result<()> {
+    loop {
+        let conn = &mut connections[idx];
+        let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
+            return Ok(()); // only H1 currently supports a file-backed body (see PendingFileSend's doc comment)
+        };
+        let Some(pending) = &mut h1.pending_file else {
+            return Ok(());
+        };
+        if pending.remaining == 0 {
+            h1.pending_file = None;
+            return Ok(());
+        }
+
+        match &mut conn.transport {
+            Transport::Plain(stream) => {
+                let socket_fd = std::os::unix::io::AsRawFd::as_raw_fd(stream);
+                let want = pending.remaining.min(4 * 1024 * 1024) as usize; // cap per-call size, same rationale as any other chunked transfer in this codebase
+                match crate::net::socket::sendfile(&pending.file, socket_fd, &mut pending.offset, want) {
+                    Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "sendfile returned 0")),
+                    Ok(n) => {
+                        pending.remaining -= n as u64;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
+            Transport::Tls { tls, .. } => {
+                // TLS fallback: read a chunk from the file, encrypt +
+                // write it like any other TLS response body -- no
+                // sendfile possible here (see this function's own doc
+                // comment).
+                use std::io::{Read, Seek, SeekFrom};
+                let want = pending.remaining.min(65536) as usize;
+                let mut buf = vec![0u8; want];
+                pending.file.seek(SeekFrom::Start(pending.offset))?;
+                let n = pending.file.read(&mut buf)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file ended before pending_file.remaining reached 0"));
+                }
+                match tls.write_plaintext(&buf[..n]) {
+                    Ok(written) => {
+                        pending.offset += written as u64;
+                        pending.remaining -= written as u64;
+                        // Any bytes read but not accepted by write_plaintext
+                        // this call are simply re-read next time (offset
+                        // wasn't advanced past them) -- correctness over
+                        // squeezing out every read syscall here.
+                        if written < n {
+                            pending.remaining += (n - written) as u64;
+                            pending.offset -= (n - written) as u64;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+            }
         }
     }
 }
@@ -770,6 +851,41 @@ mod tests {
         let (status, body) = http_get(port, "/hello.txt");
         assert_eq!(status, 200);
         assert_eq!(body, b"hello from event loop");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn serves_large_file_via_sendfile_path() {
+        // A file at or above FileCache's default mmap_threshold takes
+        // the FileBody/sendfile path (see http::static_files::serve
+        // and core::event_loop's flush_pending_file) instead of the
+        // mmap'd in-memory path -- this proves that path actually
+        // delivers correct bytes over a real TCP connection, not just
+        // that the file descriptor/range were computed correctly (see
+        // static_files's own unit test for that narrower check).
+        let dir = std::env::temp_dir().join(format!(
+            "routa_event_loop_sendfile_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Larger than any reasonable mmap threshold, and large enough
+        // that a bug truncating or corrupting the sendfile transfer
+        // partway through would be obvious rather than accidentally
+        // still passing on a tiny file.
+        let large_content = "0123456789".repeat(200_000); // 2,000,000 bytes
+        std::fs::write(dir.join("large.bin"), large_content.as_bytes()).unwrap();
+
+        let mut config = RoutaConfig::default();
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        let port = free_port();
+        let _pool = start_test_server(config, port);
+
+        let (status, body) = http_get(port, "/large.bin");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), large_content.len());
+        assert_eq!(body, large_content.as_bytes());
 
         std::fs::remove_dir_all(&dir).ok();
     }

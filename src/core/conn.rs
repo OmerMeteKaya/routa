@@ -121,6 +121,16 @@ pub enum ConnectionProtocol {
 /// `http::request`/`http::response`; this only holds the buffers they
 /// operate on plus the keep-alive bookkeeping that spans requests on
 /// the same connection.
+/// A response body queued to be sent via `sendfile(2)` once the
+/// preceding headers (in `Http1Connection::write_buf`) have fully
+/// drained -- see `core::event_loop`'s flush logic, the only place
+/// this is actually acted on.
+pub struct PendingFileSend {
+    pub file: std::fs::File,
+    pub offset: u64,
+    pub remaining: u64,
+}
+
 pub struct Http1Connection {
     pub read_buf: Buf,
     pub write_buf: Buf,
@@ -129,6 +139,11 @@ pub struct Http1Connection {
     /// fully written -- `None` means no request is currently in
     /// flight, used to enforce `request_timeout_ms`.
     pub request_started_at: Option<Instant>,
+    /// A file-backed response body still being sent via `sendfile(2)`
+    /// -- `None` once fully drained (or if this response's body was
+    /// an ordinary in-memory buffer instead, queued into `write_buf`
+    /// like any other response).
+    pub pending_file: Option<PendingFileSend>,
 }
 
 impl Http1Connection {
@@ -137,6 +152,7 @@ impl Http1Connection {
             read_buf: Buf::new(),
             write_buf: Buf::new(),
             keep_alive: true,
+            pending_file: None,
             request_started_at: None,
         }
     }

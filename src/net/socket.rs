@@ -100,3 +100,41 @@ mod tests {
         assert!(recv >= 65536, "expected recv buffer >= 65536, got {recv}");
     }
 }
+
+// ─── sendfile(2): zero-copy file-to-socket transfer ─────────────────────
+
+use std::os::unix::io::AsRawFd;
+
+/// Sends up to `count` bytes from `file` (starting at `offset`,
+/// which is advanced by however much was actually sent) directly to
+/// `socket_fd` via the `sendfile(2)` syscall -- the kernel copies
+/// data from the file's page cache straight to the socket buffer,
+/// never through a userspace buffer the way a `read()` + `write()`
+/// pair would. Only meaningful for a plaintext (non-TLS) socket: TLS
+/// must encrypt in userspace before any bytes reach the kernel, so
+/// there's nothing for the kernel to copy directly from a file for an
+/// encrypted connection -- callers on a TLS transport should use the
+/// ordinary read+write path instead of this function entirely.
+///
+/// Returns the number of bytes actually sent (which may be less than
+/// `count`, particularly on a non-blocking socket whose send buffer
+/// fills up mid-transfer -- the caller is expected to retry with the
+/// updated `offset` on the next writable-readiness event, the same
+/// partial-write tolerance every other transport write in this
+/// codebase already has to handle).
+///
+/// Returns `Err` with `ErrorKind::WouldBlock` if the socket can't
+/// accept any bytes at all right now (mirrors a regular `write()`'s
+/// `EAGAIN` behavior), and other `io::Error`s for genuine failures.
+pub fn sendfile(file: &std::fs::File, socket_fd: std::os::unix::io::RawFd, offset: &mut u64, count: usize) -> io::Result<usize> {
+    let mut off: libc::off_t = *offset as libc::off_t;
+    let result = unsafe { libc::sendfile(socket_fd, file.as_raw_fd(), &mut off, count) };
+
+    if result < 0 {
+        let err = io::Error::last_os_error();
+        return Err(err);
+    }
+
+    *offset = off as u64;
+    Ok(result as usize)
+}

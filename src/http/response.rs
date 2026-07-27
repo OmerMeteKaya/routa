@@ -17,12 +17,35 @@ use crate::util::time::format_http_date;
 /// that `serialize` emits headers in the order they were set --
 /// matters for interoperability with clients/intermediaries that are
 /// sensitive to header order (rare, but harmless to preserve).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+/// A response body backed by an open file descriptor rather than an
+/// in-memory buffer -- lets the event loop send the body via
+/// `sendfile(2)` (kernel-space file-to-socket copy, no userspace
+/// buffer) instead of reading the whole file into memory first. Only
+/// usable on a plaintext transport: TLS must encrypt in userspace, so
+/// a TLS connection's event-loop path falls back to a normal read+
+/// write for a `FileBody` response (see `core::event_loop`'s flush
+/// logic).
+pub struct FileBody {
+    pub file: std::fs::File,
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub reason: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Set instead of populating `body` when the response body should
+    /// be sent directly from a file via `sendfile(2)` -- see
+    /// `set_body_file`. Mutually exclusive with `body` in practice
+    /// (whichever was set most recently via `set_body`/`set_body_file`
+    /// is what `core::event_loop` actually sends); both existing
+    /// unconditionally rather than as an enum keeps `body()`'s
+    /// existing signature and every current caller of it unchanged.
+    pub file_body: Option<FileBody>,
     /// `Transfer-Encoding: chunked` instead of `Content-Length`. When
     /// set, `serialize` emits the body (if any) as a single chunk
     /// followed by the terminating zero-length chunk, and suppresses
@@ -38,7 +61,33 @@ impl HttpResponse {
             reason: reason.into(),
             headers: Vec::new(),
             body: Vec::new(),
+            file_body: None,
             chunked: false,
+        }
+    }
+
+    /// Sets this response's body to be sent directly from `file`
+    /// starting at `offset` for `len` bytes, via `sendfile(2)` where
+    /// the transport allows it (see `FileBody`'s own doc comment for
+    /// the TLS fallback). Clears any body previously set via
+    /// `set_body` -- the two are mutually exclusive. Sets
+    /// `Content-Length` from `len` the same way `set_body` derives it
+    /// from the in-memory body's actual size.
+    pub fn set_body_file(&mut self, file: std::fs::File, offset: u64, len: u64) {
+        self.body = Vec::new();
+        self.file_body = Some(FileBody { file, offset, len });
+        if !self.chunked {
+            self.set_header("Content-Length", len.to_string());
+        }
+    }
+
+    /// The effective body length regardless of which body source is
+    /// in use -- callers computing `Content-Length` need this instead
+    /// of `body().len()`, which is always 0 for a `FileBody` response.
+    pub fn effective_body_len(&self) -> u64 {
+        match &self.file_body {
+            Some(fb) => fb.len,
+            None => self.body.len() as u64,
         }
     }
 

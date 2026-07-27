@@ -269,11 +269,15 @@ fn build_response(req: &HttpRequest, lookup: Lookup) -> HttpResponse {
             resp.set_body(slice.to_vec());
         }
         None => {
-            // Large file, not mmap'd -- read the requested range
-            // directly. A future optimization can replace this with a
-            // zero-copy sendfile path for the plaintext (non-TLS) case.
-            match read_range(&lookup.resolved_path, range_start, range_len) {
-                Ok(data) => resp.set_body(data),
+            // Large file, not mmap'd -- hand the event loop a file
+            // descriptor + range to send directly via sendfile(2)
+            // rather than reading the whole range into memory here.
+            // See HttpResponse::set_body_file and core::event_loop's
+            // flush logic for where this is actually acted on (with a
+            // read+write fallback on TLS transports, which can't use
+            // sendfile at all).
+            match std::fs::File::open(&lookup.resolved_path) {
+                Ok(file) => resp.set_body_file(file, range_start, range_len),
                 Err(_) => return HttpResponse::new(500, "Internal Server Error"),
             }
         }
@@ -282,14 +286,7 @@ fn build_response(req: &HttpRequest, lookup: Lookup) -> HttpResponse {
     resp
 }
 
-fn read_range(path: &Path, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let mut buf = vec![0u8; len as usize];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -660,7 +657,22 @@ mod tests {
         let req = make_request(HttpMethod::Get, "/big.txt", &[]);
         let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
         assert_eq!(resp.status, 200);
-        assert_eq!(resp.body(), content.as_slice());
+        // Large, non-mmap'd files are now sent via a FileBody
+        // (sendfile-eligible) rather than being read into resp.body()
+        // -- verify the file descriptor/range actually covers the
+        // expected content instead of checking an in-memory buffer
+        // that's deliberately left empty for this path.
+        let file_body = resp.file_body.as_ref().expect("large file should use set_body_file, not set_body");
+        assert_eq!(file_body.offset, 0);
+        assert_eq!(file_body.len, content.len() as u64);
+        assert_eq!(resp.get_header("Content-Length"), Some(content.len().to_string()).as_deref());
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = &file_body.file;
+        file.seek(SeekFrom::Start(file_body.offset)).unwrap();
+        let mut actual = vec![0u8; file_body.len as usize];
+        file.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, content);
 
         std::fs::remove_dir_all(&dir).ok();
     }
