@@ -31,6 +31,23 @@ pub enum HttpMethod {
 }
 
 impl HttpMethod {
+    /// The wire representation of this method -- the inverse of
+    /// `parse`, used when serializing a request (e.g.
+    /// `core::proxy` forwarding a request upstream).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+            HttpMethod::Put => "PUT",
+            HttpMethod::Delete => "DELETE",
+            HttpMethod::Head => "HEAD",
+            HttpMethod::Patch => "PATCH",
+            HttpMethod::Options => "OPTIONS",
+            HttpMethod::Trace => "TRACE",
+            HttpMethod::Connect => "CONNECT",
+        }
+    }
+
     fn parse(s: &[u8]) -> Option<HttpMethod> {
         match s {
             b"GET" => Some(HttpMethod::Get),
@@ -78,6 +95,54 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
+    /// Serializes this request as HTTP/1.1 wire bytes -- the inverse
+    /// of `parse`. Used when forwarding a request to an HTTP/1.1
+    /// upstream (see `core::proxy`); callers building an outbound
+    /// request from scratch (rather than one already parsed from an
+    /// incoming connection) construct an `HttpRequest` directly and
+    /// call this rather than this module needing a second, separate
+    /// "build a request" API.
+    ///
+    /// Does not add or remove any headers itself (no automatic
+    /// Connection/Host/Content-Length beyond what `self.headers`
+    /// already contains, except Content-Length, which is always
+    /// derived fresh from `self.body`'s actual length rather than
+    /// trusting a possibly-stale caller-supplied value) -- header
+    /// policy (X-Forwarded-For, Via, hop-by-hop filtering) is the
+    /// caller's responsibility, the same division of concerns
+    /// `http::response::HttpResponse::serialize` uses on the response
+    /// side.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        let path_and_query = match &self.query {
+            Some(q) => format!("{}?{}", self.path, q),
+            None => self.path.clone(),
+        };
+        out.extend_from_slice(
+            format!(
+                "{} {} HTTP/{}.{}\r\n",
+                self.method.as_str(),
+                path_and_query,
+                self.version_major,
+                self.version_minor
+            )
+            .as_bytes(),
+        );
+
+        for (name, value) in &self.headers {
+            if name.eq_ignore_ascii_case("content-length") {
+                continue; // re-emitted below, from the body's actual length
+            }
+            out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
+
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(&self.body);
+        out
+    }
+
     pub fn get_header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -672,6 +737,100 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialize_basic_get_request() {
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            remote_addr: None,
+            path: "/hello".to_string(),
+            query: None,
+            query_params: Vec::new(),
+            version_major: 1,
+            version_minor: 1,
+            headers: vec![("Host".to_string(), "example.com".to_string())],
+            body: Vec::new(),
+            keep_alive: true,
+            trailers: Vec::new(),
+        };
+        let bytes = req.serialize();
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.starts_with("GET /hello HTTP/1.1\r\n"));
+        assert!(s.contains("Host: example.com\r\n"));
+        assert!(s.contains("Content-Length: 0\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn serialize_includes_query_string() {
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            remote_addr: None,
+            path: "/search".to_string(),
+            query: Some("q=rust".to_string()),
+            query_params: Vec::new(),
+            version_major: 1,
+            version_minor: 1,
+            headers: Vec::new(),
+            body: Vec::new(),
+            keep_alive: true,
+            trailers: Vec::new(),
+        };
+        let s = String::from_utf8(req.serialize()).unwrap();
+        assert!(s.starts_with("GET /search?q=rust HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn serialize_recomputes_content_length_from_actual_body() {
+        let req = HttpRequest {
+            method: HttpMethod::Post,
+            remote_addr: None,
+            path: "/submit".to_string(),
+            query: None,
+            query_params: Vec::new(),
+            version_major: 1,
+            version_minor: 1,
+            headers: vec![("Content-Length".to_string(), "999".to_string())],
+            body: b"hello".to_vec(),
+            keep_alive: true,
+            trailers: Vec::new(),
+        };
+        let s = String::from_utf8(req.serialize()).unwrap();
+        assert!(s.contains("Content-Length: 5\r\n"));
+        assert!(!s.contains("999"));
+        assert!(s.ends_with("hello"));
+    }
+
+    #[test]
+    fn serialize_then_parse_round_trips() {
+        let req = HttpRequest {
+            method: HttpMethod::Post,
+            remote_addr: None,
+            path: "/api/data".to_string(),
+            query: None,
+            query_params: Vec::new(),
+            version_major: 1,
+            version_minor: 1,
+            headers: vec![
+                ("Host".to_string(), "upstream.internal".to_string()),
+                ("X-Custom".to_string(), "value".to_string()),
+            ],
+            body: b"payload".to_vec(),
+            keep_alive: true,
+            trailers: Vec::new(),
+        };
+        let bytes = req.serialize();
+        let mut buf = Buf::new();
+        buf.push(&bytes);
+        let parsed = match parse(&buf, 0) {
+            ParseOutcome::Complete { request, .. } => request,
+            _ => panic!("expected Complete"),
+        };
+        assert_eq!(parsed.method, HttpMethod::Post);
+        assert_eq!(parsed.path, "/api/data");
+        assert_eq!(parsed.get_header("X-Custom"), Some("value"));
+        assert_eq!(parsed.body, b"payload");
+    }
 
     fn buf_from(s: &[u8]) -> Buf {
         let mut b = Buf::new();

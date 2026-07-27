@@ -61,6 +61,15 @@ struct ClientStream {
     response_body: Vec<u8>,
     headers_done: bool,
     end_stream_received: bool,
+    /// Last time this stream saw any I/O activity (a HEADERS/DATA/
+    /// WINDOW_UPDATE frame concerning it, in either direction) --
+    /// lets a caller apply the same read/write timeout policy to an H2
+    /// upstream that `lb::upstream`'s connection-pool timeout applies
+    /// to an H1 one, at per-stream granularity rather than only being
+    /// able to time out the whole shared connection at once. Updated
+    /// in `open_stream` (a stream starts "alive" the moment it's
+    /// opened) and every frame handler that touches a specific stream.
+    last_io: std::time::Instant,
 }
 
 impl ClientStream {
@@ -72,6 +81,7 @@ impl ClientStream {
             response_body: Vec::new(),
             headers_done: false,
             end_stream_received: false,
+            last_io: std::time::Instant::now(),
         }
     }
 }
@@ -557,6 +567,7 @@ impl H2Client {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             return; // response for a stream we don't know (already completed/removed) -- ignore
         };
+        stream.last_io = std::time::Instant::now();
 
         let mut payload = frame.payload;
         if frame.header.flags & frame::FLAG_PADDED != 0 {
@@ -648,6 +659,7 @@ impl H2Client {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             return;
         };
+        stream.last_io = std::time::Instant::now();
         stream.response_body.extend_from_slice(payload);
 
         if frame.header.flags & frame::FLAG_END_STREAM != 0 {
@@ -667,6 +679,7 @@ impl H2Client {
             self.conn_send_window += i64::from(increment);
         } else if let Some(stream) = self.streams.get_mut(&frame.header.stream_id) {
             stream.send_window += i64::from(increment);
+            stream.last_io = std::time::Instant::now();
         }
     }
 
@@ -675,6 +688,34 @@ impl H2Client {
     /// `stream_id` isn't a completed (or even a known) stream --
     /// callers should only call this for ids `process_readable` just
     /// reported.
+    /// Returns every stream id that has had no I/O activity for at
+    /// least `timeout` -- callers (see `core::proxy`) send a
+    /// stream-level RST_STREAM and surface a 504 to whichever
+    /// frontend request that stream was serving, then call
+    /// `abandon_stream` to remove it from this connection's table.
+    /// Applying this per-stream (rather than only being able to time
+    /// out the whole shared H2 connection at once) means one slow
+    /// upstream response doesn't force killing every other
+    /// in-flight stream sharing the same connection.
+    pub fn timed_out_streams(&self, timeout: std::time::Duration) -> Vec<u32> {
+        let now = std::time::Instant::now();
+        self.streams
+            .iter()
+            .filter(|(_, s)| now.duration_since(s.last_io) >= timeout)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Sends RST_STREAM for `stream_id` and removes it from this
+    /// connection's table -- used both for a timed-out stream (see
+    /// `timed_out_streams`) and any other case where a caller needs to
+    /// give up on a stream without waiting for its response.
+    pub fn abandon_stream(&mut self, stream_id: u32) {
+        if self.streams.remove(&stream_id).is_some() {
+            frame::write_rst_stream(&mut self.write_buf, stream_id, 0x8); // CANCEL
+        }
+    }
+
     pub fn take_response(&mut self, stream_id: u32) -> Option<ClientResponse> {
         let stream = self.streams.remove(&stream_id)?;
         let status = stream
@@ -1006,6 +1047,57 @@ mod tests {
         let (port, name, trust_anchor) = spawn_test_server(b"x", 200);
         let client = connect_and_wait_ready(port, &name, trust_anchor);
         assert!(client.has_capacity());
+    }
+
+    #[test]
+    fn timed_out_streams_identifies_stale_streams() {
+        let (port, name, trust_anchor) = spawn_test_server(b"slow", 200);
+        let mut client = connect_and_wait_ready(port, &name, trust_anchor);
+
+        let stream_id = client
+            .open_stream(
+                &[
+                    field(":method", "GET"),
+                    field(":scheme", "https"),
+                    field(":path", "/"),
+                    field(":authority", "localhost"),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        // Immediately after opening, nothing should be considered
+        // timed out yet against a generous threshold.
+        assert!(client.timed_out_streams(Duration::from_secs(10)).is_empty());
+
+        // Against a threshold shorter than any real elapsed time, the
+        // just-opened stream should be reported.
+        std::thread::sleep(Duration::from_millis(20));
+        let timed_out = client.timed_out_streams(Duration::from_millis(1));
+        assert_eq!(timed_out, vec![stream_id]);
+    }
+
+    #[test]
+    fn abandon_stream_removes_it_and_queues_rst_stream() {
+        let (port, name, trust_anchor) = spawn_test_server(b"x", 200);
+        let mut client = connect_and_wait_ready(port, &name, trust_anchor);
+
+        let stream_id = client
+            .open_stream(
+                &[
+                    field(":method", "GET"),
+                    field(":scheme", "https"),
+                    field(":path", "/"),
+                    field(":authority", "localhost"),
+                ],
+                &[],
+            )
+            .unwrap();
+        client.flush().unwrap();
+
+        client.abandon_stream(stream_id);
+        assert!(client.timed_out_streams(Duration::from_secs(0)).is_empty(), "abandoned stream should no longer be tracked");
+        assert!(!client.write_buf.is_empty(), "abandoning a stream should queue an RST_STREAM frame");
     }
 
     #[test]
