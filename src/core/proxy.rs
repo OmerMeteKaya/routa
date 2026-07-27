@@ -269,7 +269,7 @@ impl H2PoolRegistry {
         self.h2_node_ids.lock().unwrap().insert(node_id(node));
     }
 
-    fn uses_h2(&self, node: &UpstreamNode) -> bool {
+    pub fn uses_h2(&self, node: &UpstreamNode) -> bool {
         self.h2_node_ids.lock().unwrap().contains(&node_id(node))
     }
 
