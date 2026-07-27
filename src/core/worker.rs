@@ -163,7 +163,7 @@ impl WorkerPool {
                         // this slot empty, that worker id is done for good.
                     }
                     Err(payload) => {
-                        eprintln!("worker {id} panicked: {}", panic_message(&payload));
+                        tracing::error!(worker_id = id, message = %panic_message(&payload), "worker panicked, restarting");
                         if !shutdown.is_set() {
                             std::thread::sleep(RESTART_BACKOFF);
                             restarts.fetch_add(1, Ordering::SeqCst);

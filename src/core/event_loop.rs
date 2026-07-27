@@ -72,11 +72,17 @@ impl WorkerBody for EventLoopWorker {
     fn run(&self, _worker_id: usize, shutdown: &ShutdownSignal) {
         let mut listener = match bind_reuseport(self.port, 1024) {
             Ok(l) => l,
-            Err(_) => return, // worker pool's reconciler observes this thread exiting and restarts it
+            Err(e) => {
+                tracing::error!(port = self.port, error = %e, "worker failed to bind listener");
+                return; // worker pool's reconciler observes this thread exiting and restarts it
+            }
         };
         let mut poller = match MioPoller::new(1024) {
             Ok(p) => p,
-            Err(_) => return,
+            Err(e) => {
+                tracing::error!(error = %e, "worker failed to create poller");
+                return;
+            }
         };
         // Registered with a sentinel key far outside any range
         // `connections`'s own Slab<Connection> will ever hand out
@@ -131,7 +137,10 @@ fn accept_all(worker: &EventLoopWorker, listener: &mut TcpListener, poller: &mut
                 let transport = match &worker.server.tls_context {
                     Some(tls_ctx) => match TlsConnection::new_server(tls_ctx) {
                         Ok(tls) => Transport::Tls { stream, tls: Box::new(tls) },
-                        Err(_) => continue, // drop this connection, its slot is simply not populated
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to create TLS session for accepted connection");
+                            continue; // drop this connection, its slot is simply not populated
+                        }
                     },
                     None => Transport::Plain(stream),
                 };

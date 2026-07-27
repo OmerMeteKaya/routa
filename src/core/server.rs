@@ -137,7 +137,13 @@ impl RoutaServer {
         let h2_pools = Arc::new(H2PoolRegistry::new());
         let mut pools = Vec::new();
         for pool_cfg in &config.pools {
-            pools.push(build_routed_pool(pool_cfg, &h2_pools, &metrics)?);
+            let pool = build_routed_pool(pool_cfg, &h2_pools, &metrics)?;
+            tracing::info!(
+                pool_name = %pool.route_prefix,
+                node_count = pool.lb.pool.node_count(),
+                "load-balancer pool configured"
+            );
+            pools.push(pool);
         }
 
         let proxy_config = ProxyConfig {
@@ -243,6 +249,14 @@ impl RoutaServer {
 
         let router_for_dispatch = Arc::clone(&router);
         let middleware_chain = Arc::new(chain_builder.build(move |req| dispatch(&router_for_dispatch, req)));
+
+        tracing::info!(
+            port = config.port,
+            workers = config.n_workers,
+            tls_enabled = config.tls_enabled,
+            pool_count = pools.len(),
+            "server configuration built"
+        );
 
         Ok(RoutaServer {
             config,
