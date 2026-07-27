@@ -194,14 +194,37 @@ fn compress_deflate(data: &[u8], level: u32) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+/// Maps the configured flate2-style level (1-9) to a brotli quality
+/// (0-11) using real-world threshold bands rather than a proportional
+/// scale. Brotli's own quality/ratio curve doesn't behave like
+/// gzip's: gzip's compression gains flatten out well before its top
+/// level, so a mid-range gzip level already captures most of the
+/// achievable ratio, while brotli keeps yielding meaningfully smaller
+/// output even at its highest levels -- and its cost profile is the
+/// opposite too, with quality 10-11 being tens of times slower than
+/// quality 4-6 rather than gzip's comparatively gentle cost curve. A
+/// proportional mapping (`level / 9 * 11`) would send even a "fast"
+/// requested level into brotli's more expensive territory and would
+/// never reach the quality levels that are actually worth using for
+/// static/precompressible content. These bands instead mirror common
+/// production practice: low levels favor speed (suitable for
+/// per-request dynamic compression), mid levels are the standard
+/// balanced choice, and only an explicitly high requested level opts
+/// into brotli's expensive top quality range.
+fn brotli_quality_for_level(level: u32) -> i32 {
+    match level {
+        0..=3 => 4,  // fast -- appropriate for latency-sensitive dynamic responses
+        4..=6 => 6,  // balanced -- the common default for on-the-fly compression
+        7..=8 => 9,  // high -- noticeably slower, meaningfully smaller
+        _ => 11,     // maximum -- only worth it when compression cost is amortized (e.g. static assets)
+    }
+}
+
 fn compress_brotli(data: &[u8], level: u32) -> std::io::Result<Vec<u8>> {
-    // brotli's quality parameter is 0-11; flate2-style levels (1-9)
-    // are mapped proportionally rather than exposing a second,
-    // differently-scaled config knob to callers.
-    let quality = ((level as f32 / 9.0) * 11.0).round().clamp(0.0, 11.0) as u32;
+    let quality = brotli_quality_for_level(level);
     let mut out = Vec::new();
     let params = brotli::enc::BrotliEncoderParams {
-        quality: quality as i32,
+        quality,
         ..Default::default()
     };
     brotli::BrotliCompress(&mut &data[..], &mut out, &params)?;
@@ -277,6 +300,32 @@ impl Middleware for CompressMiddleware {
 mod tests {
     use super::*;
     use crate::http::request::HttpMethod;
+
+    #[test]
+    fn brotli_quality_bands_cover_the_full_level_range() {
+        assert_eq!(brotli_quality_for_level(1), 4);
+        assert_eq!(brotli_quality_for_level(3), 4);
+        assert_eq!(brotli_quality_for_level(4), 6);
+        assert_eq!(brotli_quality_for_level(6), 6);
+        assert_eq!(brotli_quality_for_level(7), 9);
+        assert_eq!(brotli_quality_for_level(8), 9);
+        assert_eq!(brotli_quality_for_level(9), 11);
+    }
+
+    #[test]
+    fn brotli_quality_never_exceeds_valid_range() {
+        for level in 0..=20 {
+            let quality = brotli_quality_for_level(level);
+            assert!((0..=11).contains(&quality), "quality {quality} out of range for level {level}");
+        }
+    }
+
+    #[test]
+    fn compress_brotli_still_produces_valid_compressed_output() {
+        let data = b"the quick brown fox jumps over the lazy dog ".repeat(50);
+        let compressed = compress_brotli(&data, 6).unwrap();
+        assert!(compressed.len() < data.len(), "brotli should shrink repetitive text");
+    }
 
     fn make_request(accept_encoding: Option<&str>) -> HttpRequest {
         let mut req = HttpRequest {
