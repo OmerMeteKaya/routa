@@ -71,12 +71,21 @@ impl BasicAuthConfig {
 
 pub struct BasicAuthMiddleware {
     config: ArcSwap<BasicAuthConfig>,
+    metrics: Option<Arc<crate::util::metrics::Metrics>>,
 }
 
 impl BasicAuthMiddleware {
     pub fn new(config: BasicAuthConfig) -> Self {
         BasicAuthMiddleware {
             config: ArcSwap::from_pointee(config),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(config: BasicAuthConfig, metrics: Arc<crate::util::metrics::Metrics>) -> Self {
+        BasicAuthMiddleware {
+            config: ArcSwap::from_pointee(config),
+            metrics: Some(metrics),
         }
     }
 
@@ -85,7 +94,10 @@ impl BasicAuthMiddleware {
     }
 }
 
-fn unauthorized_basic(realm: &str) -> HttpResponse {
+fn unauthorized_basic(realm: &str, metrics: &Option<Arc<crate::util::metrics::Metrics>>) -> HttpResponse {
+    if let Some(metrics) = metrics {
+        metrics.middleware.auth_basic_failures_total.inc();
+    }
     let mut resp = HttpResponse::new(401, "Unauthorized");
     resp.set_header(
         "WWW-Authenticate",
@@ -100,25 +112,25 @@ impl Middleware for BasicAuthMiddleware {
         let config = self.config.load();
 
         let Some(auth) = req.get_header("Authorization") else {
-            return unauthorized_basic(&config.realm);
+            return unauthorized_basic(&config.realm, &self.metrics);
         };
         let Some(encoded) = auth.strip_prefix("Basic ").or_else(|| auth.strip_prefix("basic "))
         else {
-            return unauthorized_basic(&config.realm);
+            return unauthorized_basic(&config.realm, &self.metrics);
         };
 
         let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
-            return unauthorized_basic(&config.realm);
+            return unauthorized_basic(&config.realm, &self.metrics);
         };
         let Ok(decoded) = String::from_utf8(decoded) else {
-            return unauthorized_basic(&config.realm);
+            return unauthorized_basic(&config.realm, &self.metrics);
         };
         let Some((username, password)) = decoded.split_once(':') else {
-            return unauthorized_basic(&config.realm);
+            return unauthorized_basic(&config.realm, &self.metrics);
         };
 
         if !config.verify(username, password) {
-            return unauthorized_basic(&config.realm);
+            return unauthorized_basic(&config.realm, &self.metrics);
         }
 
         next.run(req)
@@ -212,12 +224,21 @@ pub fn verify(cfg: &JwtConfig, token: &str) -> Option<JwtClaims> {
 
 pub struct JwtAuthMiddleware {
     config: ArcSwap<JwtConfig>,
+    metrics: Option<Arc<crate::util::metrics::Metrics>>,
 }
 
 impl JwtAuthMiddleware {
     pub fn new(config: JwtConfig) -> Self {
         JwtAuthMiddleware {
             config: ArcSwap::from_pointee(config),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(config: JwtConfig, metrics: Arc<crate::util::metrics::Metrics>) -> Self {
+        JwtAuthMiddleware {
+            config: ArcSwap::from_pointee(config),
+            metrics: Some(metrics),
         }
     }
 
@@ -226,7 +247,10 @@ impl JwtAuthMiddleware {
     }
 }
 
-fn unauthorized_jwt() -> HttpResponse {
+fn unauthorized_jwt(metrics: &Option<Arc<crate::util::metrics::Metrics>>) -> HttpResponse {
+    if let Some(metrics) = metrics {
+        metrics.middleware.auth_jwt_failures_total.inc();
+    }
     let mut resp = HttpResponse::new(401, "Unauthorized");
     resp.set_header("WWW-Authenticate", "Bearer");
     resp.set_body(b"Unauthorized\n".to_vec());
@@ -238,15 +262,15 @@ impl Middleware for JwtAuthMiddleware {
         let config = self.config.load();
 
         let Some(auth) = req.get_header("Authorization") else {
-            return unauthorized_jwt();
+            return unauthorized_jwt(&self.metrics);
         };
         let Some(token) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "))
         else {
-            return unauthorized_jwt();
+            return unauthorized_jwt(&self.metrics);
         };
 
         if verify(&config, token.trim()).is_none() {
-            return unauthorized_jwt();
+            return unauthorized_jwt(&self.metrics);
         }
 
         // Claims aren't currently attached back onto the request for

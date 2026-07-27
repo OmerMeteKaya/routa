@@ -123,7 +123,13 @@ impl Pattern {
     }
 }
 
-pub type RouteHandler = fn(&HttpRequest, &RouteParams) -> crate::http::response::HttpResponse;
+/// A route's handler -- boxed rather than a plain function pointer so
+/// a route can close over state (a `FileCache`, a `LoadBalancer`, etc.)
+/// the same way `http::middleware::Middleware` implementations already
+/// do, instead of needing every piece of state a handler touches
+/// threaded through as a separate parameter.
+pub type RouteHandler =
+    Box<dyn Fn(&HttpRequest, &RouteParams) -> crate::http::response::HttpResponse + Send + Sync>;
 
 /// Named parameters captured from the matched route pattern (e.g.
 /// `:id` in `/users/:id`), in the order they appear in the pattern.
@@ -149,7 +155,7 @@ struct Route {
 pub enum Dispatch<'a> {
     /// A route matched both path and method -- ready to call.
     Matched {
-        handler: RouteHandler,
+        handler: &'a RouteHandler,
         params: RouteParams,
     },
     /// A route's path pattern matched, but not for this method. Carries
@@ -173,11 +179,20 @@ impl Router {
     /// Registers a route. `path` may contain `:name` parameter
     /// segments and/or end in a trailing `*` wildcard segment (see
     /// this module's doc comment for the supported pattern kinds).
-    pub fn add(&mut self, path: &str, methods: &[HttpMethod], handler: RouteHandler) {
+    /// Accepts any closure (not just a plain function pointer) so a
+    /// route can close over whatever state it needs -- a `FileCache`,
+    /// a `LoadBalancer`, etc. -- the same way
+    /// `http::middleware::Middleware` implementations already do.
+    pub fn add(
+        &mut self,
+        path: &str,
+        methods: &[HttpMethod],
+        handler: impl Fn(&HttpRequest, &RouteParams) -> crate::http::response::HttpResponse + Send + Sync + 'static,
+    ) {
         self.routes.push(Route {
             pattern: Pattern::compile(path),
             methods: methods.to_vec(),
-            handler,
+            handler: Box::new(handler),
         });
     }
 
@@ -214,7 +229,7 @@ impl Router {
 
         if route.methods.contains(&req.method) {
             Dispatch::Matched {
-                handler: route.handler,
+                handler: &route.handler,
                 params: RouteParams(params),
             }
         } else {

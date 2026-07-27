@@ -73,6 +73,14 @@ impl HttpResponse {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Every header currently set, in the order they were added --
+    /// used by callers that need to re-encode this response's headers
+    /// into a different wire format (e.g. core::event_loop's H2 path,
+    /// which HPACK-encodes them rather than writing HTTP/1.1 text).
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// Sets the response body, replacing any previously set body.
     /// Automatically sets `Content-Length` unless `chunked` is set (in
     /// which case `serialize` computes chunk framing from the body's

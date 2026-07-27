@@ -1048,12 +1048,25 @@ const HC_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 const HC_DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl HealthCheckLoop {
+    /// `pool_name`/`metrics` are optional purely so this module's own
+    /// tests (and any other caller that doesn't care about metrics)
+    /// can start a health-check loop without needing a `Metrics`
+    /// registry at hand -- `core::server` (the only caller that
+    /// matters for production use) always supplies both.
     pub fn start(pool: Arc<UpstreamPool>) -> Self {
+        Self::start_with_metrics(pool, String::new(), None)
+    }
+
+    pub fn start_with_metrics(
+        pool: Arc<UpstreamPool>,
+        pool_name: String,
+        metrics: Option<Arc<crate::util::metrics::Metrics>>,
+    ) -> Self {
         let stop = Arc::new(ProbeStopFlag::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
             .name("routa-healthcheck".to_string())
-            .spawn(move || run_health_check_loop(pool, stop_for_thread))
+            .spawn(move || run_health_check_loop(pool, stop_for_thread, pool_name, metrics))
             .expect("failed to spawn health check thread");
 
         HealthCheckLoop {
@@ -1070,7 +1083,12 @@ impl HealthCheckLoop {
     }
 }
 
-fn run_health_check_loop(pool: Arc<UpstreamPool>, stop: Arc<ProbeStopFlag>) {
+fn run_health_check_loop(
+    pool: Arc<UpstreamPool>,
+    stop: Arc<ProbeStopFlag>,
+    pool_name: String,
+    metrics: Option<Arc<crate::util::metrics::Metrics>>,
+) {
     let nodes = pool.nodes();
     if nodes.is_empty() {
         return;
@@ -1115,6 +1133,7 @@ fn run_health_check_loop(pool: Arc<UpstreamPool>, stop: Arc<ProbeStopFlag>) {
                 }
                 Err(()) => {
                     record_probe_result(node, false);
+                    record_health_check_metric(&metrics, &pool_name, node, false);
                 }
             }
         }
@@ -1131,6 +1150,7 @@ fn run_health_check_loop(pool: Arc<UpstreamPool>, stop: Arc<ProbeStopFlag>) {
                 let _ = poller.deregister(probe.stream_mut(), key);
                 in_flight.remove(&node_index(&nodes, &probe.node));
                 record_probe_result(&probe.node, ok);
+                record_health_check_metric(&metrics, &pool_name, &probe.node, ok);
             }
         }
 
@@ -1148,12 +1168,27 @@ fn run_health_check_loop(pool: Arc<UpstreamPool>, stop: Arc<ProbeStopFlag>) {
             let _ = poller.deregister(probe.stream_mut(), key);
             in_flight.remove(&node_index(&nodes, &probe.node));
             record_probe_result(&probe.node, false);
+            record_health_check_metric(&metrics, &pool_name, &probe.node, false);
         }
     }
 
     for (key, mut probe) in probes {
         let _ = poller.deregister(probe.stream_mut(), key);
     }
+}
+
+fn record_health_check_metric(
+    metrics: &Option<Arc<crate::util::metrics::Metrics>>,
+    pool_name: &str,
+    node: &Arc<UpstreamNode>,
+    ok: bool,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let node_label = format!("{}:{}", node.host, node.port);
+    let result = if ok { "ok" } else { "fail" };
+    metrics.upstream.health_check_total.with_label_values(&[pool_name, &node_label, result]).inc();
 }
 
 fn node_index(nodes: &[Arc<UpstreamNode>], target: &Arc<UpstreamNode>) -> usize {

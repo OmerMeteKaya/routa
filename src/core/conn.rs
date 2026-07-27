@@ -148,20 +148,41 @@ impl Default for Http1Connection {
     }
 }
 
-/// Placeholder for HTTP/2 session state -- streams, HPACK dynamic
-/// table, flow-control windows. Filled in once `http::h2` exists; only
-/// reserved here so `ConnectionProtocol::Http2` has something to name
-/// today.
+/// HTTP/2 session state on this connection -- delegates all actual
+/// protocol logic to `http::h2::stream::Connection`; this wrapper only
+/// adds the write buffer a caller drains to the transport (the H2
+/// Connection itself never touches I/O directly -- see its own doc
+/// comment).
 pub struct Http2Connection {
-    _placeholder: (),
+    pub inner: crate::http::h2::stream::Connection,
+    pub write_buf: Buf,
 }
 
-/// Placeholder for WebSocket connection state -- frame parser,
-/// fragmentation buffer, ping/pong bookkeeping. Filled in once
-/// `http::ws` exists; only reserved here so `ConnectionProtocol::WebSocket`
-/// has something to name today.
+impl Http2Connection {
+    pub fn new(local_max_concurrent_streams: u32, local_header_table_size: usize) -> Self {
+        let inner = crate::http::h2::stream::Connection::new(local_max_concurrent_streams, local_header_table_size);
+        let mut write_buf = Buf::new();
+        write_buf.push(&inner.initial_send());
+        Http2Connection { inner, write_buf }
+    }
+}
+
+/// WebSocket connection state on this connection -- delegates all
+/// actual protocol logic to `http::ws::WsConnection`; this wrapper
+/// only adds the write buffer a caller drains to the transport, same
+/// division of responsibility as Http2Connection above.
 pub struct WsConnection {
-    _placeholder: (),
+    pub inner: crate::http::ws::WsConnection,
+    pub write_buf: Buf,
+}
+
+impl WsConnection {
+    pub fn new(pmd: Option<crate::http::ws::PmdContext>, max_message_size: usize) -> Self {
+        WsConnection {
+            inner: crate::http::ws::WsConnection::new(pmd, max_message_size),
+            write_buf: Buf::new(),
+        }
+    }
 }
 
 /// A single client connection: transport plus whichever protocol is

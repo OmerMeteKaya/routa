@@ -335,7 +335,9 @@ pub fn forward(
     h2_pools: &H2PoolRegistry,
     req: &HttpRequest,
     config: &ProxyConfig,
+    metrics: &crate::util::metrics::Metrics,
 ) -> Result<HttpResponse, ForwardError> {
+    let pool_name = &config.proxy_identity; // used as the pool label until pools carry their own configured name through to here
     let client_ip_str = req.remote_addr.map(|a| a.to_string());
     let sticky_value = req.get_header(&sticky_cookie_header_name(lb)).map(|s| s.to_string());
 
@@ -345,21 +347,39 @@ pub fn forward(
     for attempt in 0..max_attempts {
         if attempt > 0 {
             lb.record_retry();
+            metrics.upstream.retries_total.with_label_values(&[pool_name, "retry"]).inc();
         }
 
         let Some(node) = lb.pick_node_sticky(client_ip_str.as_deref(), sticky_value.as_deref())
         else {
             break; // no selectable node at all -- retrying further won't help
         };
+        let node_label = format!("{}:{}", node.host, node.port);
 
         match acquire_connection(&node, h2_pools) {
             AcquireOutcome::Ready(conn) => {
                 lb.record_request();
+                metrics.upstream.requests_total.with_label_values(&[pool_name, &node_label]).inc();
+                let start = std::time::Instant::now();
                 match forward_over_connection(conn, req, config, &lb.pool) {
-                    Ok(resp) => return Ok(resp),
+                    Ok(resp) => {
+                        let state_before = node.state();
+                        node.record_success(&lb.pool);
+                        record_state_transition_metrics(metrics, pool_name, &node_label, state_before, node.state());
+                        metrics
+                            .upstream
+                            .upstream_request_duration_seconds
+                            .with_label_values(&[pool_name, &node_label])
+                            .observe(start.elapsed().as_secs_f64());
+                        return Ok(resp);
+                    }
                     Err(e) => {
+                        let state_before = node.state();
                         node.record_failure(&lb.pool);
+                        record_state_transition_metrics(metrics, pool_name, &node_label, state_before, node.state());
                         lb.record_failed();
+                        let reason = if e.kind() == std::io::ErrorKind::TimedOut { "timeout" } else { "connect_failed" };
+                        metrics.upstream.errors_total.with_label_values(&[pool_name, &node_label, reason]).inc();
                         last_error = Some(e);
                         continue;
                     }
@@ -367,7 +387,10 @@ pub fn forward(
             }
             AcquireOutcome::Pending => continue,
             AcquireOutcome::Failed => {
+                let state_before = node.state();
                 node.record_failure(&lb.pool);
+                record_state_transition_metrics(metrics, pool_name, &node_label, state_before, node.state());
+                metrics.upstream.errors_total.with_label_values(&[pool_name, &node_label, "connect_failed"]).inc();
                 continue;
             }
         }
@@ -376,6 +399,46 @@ pub fn forward(
     match last_error {
         Some(e) => Err(ForwardError::UpstreamError(e)),
         None => Err(ForwardError::AllNodesExhausted),
+    }
+}
+
+/// Records circuit-breaker metrics for a node whose state may have
+/// just changed as a result of a `record_success`/`record_failure`
+/// call -- compares the state observed immediately before and after
+/// rather than `UpstreamNode` itself reporting transitions, so
+/// `lb::upstream`'s own API stays free of a `Metrics` dependency
+/// (that module's tests, and its own reasoning about circuit-breaker
+/// correctness, don't need to know metrics exist at all).
+fn record_state_transition_metrics(
+    metrics: &crate::util::metrics::Metrics,
+    pool_name: &str,
+    node_label: &str,
+    before: crate::lb::upstream::NodeState,
+    after: crate::lb::upstream::NodeState,
+) {
+    use crate::lb::upstream::NodeState;
+
+    metrics
+        .upstream
+        .circuit_breaker_state
+        .with_label_values(&[pool_name, node_label])
+        .set(circuit_breaker_state_value(after));
+
+    if before != after && after == NodeState::Down {
+        metrics.upstream.circuit_breaker_trips_total.with_label_values(&[pool_name, node_label]).inc();
+    }
+    if before != after && after == NodeState::HalfOpen {
+        metrics.upstream.half_open_trials_total.with_label_values(&[pool_name, node_label]).inc();
+    }
+}
+
+fn circuit_breaker_state_value(state: crate::lb::upstream::NodeState) -> i64 {
+    use crate::lb::upstream::NodeState;
+    match state {
+        NodeState::Up => 0,
+        NodeState::Down => 1,
+        NodeState::HalfOpen => 2,
+        NodeState::Draining => 3,
     }
 }
 
@@ -833,7 +896,8 @@ mod tests {
         let config = ProxyConfig::default();
 
         let req = make_request(HttpMethod::Get, "/", &[("Host", "example.com")]);
-        let resp = forward(&lb, &h2_pools, &req, &config).unwrap();
+        let metrics = crate::util::metrics::Metrics::new();
+        let resp = forward(&lb, &h2_pools, &req, &config, &metrics).unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"ok");
     }
@@ -848,7 +912,8 @@ mod tests {
 
         node.record_failure(&lb.pool); // start with one recorded failure
         let req = make_request(HttpMethod::Get, "/", &[("Host", "example.com")]);
-        forward(&lb, &h2_pools, &req, &config).unwrap();
+        let metrics = crate::util::metrics::Metrics::new();
+        forward(&lb, &h2_pools, &req, &config, &metrics).unwrap();
 
         // A success should have reset the fail streak -- confirmed
         // indirectly by the node still being selectable/Up (it never
@@ -885,7 +950,8 @@ mod tests {
         let config = ProxyConfig::default();
 
         let req = make_request(HttpMethod::Get, "/", &[("Host", "example.com")]);
-        let resp = forward(&lb, &h2_pools, &req, &config).unwrap();
+        let metrics = crate::util::metrics::Metrics::new();
+        let resp = forward(&lb, &h2_pools, &req, &config, &metrics).unwrap();
         assert_eq!(resp.body(), b"good");
     }
 
@@ -915,7 +981,8 @@ mod tests {
         let config = ProxyConfig::default();
 
         let req = make_request(HttpMethod::Get, "/", &[("Host", "example.com")]);
-        let result = forward(&lb, &h2_pools, &req, &config);
+        let metrics = crate::util::metrics::Metrics::new();
+        let result = forward(&lb, &h2_pools, &req, &config, &metrics);
         assert!(result.is_err());
     }
 
@@ -945,7 +1012,8 @@ mod tests {
         let config = ProxyConfig::default();
 
         let req = make_request(HttpMethod::Get, "/", &[("Host", "example.com")]);
-        let resp = forward(&lb, &h2_pools, &req, &config).unwrap();
+        let metrics = crate::util::metrics::Metrics::new();
+        let resp = forward(&lb, &h2_pools, &req, &config, &metrics).unwrap();
         assert_eq!(resp.body(), b"yes");
     }
 }

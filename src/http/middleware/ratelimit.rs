@@ -113,6 +113,7 @@ struct TokenBucket {
 pub struct RateLimitMiddleware {
     config: RateLimitConfig,
     buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+    metrics: Option<std::sync::Arc<crate::util::metrics::Metrics>>,
 }
 
 const BUCKET_MAX_AGE: Duration = Duration::from_secs(60);
@@ -122,6 +123,15 @@ impl RateLimitMiddleware {
         RateLimitMiddleware {
             config,
             buckets: Mutex::new(HashMap::new()),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(config: RateLimitConfig, metrics: std::sync::Arc<crate::util::metrics::Metrics>) -> Self {
+        RateLimitMiddleware {
+            config,
+            buckets: Mutex::new(HashMap::new()),
+            metrics: Some(metrics),
         }
     }
 
@@ -169,6 +179,9 @@ impl Middleware for RateLimitMiddleware {
         if self.check_and_consume(ip) {
             next.run(req)
         } else {
+            if let Some(metrics) = &self.metrics {
+                metrics.middleware.rate_limit_rejected_total.inc();
+            }
             let mut resp = HttpResponse::new(429, "Too Many Requests");
             resp.set_header("Content-Type", "text/plain");
             resp.set_body(b"Too Many Requests\n".to_vec());

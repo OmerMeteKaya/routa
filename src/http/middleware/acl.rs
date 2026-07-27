@@ -86,12 +86,21 @@ impl AclConfig {
 /// `http::middleware`'s module doc comment for the general pattern.
 pub struct AclMiddleware {
     config: ArcSwap<AclConfig>,
+    metrics: Option<std::sync::Arc<crate::util::metrics::Metrics>>,
 }
 
 impl AclMiddleware {
     pub fn new(config: AclConfig) -> Self {
         AclMiddleware {
             config: ArcSwap::from_pointee(config),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(config: AclConfig, metrics: std::sync::Arc<crate::util::metrics::Metrics>) -> Self {
+        AclMiddleware {
+            config: ArcSwap::from_pointee(config),
+            metrics: Some(metrics),
         }
     }
 
@@ -114,6 +123,9 @@ impl Middleware for AclMiddleware {
         };
 
         if !allowed {
+            if let Some(metrics) = &self.metrics {
+                metrics.middleware.acl_denied_total.inc();
+            }
             let mut resp = HttpResponse::new(403, "Forbidden");
             resp.set_header("Content-Type", "text/plain");
             resp.set_body(b"Forbidden\n".to_vec());

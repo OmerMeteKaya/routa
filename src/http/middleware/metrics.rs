@@ -1,38 +1,27 @@
 //! `/metrics` route handler: renders Prometheus text format. Not a
 //! `Middleware` (doesn't sit in the request chain) -- registered
-//! directly as a route, same as the archived C implementation's
-//! `routa_metrics_handler` (see its own doc comment for the intended
-//! registration: `GET /metrics`).
+//! directly as a route: `GET /metrics`.
 //!
 //! The actual metric collection/formatting logic lives in
-//! `util::metrics` (not yet implemented -- see the project roadmap's
-//! observability layer, deliberately sequenced after the request/
-//! response/proxy layers that produce the numbers being reported).
-//! This handler is intentionally a thin wrapper around that: once
-//! `util::metrics::prometheus_text()` exists, this is the only place
-//! that needs to change to serve real data instead of a placeholder.
+//! `util::metrics`; this handler is a thin wrapper that reads the
+//! caller-supplied `Metrics` registry and serves its current state.
+
+use std::sync::Arc;
 
 use crate::http::request::HttpRequest;
 use crate::http::response::HttpResponse;
+use crate::util::metrics::Metrics;
 
 /// Renders the `/metrics` response. Returns Prometheus text format
 /// (content-type `text/plain; version=0.0.4; charset=utf-8`, per the
 /// Prometheus exposition format spec) with caching disabled, since
 /// metrics should always be scraped fresh.
-pub fn handle(_req: &HttpRequest) -> HttpResponse {
+pub fn handle(_req: &HttpRequest, metrics: &Arc<Metrics>) -> HttpResponse {
     let mut resp = HttpResponse::new(200, "OK");
     resp.set_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
     resp.set_header("Cache-Control", "no-cache");
-    resp.set_body(prometheus_text());
+    resp.set_body(metrics.prometheus_text());
     resp
-}
-
-/// Placeholder pending `util::metrics`. Returns an empty exposition
-/// (Prometheus scrapers tolerate an empty body -- no metrics reported
-/// yet is a valid, if uninteresting, response) rather than fabricating
-/// fake metric lines.
-fn prometheus_text() -> Vec<u8> {
-    Vec::new()
 }
 
 #[cfg(test)]
@@ -58,7 +47,8 @@ mod tests {
 
     #[test]
     fn returns_200_with_correct_content_type() {
-        let resp = handle(&make_request());
+        let metrics = crate::util::metrics::Metrics::new();
+        let resp = handle(&make_request(), &metrics);
         assert_eq!(resp.status, 200);
         assert_eq!(
             resp.get_header("Content-Type"),
@@ -68,7 +58,17 @@ mod tests {
 
     #[test]
     fn disables_caching() {
-        let resp = handle(&make_request());
+        let metrics = crate::util::metrics::Metrics::new();
+        let resp = handle(&make_request(), &metrics);
         assert_eq!(resp.get_header("Cache-Control"), Some("no-cache"));
+    }
+
+    #[test]
+    fn body_contains_real_metric_output() {
+        let metrics = crate::util::metrics::Metrics::new();
+        metrics.record_request("GET", "/", 200, 0.01, 0, 0);
+        let resp = handle(&make_request(), &metrics);
+        let body = String::from_utf8(resp.body().to_vec()).unwrap();
+        assert!(body.contains("routa_http_requests_total"));
     }
 }
