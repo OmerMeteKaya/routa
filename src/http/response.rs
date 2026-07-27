@@ -11,6 +11,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::util::buf::Buf;
+use crate::util::time::format_http_date;
 
 /// A single response header. Stored as an ordered list (not a map) so
 /// that `serialize` emits headers in the order they were set --
@@ -198,51 +199,6 @@ fn http_date_now() -> String {
     format_http_date(now.as_secs())
 }
 
-const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// Converts a Unix timestamp (seconds since epoch, UTC) to the
-/// RFC 9110 IMF-fixdate format. Implements the same civil-calendar
-/// arithmetic `gmtime` does, restricted to what formatting the `Date`
-/// header needs (no timezone handling -- always UTC).
-pub(crate) fn format_http_date(unix_secs: u64) -> String {
-    let days_since_epoch = unix_secs / 86400;
-    let secs_of_day = unix_secs % 86400;
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    let second = secs_of_day % 60;
-
-    // 1970-01-01 was a Thursday (weekday index 4).
-    let weekday = WEEKDAYS[((days_since_epoch + 4) % 7) as usize];
-
-    let (year, month, day) = civil_from_days(days_since_epoch as i64);
-
-    format!(
-        "{weekday}, {day:02} {month} {year} {hour:02}:{minute:02}:{second:02} GMT",
-        month = MONTHS[(month - 1) as usize]
-    )
-}
-
-/// Howard Hinnant's `civil_from_days` algorithm: converts a day count
-/// since the Unix epoch into a proleptic-Gregorian (year, month, day).
-/// A standard, well-tested piece of civil calendar arithmetic (avoids
-/// hand-rolling leap-year logic, a well-known source of off-by-one
-/// bugs at century/400-year boundaries).
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as i64; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as i64; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
 
 #[cfg(test)]
 mod tests {
@@ -391,38 +347,4 @@ mod tests {
         assert!(!s.contains("Content-Length"));
     }
 
-    // ─── HTTP-date formatting ────────────────────────────────────────
-
-    #[test]
-    fn known_epoch_formats_correctly() {
-        // 0 = 1970-01-01T00:00:00Z, a Thursday.
-        assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-    }
-
-    #[test]
-    fn known_recent_date_formats_correctly() {
-        // 2024-01-01T00:00:00Z was a Monday.
-        assert_eq!(
-            format_http_date(1_704_067_200),
-            "Mon, 01 Jan 2024 00:00:00 GMT"
-        );
-    }
-
-    #[test]
-    fn leap_day_formats_correctly() {
-        // 2024-02-29T12:00:00Z (2024 is a leap year) was a Thursday.
-        assert_eq!(
-            format_http_date(1_709_208_000),
-            "Thu, 29 Feb 2024 12:00:00 GMT"
-        );
-    }
-
-    #[test]
-    fn year_end_formats_correctly() {
-        // 2023-12-31T23:59:59Z was a Sunday.
-        assert_eq!(
-            format_http_date(1_704_067_199),
-            "Sun, 31 Dec 2023 23:59:59 GMT"
-        );
-    }
 }

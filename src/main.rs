@@ -71,7 +71,7 @@ fn main() {
         }
     };
 
-    let pool = event_loop::run(server, port, n_workers);
+    let pool = event_loop::run(Arc::clone(&server), port, n_workers);
 
     // SIGTERM/SIGINT initiate a graceful shutdown: WorkerPool::shutdown()
     // signals every worker thread to stop accepting new connections
@@ -85,8 +85,23 @@ fn main() {
 
     tracing::info!(port, n_workers, "routa ready");
 
+    server.metrics.process.workers_alive.set(n_workers as i64);
+    let mut last_seen_restarts: usize = 0;
+
     while !shutdown_requested.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // WorkerPool::total_restarts() is a running total, but
+        // worker_restarts_total is a Prometheus counter (only ever
+        // increases by a delta, never set to an absolute value) --
+        // track how much of the total this loop has already reported
+        // and inc() by whatever's new since the last check.
+        let current_restarts = pool.total_restarts();
+        if current_restarts > last_seen_restarts {
+            let delta = current_restarts - last_seen_restarts;
+            server.metrics.process.worker_restarts_total.inc_by(delta as u64);
+            last_seen_restarts = current_restarts;
+        }
     }
 
     tracing::info!("shutdown signal received, draining workers");

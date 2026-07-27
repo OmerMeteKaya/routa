@@ -845,7 +845,7 @@ impl FileCache {
     /// per-worker on the next `get`, see `WorkerMmapCache::sync`).
     pub fn put(&self, path: &str, resolved_path: PathBuf, size: u64, mtime: SystemTime) {
         let etag = make_etag(mtime, size);
-        let last_modified = crate::http::response::format_http_date(
+        let last_modified = crate::util::time::format_http_date(
             mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         );
         let mime_type = guess_mime_type(&resolved_path).to_string();
