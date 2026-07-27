@@ -26,6 +26,7 @@ prometheus = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
+signal-hook = "0.3"
 brotli = "6"
 
 [dev-dependencies]
