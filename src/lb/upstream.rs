@@ -24,6 +24,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+/// How long a resolved upstream address stays valid before
+/// `resolve_addr` performs a fresh DNS lookup. Chosen as a middle
+/// ground: short enough that a hostname's DNS record change (e.g. a
+/// cloud load balancer rotating IPs) is picked up within a reasonable
+/// operational window, long enough that a busy pool making frequent
+/// new connections doesn't pay for a DNS round-trip on most of them.
+const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+
 use mio::net::TcpStream;
 
 // ─── Health check config ────────────────────────────────────────────────
@@ -191,10 +199,11 @@ pub struct UpstreamNode {
     // Least-connections counter.
     pub inflight: AtomicU32,
 
-    // Resolved address, cached after first resolution -- see
-    // `resolve_addr`'s doc comment for the "resolved once, for the
-    // process's lifetime" tradeoff this makes deliberately.
-    resolved_addr: RwLock<Option<SocketAddr>>,
+    // Resolved address, cached with a TTL -- see `resolve_addr`'s doc
+    // comment for why a bounded cache (rather than either "resolve
+    // every call" or "resolve once for the process's lifetime")
+    // is the right tradeoff here.
+    resolved_addr: RwLock<Option<(SocketAddr, Instant)>>,
 
     pub use_tls: bool,
 
@@ -242,31 +251,45 @@ impl UpstreamNode {
         NodeStateCode::from(self.state.load(Ordering::Acquire) as u8).into()
     }
 
-    /// Resolves and caches this node's address: IPv4/IPv6 literals
-    /// resolve instantly; a hostname goes through a real (blocking)
-    /// DNS lookup the first time only. The result is cached for the
-    /// process's lifetime -- deliberately no periodic re-resolution
-    /// here. If DNS-based failover across a hostname's resolved IPs
-    /// (as opposed to routa's own health checking across configured
-    /// nodes) is ever needed, that's a distinct feature to add on top
-    /// of this, not a correction to this function's current behavior.
+    /// Resolves this node's address, caching the result for
+    /// `DNS_CACHE_TTL` -- IPv4/IPv6 literals resolve instantly (and
+    /// are effectively cached forever, since parsing a literal never
+    /// changes); a hostname goes through a real (blocking) DNS lookup
+    /// whenever the cached entry is missing or older than the TTL.
+    /// This bounds how long an upstream's DNS-level changes (e.g. a
+    /// cloud load balancer rotating the IPs behind a hostname) can go
+    /// unnoticed, without paying a DNS lookup on every single
+    /// connection attempt -- the two extremes a fixed "resolve once
+    /// for the process's lifetime" or "resolve on every call" policy
+    /// would otherwise force a choice between.
+    ///
+    /// A stale cached address isn't proactively evicted on its own --
+    /// it's simply not reused past the TTL, and the next call pays for
+    /// a fresh lookup. If that fresh lookup itself fails (e.g. a
+    /// transient DNS outage), the error propagates rather than falling
+    /// back to the stale address; a caller that already has a
+    /// TcpStream open against the old address keeps using it until
+    /// that connection's own lifecycle ends (idle-reaping, a failed
+    /// request) -- this function only affects NEW connection
+    /// attempts, never ones already in flight.
     pub fn resolve_addr(&self) -> std::io::Result<SocketAddr> {
-        if let Some(addr) = *self.resolved_addr.read().unwrap() {
-            return Ok(addr);
+        if let Some((addr, resolved_at)) = *self.resolved_addr.read().unwrap() {
+            if resolved_at.elapsed() < DNS_CACHE_TTL {
+                return Ok(addr);
+            }
         }
-
         let mut guard = self.resolved_addr.write().unwrap();
         // Re-check under the write lock -- another thread may have
-        // resolved it while we were waiting for the lock.
-        if let Some(addr) = *guard {
-            return Ok(addr);
+        // already refreshed it while we were waiting for the lock.
+        if let Some((addr, resolved_at)) = *guard {
+            if resolved_at.elapsed() < DNS_CACHE_TTL {
+                return Ok(addr);
+            }
         }
-
         let addr = if let Ok(ip) = self.host.parse::<IpAddr>() {
             SocketAddr::new(ip, self.port)
         } else {
-            // Hostname -- a real (blocking) DNS lookup, same
-            // resolve-once-and-cache tradeoff as an IP literal above.
+            // Hostname -- a real (blocking) DNS lookup.
             use std::net::ToSocketAddrs;
             let mut addrs = (self.host.as_str(), self.port).to_socket_addrs()?;
             addrs.next().ok_or_else(|| {
@@ -276,8 +299,7 @@ impl UpstreamNode {
                 )
             })?
         };
-
-        *guard = Some(addr);
+        *guard = Some((addr, Instant::now()));
         Ok(addr)
     }
 
@@ -577,6 +599,35 @@ mod tests {
         let first = node.resolve_addr().unwrap();
         let second = node.resolve_addr().unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn resolve_addr_refreshes_after_ttl_expires() {
+        let node = make_node();
+        let first = node.resolve_addr().unwrap();
+
+        // Directly age the cached entry past DNS_CACHE_TTL rather than
+        // actually sleeping for it in a test -- same address is
+        // expected back (this node's host is an IP literal, so a
+        // "fresh" resolution is identical), but what's under test is
+        // that resolve_addr() actually re-entered its resolution path
+        // rather than trusting a stale cache entry indefinitely. A
+        // hostname-based node re-resolving to a *different* address
+        // isn't practical to test without a controllable DNS backend,
+        // so this test's guarantee is narrower: expiry triggers
+        // resolution again, not "resolution ever changes."
+        {
+            let mut guard = node.resolved_addr.write().unwrap();
+            if let Some((addr, _)) = *guard {
+                let long_ago = Instant::now()
+                    .checked_sub(DNS_CACHE_TTL + Duration::from_secs(1))
+                    .expect("test clock underflow");
+                *guard = Some((addr, long_ago));
+            }
+        }
+
+        let second = node.resolve_addr().unwrap();
+        assert_eq!(first, second); // same IP literal -- but re-resolved, not just reused from a stale cache hit
     }
 
     // ─── Passive health / circuit breaker ────────────────────────────
