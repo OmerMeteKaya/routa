@@ -109,6 +109,14 @@ pub struct DynamicTable {
     entries: VecDeque<HeaderField>,
     current_size: usize,
     max_size: usize,
+    /// The upper bound this side has advertised (via
+    /// SETTINGS_HEADER_TABLE_SIZE) that a peer's dynamic table size
+    /// update must never exceed -- distinct from `max_size` itself,
+    /// which tracks the *current* effective limit (a peer can set it
+    /// anywhere from 0 up to this ceiling). RFC 7541 6.3: a size
+    /// update exceeding this ceiling is a decoding error, not merely
+    /// clamped.
+    advertised_max_size: usize,
 }
 
 impl DynamicTable {
@@ -117,15 +125,35 @@ impl DynamicTable {
             entries: VecDeque::new(),
             current_size: 0,
             max_size,
+            advertised_max_size: max_size,
         }
     }
 
     /// Changes the table's size limit (from a Dynamic Table Size
     /// Update representation, 6.3), evicting entries if the new limit
     /// is smaller than the current content requires.
-    pub fn set_max_size(&mut self, new_max_size: usize) {
+    /// Sets the dynamic table's current effective size limit.
+    /// `Err` if `new_max_size` exceeds `advertised_max_size` (RFC 7541
+    /// 6.3's decoding-error case) -- the caller (see `HpackContext::decode`)
+    /// is expected to treat that as a full decode failure, not clamp
+    /// silently to the ceiling.
+    pub fn set_max_size(&mut self, new_max_size: usize) -> Result<(), HpackError> {
+        if new_max_size > self.advertised_max_size {
+            return Err(HpackError::DynamicTableSizeUpdateTooLarge);
+        }
         self.max_size = new_max_size;
         self.evict_to_fit(0);
+        Ok(())
+    }
+
+    /// Updates the ceiling a peer's dynamic table size update must
+    /// respect -- called when this side's own SETTINGS_HEADER_TABLE_SIZE
+    /// changes (see `HpackContext::set_max_dynamic_table_size`, which
+    /// is this side announcing a new value to accept from the peer,
+    /// as opposed to `set_max_size` which is the peer telling us what
+    /// it's actually using right now).
+    pub fn set_advertised_max_size(&mut self, new_ceiling: usize) {
+        self.advertised_max_size = new_ceiling;
     }
 
     fn evict_to_fit(&mut self, needed: usize) {
@@ -539,9 +567,17 @@ fn huffman_decode(data: &[u8]) -> Result<Vec<u8>, HpackError> {
         }
     }
 
-    // Whatever bits remain (fewer than 5) must be all 1s -- valid
-    // trailing padding per RFC 7541 5.2. Anything else is a decoding
-    // error (malformed input).
+    // RFC 7541 5.2: trailing padding must be all 1s AND must be
+    // strictly shorter than the shortest valid Huffman code (5 bits
+    // in this table) -- 7 bits is the practical ceiling since an
+    // 8-bit or longer "leftover" that's still all 1s would actually
+    // be long enough to itself be a valid (or EOS-colliding) code,
+    // meaning the encoder either used a real code as padding or the
+    // padding is simply too long to be padding at all. Either way
+    // that's a decoding error, not padding to silently accept.
+    if bit_count > 7 {
+        return Err(HpackError::InvalidHuffmanPadding);
+    }
     if bit_count > 0 {
         let remaining = bit_buf & ((1u64 << bit_count) - 1);
         let all_ones = (1u64 << bit_count) - 1;
@@ -586,6 +622,9 @@ pub enum HpackError {
     InvalidHuffmanPadding,
     /// Decoded bytes (Huffman or literal) weren't valid UTF-8.
     InvalidUtf8,
+    /// A dynamic table size update exceeded the ceiling this side
+    /// advertised via SETTINGS_HEADER_TABLE_SIZE (RFC 7541 6.3).
+    DynamicTableSizeUpdateTooLarge,
 }
 
 // ─── Integer primitives (RFC 7541 5.1) ─────────────────────────────────
@@ -721,8 +760,15 @@ impl HpackContext {
         }
     }
 
+    /// Called when THIS side's own SETTINGS_HEADER_TABLE_SIZE changes
+    /// (i.e. we're announcing a new ceiling to the peer) -- updates
+    /// both the advertised ceiling and, since we're the one changing
+    /// our own mind about it, the current effective size to match (a
+    /// self-imposed change can't itself be "too large" the way a
+    /// peer's size update against our ceiling could be).
     pub fn set_max_dynamic_table_size(&mut self, new_size: usize) {
-        self.table.set_max_size(new_size);
+        self.table.set_advertised_max_size(new_size);
+        let _ = self.table.set_max_size(new_size); // can't fail: new_size is now also the ceiling
     }
 
     /// Resolves a combined static+dynamic index (1-based, per RFC 7541
@@ -767,6 +813,19 @@ impl HpackContext {
         while pos < data.len() {
             let byte = data[pos];
 
+            // RFC 7541 4.2: a dynamic table size update, if present at
+            // all, must appear at the very start of a header block --
+            // never after any header field representation has already
+            // been decoded. Checked using the same bit-pattern
+            // precedence as the dispatch below (0x80, then 0x40, then
+            // 0x20) -- a naive `byte & 0x20 != 0` alone would also
+            // match plenty of Indexed Header Field or Incremental
+            // Indexing bytes that happen to have that bit set too,
+            // since HPACK's representations are only distinguished by
+            // testing the highest set bit first.
+            if byte & 0x80 == 0 && byte & 0x40 == 0 && byte & 0x20 != 0 && !fields.is_empty() {
+                return Err(HpackError::DynamicTableSizeUpdateTooLarge);
+            }
             if byte & 0x80 != 0 {
                 // 6.1 Indexed Header Field -- top bit set, 7-bit index.
                 let (index, consumed) = decode_integer(&data[pos..], 7)?;
@@ -793,7 +852,7 @@ impl HpackContext {
                 // 6.3 Dynamic Table Size Update -- top three bits 001,
                 // 5-bit encoded new max size.
                 let (new_size, consumed) = decode_integer(&data[pos..], 5)?;
-                self.table.set_max_size(new_size as usize);
+                self.table.set_max_size(new_size as usize)?;
                 pos += consumed;
             } else {
                 // 6.2.2 Literal Header Field without Indexing (top
@@ -1040,7 +1099,7 @@ mod tests {
         table.insert(field("a", "1"));
         table.insert(field("b", "2"));
         assert_eq!(table.len(), 2);
-        table.set_max_size(34); // room for only one ~34-byte entry
+        let _ = table.set_max_size(34); // room for only one ~34-byte entry
         assert!(table.len() <= 1);
     }
 
@@ -1090,6 +1149,37 @@ mod tests {
         let mut ctx = HpackContext::new(4096);
         let encoded = ctx.encode(&[field(":method", "GET")]);
         assert_eq!(encoded, vec![0x82]); // indexed, static index 2
+    }
+
+    #[test]
+    fn dynamic_table_size_update_exceeding_advertised_ceiling_is_rejected() {
+        let mut table = DynamicTable::new(100);
+        // The advertised ceiling is 100 -- a size update trying to set
+        // it to 200 exceeds what was ever advertised as acceptable.
+        let result = table.set_max_size(200);
+        assert!(matches!(result, Err(HpackError::DynamicTableSizeUpdateTooLarge)));
+    }
+
+    #[test]
+    fn dynamic_table_size_update_within_ceiling_succeeds() {
+        let mut table = DynamicTable::new(100);
+        assert!(table.set_max_size(50).is_ok());
+    }
+
+    #[test]
+    fn dynamic_table_size_update_after_a_header_field_is_a_decode_error() {
+        let mut decoder = HpackContext::new(4096);
+        // First, a single valid indexed header field representation
+        // (index 2 = ":method: GET" in the static table) -- valid on
+        // its own.
+        let mut encoded = vec![0x82]; // 1000_0010 -- indexed, index 2
+        // Then a dynamic table size update (0010_xxxx pattern) --
+        // this is no longer at the start of the header block, so it
+        // must be rejected.
+        encoded.push(0x3f); // 0011_1111: size update, prefix value 31 (needs continuation)
+        encoded.push(0x00); // continuation byte: value stays small
+        let result = decoder.decode(&encoded);
+        assert!(result.is_err(), "a dynamic table size update after a header field should be a decode error");
     }
 
     #[test]

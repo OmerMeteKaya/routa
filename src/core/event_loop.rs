@@ -498,6 +498,33 @@ fn read_transport_bytes(connections: &mut Slab<Connection>, idx: usize) -> std::
     let mut collected = Vec::new();
     loop {
         let conn = &mut connections[idx];
+
+        // For a TLS transport, read_plaintext only surfaces bytes
+        // rustls has already decrypted -- advance_io is what actually
+        // reads new TLS records (or notices the underlying TCP
+        // connection reached EOF) off the real socket. Without this,
+        // an abruptly-closed TCP connection (no TLS close_notify sent
+        // -- common; see rustls's own docs on this) would never
+        // surface as anything other than WouldBlock from
+        // read_plaintext, since rustls has no new record to decrypt
+        // and no reason to believe the connection ended. The result
+        // was an infinite busy-loop: mio's level-triggered epoll kept
+        // reporting the socket readable (a closed peer is always
+        // "readable" in that sense), and this function kept reporting
+        // "nothing new" back up to the caller instead of ever
+        // detecting the close.
+        if let Transport::Tls { stream, tls } = &mut conn.transport {
+            match tls.advance_io(stream) {
+                Ok(advance) if advance.peer_closed => {
+                    conn.closing = true;
+                    return Ok(collected);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+
         let mut chunk = [0u8; 16384];
         let read_result = match &mut conn.transport {
             Transport::Plain(stream) => stream.read(&mut chunk),

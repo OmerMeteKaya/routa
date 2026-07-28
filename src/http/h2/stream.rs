@@ -211,6 +211,13 @@ pub struct Connection {
     goaway_sent: bool,
     error: bool,
     last_stream_id_processed: u32,
+    /// `Some(stream_id)` while a HEADERS frame without END_HEADERS is
+    /// still waiting for its CONTINUATION frame(s) -- RFC 9113 6.10
+    /// requires that no other frame type may be interleaved on the
+    /// connection during this window (not even for a different
+    /// stream), so `dispatch_frame` checks this before routing
+    /// anything except CONTINUATION while it's set.
+    expecting_continuation_for: Option<u32>,
 }
 
 impl Connection {
@@ -236,6 +243,7 @@ impl Connection {
             goaway_sent: false,
             error: false,
             last_stream_id_processed: 0,
+            expecting_continuation_for: None,
         }
     }
 
@@ -314,14 +322,28 @@ impl Connection {
 
     fn process_frames(&mut self, mut data: &[u8], result: &mut AdvanceResult) {
         loop {
-            let Some((frame, consumed)) = frame::parse_frame(data) else {
-                break;
+            // Check the frame header's declared length against our
+            // own advertised SETTINGS_MAX_FRAME_SIZE as soon as the
+            // 9-byte header itself is available -- deliberately
+            // before waiting for parse_frame to see the frame's full
+            // payload. A frame whose declared length already exceeds
+            // what we said we'd accept can legitimately never
+            // complete (the peer may simply never send that much
+            // payload, especially a conformance tester deliberately
+            // testing this exact boundary), so waiting for the "full"
+            // frame first would mean waiting forever instead of
+            // erroring immediately per RFC 9113 4.2.
+            let Some(header) = frame::FrameHeader::parse(data) else {
+                break; // not even a full header yet -- wait for more data
             };
-
-            if frame.header.length > self.local_max_frame_size {
+            if header.length > self.local_max_frame_size {
                 self.conn_error(H2Error::FrameSizeError, result);
                 break;
             }
+
+            let Some((frame, consumed)) = frame::parse_frame(data) else {
+                break; // header fits the limit, but payload hasn't fully arrived yet
+            };
 
             self.dispatch_frame(&frame, result);
             if self.error {
@@ -333,6 +355,14 @@ impl Connection {
     }
 
     fn dispatch_frame(&mut self, frame: &Frame<'_>, result: &mut AdvanceResult) {
+        if self.expecting_continuation_for.is_some() && frame.header.frame_type != FrameType::Continuation {
+            // RFC 9113 6.10: while a header block is incomplete (a
+            // HEADERS frame arrived without END_HEADERS), no frame
+            // other than CONTINUATION may be sent on the connection --
+            // not even a different, unrelated frame type or a frame
+            // for a different stream.
+            return self.conn_error(H2Error::ProtocolError, result);
+        }
         match frame.header.frame_type {
             FrameType::Settings => self.handle_settings(frame, result),
             FrameType::Ping => self.handle_ping(frame, result),
@@ -342,7 +372,7 @@ impl Connection {
             FrameType::Headers => self.handle_headers(frame, result),
             FrameType::Continuation => self.handle_continuation(frame, result),
             FrameType::Data => self.handle_data(frame, result),
-            FrameType::Priority => {} // accepted, deliberately not acted on -- see this module's h2.h note on priority being deprecated
+            FrameType::Priority => self.handle_priority(frame, result),
             FrameType::PushPromise => {
                 // A server never receives PUSH_PROMISE (only sends it)
                 // -- a client sending one is a protocol error.
@@ -433,6 +463,16 @@ impl Connection {
             for stream in self.streams.values_mut() {
                 stream.send_window += window_delta;
             }
+            // RFC 9113 6.9.2: adjusting SETTINGS_INITIAL_WINDOW_SIZE
+            // must actually unstall any stream whose pending response
+            // was previously blocked on a zero-or-negative window --
+            // just updating send_window above without also resuming
+            // delivery would leave that data queued forever even
+            // though the window is now open.
+            let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+            for stream_id in stream_ids {
+                self.flush_pending(stream_id, &mut result.to_send);
+            }
         }
 
         frame::write_settings_ack(&mut result.to_send);
@@ -470,15 +510,18 @@ impl Connection {
                 self.conn_error(H2Error::FlowControlError, result);
             }
         } else {
+            if frame.header.stream_id > self.highest_peer_stream_id {
+                // RFC 9113 5.1: a WINDOW_UPDATE for an idle stream
+                // (its id exceeds every id the peer has ever actually
+                // opened) is a connection error -- distinct from a
+                // WINDOW_UPDATE for a stream we've already closed and
+                // forgotten about, which is a normal, ignorable
+                // close-timing race (handled by the early return
+                // below when the id isn't found but is <= the highest
+                // seen).
+                return self.conn_error(H2Error::ProtocolError, result);
+            }
             let Some(stream) = self.streams.get_mut(&frame.header.stream_id) else {
-                // RFC 9113 5.1: a WINDOW_UPDATE for an idle (never
-                // opened) stream is a connection error; for an already
-                // fully-closed stream it's typically ignorable (the
-                // peer's view is just stale) -- since we've already
-                // removed truly-closed streams from `self.streams`,
-                // any missing id here is treated as the more lenient
-                // "stale, ignore" case rather than erroring the whole
-                // connection over normal close-timing races.
                 return;
             };
             stream.send_window += i64::from(increment);
@@ -497,7 +540,55 @@ impl Connection {
         if frame.payload.len() != 4 {
             return self.conn_error(H2Error::FrameSizeError, result);
         }
+        // RFC 9113 5.1: RST_STREAM on an idle stream (never opened --
+        // its id exceeds every id seen so far) is a connection error;
+        // a closed stream is different from idle and this is the
+        // ordinary/expected way a stream we already know about ends.
+        if frame.header.stream_id > self.highest_peer_stream_id {
+            return self.conn_error(H2Error::ProtocolError, result);
+        }
         self.streams.remove(&frame.header.stream_id);
+    }
+
+    /// PRIORITY frames are deprecated (RFC 9113 5.3.2 marks the whole
+    /// mechanism as a SHOULD-not-implement for new code, and routa
+    /// never acts on stream dependency/weight) but still must be
+    /// validated per RFC 9113 6.3 -- a client can send one at any
+    /// point, including for an idle stream, so its frame-level
+    /// requirements (exactly 5 bytes, not self-dependent) are checked
+    /// here even though the dependency/weight values themselves are
+    /// discarded afterward.
+    fn handle_priority(&mut self, frame: &Frame<'_>, result: &mut AdvanceResult) {
+        if frame.header.stream_id == CONNECTION_STREAM_ID {
+            return self.conn_error(H2Error::ProtocolError, result);
+        }
+        if frame.payload.len() != 5 {
+            // RFC 9113 6.3: a PRIORITY frame with a length other than
+            // 5 octets is a stream error, not a connection error --
+            // but if this is an idle stream (no Stream entry exists
+            // yet to attach a stream-level error to), there's nothing
+            // for a stream error to apply to, so this degrades to a
+            // connection error instead.
+            if self.streams.contains_key(&frame.header.stream_id) {
+                frame::write_rst_stream(&mut result.to_send, frame.header.stream_id, H2Error::FrameSizeError as u32);
+                self.streams.remove(&frame.header.stream_id);
+            } else {
+                self.conn_error(H2Error::FrameSizeError, result);
+            }
+            return;
+        }
+        let dependency = u32::from_be_bytes([frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3]]) & 0x7fff_ffff;
+        if dependency == frame.header.stream_id {
+            // RFC 9113 5.3.1: a stream cannot depend on itself.
+            if self.streams.contains_key(&frame.header.stream_id) {
+                frame::write_rst_stream(&mut result.to_send, frame.header.stream_id, H2Error::ProtocolError as u32);
+                self.streams.remove(&frame.header.stream_id);
+            } else {
+                self.conn_error(H2Error::ProtocolError, result);
+            }
+        }
+        // Dependency/weight are otherwise accepted and discarded --
+        // see this function's own doc comment.
     }
 
     fn handle_goaway(&mut self, frame: &Frame<'_>) {
@@ -524,6 +615,34 @@ impl Connection {
             // Reusing/reopening an id that's already been superseded --
             // RFC 9113 5.1's idle-stream-must-be-monotonic rule.
             return self.conn_error(H2Error::ProtocolError, result);
+        }
+        // RFC 9113 5.1: a HEADERS frame for a stream already in
+        // HalfClosedRemote is only valid as trailers -- the request's
+        // own END_STREAM has already arrived, so any further HEADERS
+        // must itself carry END_STREAM (trailers never introduce a
+        // new request body chunk) or it's a stream error. This is
+        // also what prevents a stray/duplicate HEADERS from
+        // re-triggering dispatch of a request that's already been
+        // fully received and responded to.
+        if let Some(existing) = self.streams.get(&stream_id) {
+            if existing.phase == StreamPhase::HalfClosedRemote {
+                if frame.header.flags & frame::FLAG_END_STREAM == 0 {
+                    frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::StreamClosed as u32);
+                    self.streams.remove(&stream_id);
+                    return;
+                }
+                // A valid trailers HEADERS frame -- accepted, but since
+                // this stream's request was already dispatched once
+                // (the moment it first reached HalfClosedRemote), the
+                // trailers themselves aren't currently surfaced to a
+                // caller anywhere (no trailer-aware request/response
+                // path exists yet). Consuming and discarding them here
+                // (rather than falling through to the rest of this
+                // function, which would try to re-open the stream and
+                // re-dispatch it) is what stops a trailers HEADERS
+                // frame from producing a second, spurious response.
+                return;
+            }
         }
 
         let concurrent = self
@@ -562,10 +681,19 @@ impl Connection {
 
         // PRIORITY (RFC 9113 5.3, deprecated): 5 bytes (stream
         // dependency + weight) accepted and skipped, never acted on --
-        // see this module's top doc comment.
+        // see this module's top doc comment. Still validated for
+        // self-dependency (RFC 9113 5.3.1): a HEADERS frame whose
+        // embedded priority makes the stream depend on itself is a
+        // stream error even though the dependency value is otherwise
+        // discarded.
         if frame.header.flags & frame::FLAG_PRIORITY != 0 {
             if payload.len() < 5 {
                 return self.conn_error(H2Error::FrameSizeError, result);
+            }
+            let dependency = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7fff_ffff;
+            if dependency == stream_id {
+                frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
+                return;
             }
             payload = &payload[5..];
         }
@@ -581,12 +709,19 @@ impl Connection {
 
         if end_headers {
             self.finish_header_block(stream_id, result);
+        } else {
+            self.expecting_continuation_for = Some(stream_id);
         }
-        // else: wait for CONTINUATION frame(s) -- see handle_continuation.
     }
 
     fn handle_continuation(&mut self, frame: &Frame<'_>, result: &mut AdvanceResult) {
         let stream_id = frame.header.stream_id;
+        // A CONTINUATION not for the stream currently being assembled
+        // (including one that arrives when no header block is in
+        // progress at all) is a connection error -- RFC 9113 6.10.
+        if self.expecting_continuation_for != Some(stream_id) {
+            return self.conn_error(H2Error::ProtocolError, result);
+        }
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             return self.conn_error(H2Error::ProtocolError, result);
         };
@@ -597,6 +732,7 @@ impl Connection {
         stream.header_block.extend_from_slice(frame.payload);
 
         if frame.header.flags & frame::FLAG_END_HEADERS != 0 {
+            self.expecting_continuation_for = None;
             self.finish_header_block(stream_id, result);
         }
     }
@@ -663,13 +799,36 @@ fn validate_request_pseudo_headers(fields: &[HeaderField]) -> bool {
             }
         } else {
             seen_regular_header = true;
+            // RFC 9113 8.2.1: field names are always lowercase in
+            // HTTP/2 -- an uppercase letter anywhere in the name is a
+            // protocol error, not just a stylistic nit, since h2's
+            // HPACK-based framing has no case-folding step the way h1
+            // header parsing does.
+            if field.name.chars().any(|c| c.is_ascii_uppercase()) {
+                return false;
+            }
             if is_hop_by_hop(&field.name) {
+                return false;
+            }
+            // RFC 9113 8.2.2: the only valid value for a TE header in
+            // an h2 request is exactly "trailers" -- any other value
+            // (including empty) is a protocol error, distinct from
+            // the general is_hop_by_hop check above which forbids
+            // Connection/Transfer-Encoding/etc. entirely but allows TE
+            // through with this one specific value.
+            if field.name.eq_ignore_ascii_case("te") && !field.value.eq_ignore_ascii_case("trailers") {
                 return false;
             }
         }
     }
 
     if method.is_none() || scheme.is_none() || path.is_none() {
+        return false;
+    }
+    // RFC 9113 8.3.1: :path must not be empty (a genuinely empty path
+    // is invalid even though "*" and "/" are both valid non-empty
+    // special cases handled elsewhere).
+    if path.is_some_and(|p| p.is_empty()) {
         return false;
     }
     if authority.is_none() && !fields.iter().any(|f| f.name.eq_ignore_ascii_case("host")) {
@@ -733,6 +892,21 @@ impl Connection {
 
         let end_stream = frame.header.flags & frame::FLAG_END_STREAM != 0;
         if end_stream {
+            // RFC 9113 8.3.2 / RFC 9110 8.6: if a content-length
+            // header was sent, the actual received body size must
+            // match it exactly.
+            if let Some(declared) = stream
+                .request_headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                .and_then(|h| h.value.parse::<usize>().ok())
+            {
+                if declared != stream.request_body.len() {
+                    frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
+                    self.streams.remove(&stream_id);
+                    return;
+                }
+            }
             stream.phase = StreamPhase::HalfClosedRemote;
             result.newly_ready_streams.push(stream_id);
         }
@@ -1117,6 +1291,85 @@ mod tests {
     }
 
     // ─── Protocol validation ─────────────────────────────────────────
+
+    /// Builds a raw 9-byte frame header + payload, for constructing
+    /// frames deliberately outside what this module's own frame::write_*
+    /// helpers would ever produce (malformed lengths, wrong stream
+    /// ids) -- exactly the kind of input a conformance fuzzer/tester
+    /// like h2spec sends and this module's own well-behaved test
+    /// helpers otherwise never would.
+    fn raw_frame(length: u32, frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push((length >> 16) as u8);
+        out.push((length >> 8) as u8);
+        out.push(length as u8);
+        out.push(frame_type);
+        out.push(flags);
+        out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    const FRAME_TYPE_PING: u8 = 0x6;
+    const FRAME_TYPE_PRIORITY: u8 = 0x2;
+    const FRAME_TYPE_RST_STREAM: u8 = 0x3;
+    const FRAME_TYPE_WINDOW_UPDATE: u8 = 0x8;
+
+    #[test]
+    fn ping_with_wrong_length_is_connection_error() {
+        let mut conn = new_conn();
+        let mut input = CONNECTION_PREFACE.to_vec();
+        // A PING frame with a 4-byte payload instead of the required 8.
+        input.extend_from_slice(&raw_frame(4, FRAME_TYPE_PING, 0, 0, &[1, 2, 3, 4]));
+        let result = conn.advance(&input);
+        assert!(result.connection_closed, "wrong-length PING should close the connection");
+    }
+
+    #[test]
+    fn rst_stream_on_idle_stream_is_connection_error() {
+        let mut conn = new_conn();
+        let mut input = CONNECTION_PREFACE.to_vec();
+        // Stream 1 has never been opened (no HEADERS sent for it) --
+        // an RST_STREAM referencing it is idle, not closed.
+        input.extend_from_slice(&raw_frame(4, FRAME_TYPE_RST_STREAM, 0, 1, &[0, 0, 0, 0]));
+        let result = conn.advance(&input);
+        assert!(result.connection_closed, "RST_STREAM on an idle stream should close the connection");
+    }
+
+    #[test]
+    fn window_update_on_idle_stream_is_connection_error() {
+        let mut conn = new_conn();
+        let mut input = CONNECTION_PREFACE.to_vec();
+        input.extend_from_slice(&raw_frame(4, FRAME_TYPE_WINDOW_UPDATE, 0, 1, &[0, 0, 0, 1]));
+        let result = conn.advance(&input);
+        assert!(result.connection_closed, "WINDOW_UPDATE on an idle stream should close the connection");
+    }
+
+    #[test]
+    fn priority_frame_depending_on_itself_is_an_error() {
+        let mut conn = new_conn();
+        let stream_id = send_handshake_and_request(&mut conn, "/");
+        let mut priority_payload = Vec::new();
+        priority_payload.extend_from_slice(&stream_id.to_be_bytes()); // depends on itself
+        priority_payload.push(16); // weight
+        let input = raw_frame(5, FRAME_TYPE_PRIORITY, 0, stream_id, &priority_payload);
+        let result = conn.advance(&input);
+        // Either a full connection close, or an RST_STREAM for the
+        // affected stream, satisfies RFC 9113 5.3.1's "stream error"
+        // requirement here -- confirmed by checking result.to_send
+        // contains something (either GOAWAY or RST_STREAM bytes),
+        // not silence.
+        assert!(!result.to_send.is_empty() || result.connection_closed);
+    }
+
+    #[test]
+    fn priority_frame_wrong_length_on_idle_stream_is_connection_error() {
+        let mut conn = new_conn();
+        let mut input = CONNECTION_PREFACE.to_vec();
+        input.extend_from_slice(&raw_frame(3, FRAME_TYPE_PRIORITY, 0, 1, &[0, 0, 0]));
+        let result = conn.advance(&input);
+        assert!(result.connection_closed, "wrong-length PRIORITY on an idle stream should close the connection");
+    }
 
     #[test]
     fn even_stream_id_from_client_is_protocol_error() {
