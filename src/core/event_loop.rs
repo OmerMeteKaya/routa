@@ -691,10 +691,10 @@ fn drive_http2(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
             let ConnectionProtocol::Http2(h2) = &connections[idx].protocol else {
                 unreachable!()
             };
-            let Some((headers, body)) = h2.inner.take_request(stream_id) else {
+            let Some((headers, body, trailers)) = h2.inner.take_request(stream_id) else {
                 continue;
             };
-            build_request_from_h2_headers(headers, body, remote_ip)
+            build_request_from_h2_headers(headers, body, trailers, remote_ip)
         };
         let Some(request) = request else {
             let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
@@ -742,6 +742,7 @@ fn drive_http2(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
 fn build_request_from_h2_headers(
     headers: &[crate::http::h2::hpack::HeaderField],
     body: &[u8],
+    trailers: &[crate::http::h2::hpack::HeaderField],
     remote_ip: std::net::IpAddr,
 ) -> Option<crate::http::request::HttpRequest> {
     let method_str = headers.iter().find(|h| h.name == ":method")?.value.as_str();
@@ -789,7 +790,7 @@ fn build_request_from_h2_headers(
         headers: regular_headers,
         body: body.to_vec(),
         keep_alive: true, // meaningless for H2 (multiplexed streams, no per-request Connection semantics) -- true is the harmless default
-        trailers: Vec::new(),
+        trailers: trailers.iter().map(|h| (h.name.clone(), h.value.clone())).collect(),
     })
 }
 

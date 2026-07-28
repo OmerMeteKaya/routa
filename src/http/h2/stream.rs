@@ -137,6 +137,12 @@ pub struct Stream {
 
     pub pending_response: PendingBody,
     pub response_headers_sent: bool,
+    /// Trailer fields received after the request body (a second
+    /// HEADERS frame with END_STREAM, sent once the stream was
+    /// already `Open`) -- kept separate from `request_headers` since
+    /// trailers arrive after the body and are exempt from the
+    /// pseudo-header validation regular request headers require.
+    pub trailers: Vec<HeaderField>,
 }
 
 impl Stream {
@@ -152,6 +158,7 @@ impl Stream {
             request_body: Vec::new(),
             pending_response: PendingBody::None,
             response_headers_sent: false,
+            trailers: Vec::new(),
         }
     }
 }
@@ -274,10 +281,10 @@ impl Connection {
     /// called once per `advance()` result, handing each id's request
     /// off to a router and then, once a response is ready, back to
     /// `Connection::send_response`.
-    pub fn take_request(&self, stream_id: u32) -> Option<(&[HeaderField], &[u8])> {
+    pub fn take_request(&self, stream_id: u32) -> Option<(&[HeaderField], &[u8], &[HeaderField])> {
         self.streams
             .get(&stream_id)
-            .map(|s| (s.request_headers.as_slice(), s.request_body.as_slice()))
+            .map(|s| (s.request_headers.as_slice(), s.request_body.as_slice(), s.trailers.as_slice()))
     }
 
     pub fn is_closed(&self) -> bool {
@@ -507,7 +514,14 @@ impl Connection {
         if frame.header.stream_id == CONNECTION_STREAM_ID {
             self.send_window += i64::from(increment);
             if self.send_window > MAX_WINDOW_SIZE {
-                self.conn_error(H2Error::FlowControlError, result);
+                return self.conn_error(H2Error::FlowControlError, result);
+            }
+            // A connection-level window increase can unstall every
+            // stream that has a response queued, not just one -- same
+            // reasoning as the SETTINGS_INITIAL_WINDOW_SIZE handler.
+            let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+            for stream_id in stream_ids {
+                self.flush_pending(stream_id, &mut result.to_send);
             }
         } else {
             if frame.header.stream_id > self.highest_peer_stream_id {
@@ -529,7 +543,10 @@ impl Connection {
                 let stream_id = frame.header.stream_id;
                 frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::FlowControlError as u32);
                 self.streams.remove(&stream_id);
+                return;
             }
+            let stream_id = frame.header.stream_id;
+            self.flush_pending(stream_id, &mut result.to_send);
         }
     }
 
@@ -626,21 +643,56 @@ impl Connection {
         // fully received and responded to.
         if let Some(existing) = self.streams.get(&stream_id) {
             if existing.phase == StreamPhase::HalfClosedRemote {
+                // RFC 9113 5.1: any further frame on a stream already
+                // in HalfClosedRemote other than WINDOW_UPDATE,
+                // PRIORITY, or RST_STREAM is a stream error of type
+                // STREAM_CLOSED -- including a HEADERS frame that
+                // merely resembles trailers on the surface (has
+                // END_STREAM) but isn't valid trailers once decoded
+                // (carries pseudo-headers, i.e. is actually a second
+                // copy of request headers). Only genuine trailers --
+                // END_STREAM set AND no pseudo-headers once HPACK-
+                // decoded -- are accepted and silently discarded here
+                // (no trailer-aware second-dispatch path exists, so
+                // accepting them is just "don't error", not "act on
+                // them"). Everything else, including an END_STREAM'd
+                // HEADERS that isn't valid trailers, must still
+                // consume its bytes from the HPACK decoder's dynamic
+                // table state (decoding is a shared, stateful
+                // per-connection process -- skipping it would corrupt
+                // decoding of every subsequent HEADERS frame on this
+                // connection), so decode it before deciding.
                 if frame.header.flags & frame::FLAG_END_STREAM == 0 {
                     frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::StreamClosed as u32);
                     self.streams.remove(&stream_id);
                     return;
                 }
-                // A valid trailers HEADERS frame -- accepted, but since
-                // this stream's request was already dispatched once
-                // (the moment it first reached HalfClosedRemote), the
-                // trailers themselves aren't currently surfaced to a
-                // caller anywhere (no trailer-aware request/response
-                // path exists yet). Consuming and discarding them here
-                // (rather than falling through to the rest of this
-                // function, which would try to re-open the stream and
-                // re-dispatch it) is what stops a trailers HEADERS
-                // frame from producing a second, spurious response.
+                let mut payload = frame.payload;
+                if frame.header.flags & frame::FLAG_PADDED != 0 {
+                    let Some(&pad_len) = payload.first() else {
+                        return self.conn_error(H2Error::FrameSizeError, result);
+                    };
+                    let pad_len = pad_len as usize;
+                    if payload.len() < 1 + pad_len {
+                        return self.conn_error(H2Error::FrameSizeError, result);
+                    }
+                    payload = &payload[1..payload.len() - pad_len];
+                }
+                if frame.header.flags & frame::FLAG_PRIORITY != 0 {
+                    if payload.len() < 5 {
+                        return self.conn_error(H2Error::FrameSizeError, result);
+                    }
+                    payload = &payload[5..];
+                }
+                let fields = match self.decoder.decode(payload) {
+                    Ok(f) => f,
+                    Err(_) => return self.conn_error(H2Error::CompressionError, result),
+                };
+                if !validate_trailer_fields(&fields) {
+                    frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::StreamClosed as u32);
+                    self.streams.remove(&stream_id);
+                    return;
+                }
                 return;
             }
         }
@@ -702,7 +754,9 @@ impl Connection {
         let end_headers = frame.header.flags & frame::FLAG_END_HEADERS != 0;
 
         let stream = self.streams.entry(stream_id).or_insert_with(|| {
-            Stream::new(stream_id, self.peer_initial_window_size, self.local_initial_window_size)
+            {
+                Stream::new(stream_id, self.peer_initial_window_size, self.local_initial_window_size)
+            }
         });
         stream.header_block.extend_from_slice(payload);
         stream.header_block_end_stream = end_stream;
@@ -744,9 +798,49 @@ impl Connection {
     /// `Open` (or straight to `HalfClosedRemote` if this request had
     /// no body).
     fn finish_header_block(&mut self, stream_id: u32, result: &mut AdvanceResult) {
-        if self.streams.get(&stream_id).is_none() {
+        let Some(existing) = self.streams.get(&stream_id) else {
+            return;
+        };
+
+        // A header block assembled while the stream was already
+        // `Open` (request headers already accepted, body in
+        // progress) is trailers, not a second set of request headers
+        // -- RFC 9113 8.1: trailers carry no pseudo-headers of their
+        // own and must not be run through the same pseudo-header
+        // validation regular request headers need. `handle_headers`
+        // only reaches this point for such a stream when the frame
+        // also carried END_STREAM (anything else was already
+        // rejected there), so trailers here always terminate the
+        // stream.
+        if existing.phase == StreamPhase::Open {
+            let header_block_end_stream = existing.header_block_end_stream;
+            let header_block = std::mem::take(&mut self.streams.get_mut(&stream_id).unwrap().header_block);
+            let fields = match self.decoder.decode(&header_block) {
+                Ok(f) => f,
+                Err(_) => return self.conn_error(H2Error::CompressionError, result),
+            };
+            // RFC 9113 8.1: a second HEADERS frame on an already-Open
+            // stream is only valid as trailers, which by definition
+            // terminate the stream -- one lacking END_STREAM is
+            // neither a valid trailers block nor a valid way to
+            // resume sending request headers, so it's a stream error.
+            if !header_block_end_stream {
+                frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
+                self.streams.remove(&stream_id);
+                return;
+            }
+            if !validate_trailer_fields(&fields) {
+                frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
+                self.streams.remove(&stream_id);
+                return;
+            }
+            let stream = self.streams.get_mut(&stream_id).unwrap();
+            stream.trailers = fields;
+            stream.phase = StreamPhase::HalfClosedRemote;
+            result.newly_ready_streams.push(stream_id);
             return;
         }
+
         let header_block = std::mem::take(&mut self.streams.get_mut(&stream_id).unwrap().header_block);
 
         let fields = match self.decoder.decode(&header_block) {
@@ -778,6 +872,26 @@ impl Connection {
 /// 7.6.1's hop-by-hop set) are forbidden on an h2 request entirely --
 /// their h1 equivalents (Connection: keep-alive, Transfer-Encoding,
 /// etc.) have no meaning in h2's own framing.
+/// RFC 9113 8.1: trailers carry no pseudo-headers at all (unlike
+/// regular request headers, which must have exactly one of each
+/// required pseudo-header) -- any field starting with ':' here is a
+/// stream error. Regular field-name rules (lowercase-only, no
+/// hop-by-hop headers) still apply.
+fn validate_trailer_fields(fields: &[HeaderField]) -> bool {
+    for field in fields {
+        if field.name.starts_with(':') {
+            return false;
+        }
+        if field.name.chars().any(|c| c.is_ascii_uppercase()) {
+            return false;
+        }
+        if is_hop_by_hop(&field.name) {
+            return false;
+        }
+    }
+    true
+}
+
 fn validate_request_pseudo_headers(fields: &[HeaderField]) -> bool {
     let mut method = None;
     let mut scheme = None;
@@ -981,7 +1095,18 @@ impl Connection {
                 return;
             };
             if stream.pending_response.is_exhausted() {
-                if stream.phase == StreamPhase::HalfClosedRemote {
+                // Only a stream whose response has actually started
+                // (`send_response` already ran at least once) is safe
+                // to close out here -- an exhausted-looking
+                // `PendingBody::None` on a stream that hasn't been
+                // dispatched yet is just its untouched default, not a
+                // finished response. Closing it prematurely (e.g. from
+                // a WINDOW_UPDATE or SETTINGS-triggered resume that
+                // fires before the request has even reached the
+                // router) would drop the stream out of `self.streams`
+                // before `take_request`/`send_response` ever get a
+                // chance to run on it.
+                if stream.response_headers_sent && stream.phase == StreamPhase::HalfClosedRemote {
                     stream.phase = StreamPhase::Closed;
                     self.streams.remove(&stream_id);
                 }
@@ -1143,7 +1268,7 @@ mod tests {
     fn simple_get_request_reaches_ready_streams() {
         let mut conn = new_conn();
         let stream_id = send_handshake_and_request(&mut conn, "/hello");
-        let (headers, body) = conn.take_request(stream_id).unwrap();
+        let (headers, body, _trailers) = conn.take_request(stream_id).unwrap();
         assert!(headers.iter().any(|h| h.name == ":path" && h.value == "/hello"));
         assert!(body.is_empty());
     }
@@ -1264,18 +1389,25 @@ mod tests {
         let advance_result = conn.advance(&window_update_frame);
         assert!(!advance_result.connection_closed);
 
-        let resumed = conn.resume_pending(stream_id);
+        // `advance()` itself already resumes any stream a WINDOW_UPDATE
+        // unstalled (see `handle_window_update`) -- a caller-driven
+        // `resume_pending` immediately afterward is now redundant for
+        // this exact case, but must still be a harmless no-op (the
+        // stream may already be fully drained and gone from
+        // `self.streams` by this point).
         let mut sent_after = 0;
         let mut saw_end_stream = false;
-        let mut pos = 0;
-        while let Some((frame, consumed)) = frame::parse_frame(&resumed[pos..]) {
-            if frame.header.frame_type == FrameType::Data {
-                sent_after += frame.payload.len();
-                if frame.header.flags & frame::FLAG_END_STREAM != 0 {
-                    saw_end_stream = true;
+        for buf in [&advance_result.to_send, &conn.resume_pending(stream_id)] {
+            let mut pos = 0;
+            while let Some((frame, consumed)) = frame::parse_frame(&buf[pos..]) {
+                if frame.header.frame_type == FrameType::Data {
+                    sent_after += frame.payload.len();
+                    if frame.header.flags & frame::FLAG_END_STREAM != 0 {
+                        saw_end_stream = true;
+                    }
                 }
+                pos += consumed;
             }
-            pos += consumed;
         }
         assert_eq!(sent_before + sent_after, big_body.len(), "all bytes should eventually be sent, none lost or duplicated");
         assert!(saw_end_stream, "END_STREAM should be set once the very last byte is sent");
