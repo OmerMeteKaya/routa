@@ -144,6 +144,15 @@ pub struct Http1Connection {
     /// an ordinary in-memory buffer instead, queued into `write_buf`
     /// like any other response).
     pub pending_file: Option<PendingFileSend>,
+    /// Set once a `100 Continue` interim response has been sent for
+    /// the request currently being received -- since `http::request::parse`
+    /// is stateless and reports `ParseOutcome::NeedsContinue` on every
+    /// call while a request's body is still incomplete, this flag is
+    /// what stops the event loop from queuing a fresh `100 Continue`
+    /// on every single read event for the same request. Reset to
+    /// `false` once that request finishes parsing (alongside
+    /// `request_started_at`).
+    pub continue_sent: bool,
 }
 
 impl Http1Connection {
@@ -153,6 +162,7 @@ impl Http1Connection {
             write_buf: Buf::new(),
             keep_alive: true,
             pending_file: None,
+            continue_sent: false,
             request_started_at: None,
         }
     }

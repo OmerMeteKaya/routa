@@ -147,6 +147,19 @@ impl HttpResponse {
         &self.body
     }
 
+    /// Clears this response's actual body content (both the in-memory
+    /// buffer and any file-backed body) while leaving `Content-Length`
+    /// untouched -- used for a `HEAD` request's response, which per
+    /// RFC 9110 9.3.2 must report the same headers a `GET` would but
+    /// send no body at all. Keeping this as a post-processing step
+    /// applied uniformly to whatever a route/proxy produced (see
+    /// `core::event_loop`'s HEAD handling) means no individual route
+    /// handler needs its own HEAD-specific logic.
+    pub fn strip_body_for_head(&mut self) {
+        self.body = Vec::new();
+        self.file_body = None;
+    }
+
     /// Serializes the full HTTP/1.1 response (status line, headers,
     /// body) into `out`. Adds `Date`/`Server`/`Connection` headers if
     /// the caller hasn't already set them -- RFC 9110 doesn't require

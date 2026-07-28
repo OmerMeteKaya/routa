@@ -163,6 +163,7 @@ impl HttpRequest {
 /// The three outcomes `parse` can report. `Incomplete` is the common,
 /// expected result while a request is still arriving over the wire --
 /// not an error.
+#[derive(Debug)]
 pub enum ParseOutcome {
     /// A full request was parsed. `consumed` is how many bytes of
     /// `buf` it occupied -- the caller should `buf.consume(consumed)`
@@ -179,6 +180,26 @@ pub enum ParseOutcome {
     /// immediately otherwise -- that policy decision belongs to the
     /// caller, not this module).
     Invalid(ParseError),
+    /// Headers are fully parsed and valid, but the declared body
+    /// (`Content-Length`) hasn't fully arrived yet, and the client
+    /// sent `Expect: 100-continue` (RFC 9110 10.1.1). Carries the
+    /// fully-parsed method/path/headers (everything except the body,
+    /// which is what's still missing) so the caller can make a real
+    /// routing decision -- e.g. reject with 405/404 immediately,
+    /// without ever sending `100 Continue` or waiting for a body the
+    /// request was always going to be rejected without needing --
+    /// before deciding whether to send `100 Continue` and wait for
+    /// the rest of the body. Reported on every `parse` call while
+    /// this condition holds (this function is stateless and has no
+    /// memory of whether a `100 Continue` was already sent) -- the
+    /// caller is responsible for only acting on this once per
+    /// request, not resending `100 Continue` on every subsequent
+    /// `parse` call for the same still-incomplete body.
+    NeedsContinue {
+        method: HttpMethod,
+        path: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,6 +697,15 @@ pub fn parse(buf: &Buf, max_body_size: usize) -> ParseOutcome {
         }
     } else if content_length > 0 {
         if available < content_length {
+            let expects_continue = find_header(&headers, "Expect")
+                .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+            if expects_continue {
+                return ParseOutcome::NeedsContinue {
+                    method,
+                    path: path.clone(),
+                    headers: headers.clone(),
+                };
+            }
             return ParseOutcome::Incomplete;
         }
         (
@@ -843,6 +873,7 @@ mod tests {
             ParseOutcome::Complete { request, consumed } => (request, consumed),
             ParseOutcome::Incomplete => panic!("expected Complete, got Incomplete"),
             ParseOutcome::Invalid(e) => panic!("expected Complete, got Invalid({e:?})"),
+            ParseOutcome::NeedsContinue { .. } => panic!("expected Complete, got NeedsContinue"),
         }
     }
 
@@ -851,6 +882,55 @@ mod tests {
             ParseOutcome::Invalid(e) => e,
             ParseOutcome::Complete { .. } => panic!("expected Invalid, got Complete"),
             ParseOutcome::Incomplete => panic!("expected Invalid, got Incomplete"),
+            ParseOutcome::NeedsContinue { .. } => panic!("expected Invalid, got NeedsContinue"),
+        }
+    }
+
+    // ─── Expect: 100-continue (RFC 9110 10.1.1) ────────────────────────
+
+    #[test]
+    fn expect_100_continue_with_incomplete_body_reports_needs_continue() {
+        let req = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n";
+        let buf = buf_from(req); // headers complete, but none of the declared 100-byte body has arrived yet
+        match parse(&buf, 0) {
+            ParseOutcome::NeedsContinue { .. } => {}
+            other => panic!("expected NeedsContinue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expect_100_continue_is_case_insensitive() {
+        let req = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\nExpect: 100-Continue\r\n\r\n";
+        let buf = buf_from(req);
+        match parse(&buf, 0) {
+            ParseOutcome::NeedsContinue { .. } => {}
+            other => panic!("expected NeedsContinue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_expect_header_with_incomplete_body_is_plain_incomplete() {
+        let req = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\n\r\n";
+        let buf = buf_from(req);
+        match parse(&buf, 0) {
+            ParseOutcome::Incomplete => {}
+            other => panic!("expected plain Incomplete (no Expect header), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expect_continue_with_body_already_fully_present_parses_as_complete() {
+        // If the whole body already arrived in the same read (common
+        // for small bodies, or a client that doesn't actually wait for
+        // the 100 Continue before sending), there's nothing left to
+        // wait for -- this should parse straight through to Complete,
+        // not NeedsContinue.
+        let mut req = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n".to_vec();
+        req.extend_from_slice(b"hello");
+        let buf = buf_from(&req);
+        match parse(&buf, 0) {
+            ParseOutcome::Complete { request, .. } => assert_eq!(request.body, b"hello"),
+            other => panic!("expected Complete, got {other:?}"),
         }
     }
 

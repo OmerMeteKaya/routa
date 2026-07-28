@@ -285,11 +285,64 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
 
         match parse_outcome {
             crate::http::request::ParseOutcome::Incomplete => break,
+            crate::http::request::ParseOutcome::NeedsContinue { method, path, headers } => {
+                let already_sent = {
+                    let ConnectionProtocol::Http1(h1) = &connections[idx].protocol else {
+                        unreachable!()
+                    };
+                    h1.continue_sent
+                };
+                if !already_sent {
+                    let probe_request = crate::http::request::HttpRequest {
+                        method,
+                        remote_addr: Some(connections[idx].remote_addr.ip()),
+                        path: path.clone(),
+                        query: None,
+                        query_params: Vec::new(),
+                        version_major: 1,
+                        version_minor: 1,
+                        headers: headers.clone(),
+                        body: Vec::new(),
+                        keep_alive: true,
+                        trailers: Vec::new(),
+                    };
+                    let route_exists = !matches!(
+                        worker.server.router.dispatch(&probe_request),
+                        crate::http::router::Dispatch::NotFound | crate::http::router::Dispatch::MethodNotAllowed { .. }
+                    );
+                    if route_exists {
+                        let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else {
+                            unreachable!()
+                        };
+                        h1.write_buf.push(b"HTTP/1.1 100 Continue");
+                        h1.write_buf.push(&[13, 10, 13, 10]);
+                        h1.continue_sent = true;
+                    } else {
+                        let mut resp = worker.server.middleware_chain.execute(&probe_request);
+                        resp.set_header("Connection", "close");
+                        queue_http1_response(connections, idx, resp);
+                        connections[idx].closing = true;
+                        flush_transport(connections, idx)?;
+                        return Ok(());
+                    }
+                }
+                break;
+            }
             crate::http::request::ParseOutcome::Invalid(_) => {
                 let mut resp = crate::http::response::HttpResponse::new(400, "Bad Request");
                 resp.set_header("Connection", "close");
                 queue_http1_response(connections, idx, resp);
                 connections[idx].closing = true;
+                // queue_http1_response only queues bytes into the
+                // connection's write_buf -- flush_transport is what
+                // actually writes them to the socket. Without this,
+                // the 400 response sat in write_buf forever: this
+                // early-return path never reached the flush_transport
+                // call at the bottom of the normal (valid-request)
+                // loop below, so a malformed request produced no
+                // observable response at all, just a silently closed
+                // connection.
+                flush_transport(connections, idx)?;
                 return Ok(());
             }
             crate::http::request::ParseOutcome::Complete { mut request, consumed } => {
@@ -301,6 +354,7 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                 };
                 h1.read_buf.consume(consumed);
                 h1.request_started_at = None; // request is now fully parsed -- see the timeout sweep, which only fires while this is Some
+                h1.continue_sent = false; // ready for the next request on this (keep-alive) connection to potentially need its own 100 Continue
 
                 let is_upgrade = crate::http::ws::is_upgrade_request(&request);
                 let request_body_len = request.body.len();
@@ -320,6 +374,16 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                     response.body().len(),
                 );
 
+                let mut response = response;
+                if request.method == crate::http::request::HttpMethod::Head {
+                    // RFC 9110 9.3.2: a HEAD response reports the same
+                    // headers a GET would (Content-Length included),
+                    // but must never actually send a body -- applied
+                    // here uniformly to whatever the route/proxy
+                    // produced. Metrics above already recorded this
+                    // response's real body length before it's stripped.
+                    response.strip_body_for_head();
+                }
                 if is_upgrade && response.status == 101 {
                     let pmd = negotiate_pmd_from_response(&response);
                     queue_http1_response(connections, idx, response);
