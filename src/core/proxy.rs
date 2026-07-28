@@ -371,12 +371,20 @@ pub fn forward(
                             .upstream_request_duration_seconds
                             .with_label_values(&[pool_name, &node_label])
                             .observe(start.elapsed().as_secs_f64());
+                        // Outlier detection treats a 5xx response the
+                        // same as a connection-level failure (mirrors
+                        // Envoy's "gateway failure" framing) -- a node
+                        // that accepts connections but consistently
+                        // returns 5xx is just as much an outlier as one
+                        // that can't be reached at all.
+                        lb.pool.outlier_stats_for(&node).record_request(resp.status < 500);
                         return Ok(resp);
                     }
                     Err(e) => {
                         let state_before = node.state();
                         node.record_failure(&lb.pool);
                         record_state_transition_metrics(metrics, pool_name, &node_label, state_before, node.state());
+                        lb.pool.outlier_stats_for(&node).record_request(false);
                         lb.record_failed();
                         let reason = if e.kind() == std::io::ErrorKind::TimedOut { "timeout" } else { "connect_failed" };
                         metrics.upstream.errors_total.with_label_values(&[pool_name, &node_label, reason]).inc();
@@ -390,6 +398,7 @@ pub fn forward(
                 let state_before = node.state();
                 node.record_failure(&lb.pool);
                 record_state_transition_metrics(metrics, pool_name, &node_label, state_before, node.state());
+                lb.pool.outlier_stats_for(&node).record_request(false);
                 metrics.upstream.errors_total.with_label_values(&[pool_name, &node_label, "connect_failed"]).inc();
                 continue;
             }

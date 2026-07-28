@@ -351,6 +351,10 @@ impl UpstreamNode {
     ///   `release_half_open_trial` directly, if it bails out before
     ///   reaching either) when that request completes.
     pub fn is_selectable(&self, pool: &UpstreamPool) -> bool {
+        if pool.is_outlier_ejected(self) {
+            return false; // statistically worse than its peers right now -- see lb::outlier
+        }
+
         match self.state() {
             NodeState::Up => return true,
             NodeState::Draining | NodeState::HalfOpen => return false,
@@ -513,6 +517,15 @@ pub struct UpstreamPool {
     /// Round-robin counter, shared across every caller picking from
     /// this pool.
     pub rr_counter: AtomicU32,
+
+    /// Per-node success-rate outlier-detection state, keyed by the
+    /// same host:port identity `lb::lb::sticky_id_for_node` uses --
+    /// kept here rather than on `UpstreamNode` itself so that module
+    /// doesn't need to depend on `lb::outlier` (see that module's own
+    /// doc comment on keeping outlier detection and the circuit
+    /// breaker as genuinely separate mechanisms).
+    outlier_stats: RwLock<std::collections::HashMap<String, Arc<crate::lb::outlier::NodeOutlierStats>>>,
+    pub outlier_config: crate::lb::outlier::OutlierConfig,
 }
 
 impl UpstreamPool {
@@ -523,6 +536,53 @@ impl UpstreamPool {
             passive_recover_threshold,
             half_open_retry_after: Duration::from_secs(30),
             rr_counter: AtomicU32::new(0),
+            outlier_stats: RwLock::new(std::collections::HashMap::new()),
+            outlier_config: crate::lb::outlier::OutlierConfig::default(),
+        }
+    }
+
+    /// Replaces this pool's outlier-detection config -- called once
+    /// during pool construction, before the pool is wrapped in an
+    /// `Arc` (after which `outlier_config` can no longer be mutated
+    /// directly). A builder-style method rather than a `UpstreamPool::new`
+    /// parameter so existing callers that don't care about outlier
+    /// detection (most of this module's own tests) aren't forced to
+    /// supply one.
+    pub fn with_outlier_config(mut self, config: crate::lb::outlier::OutlierConfig) -> Self {
+        self.outlier_config = config;
+        self
+    }
+
+    fn outlier_key(node: &UpstreamNode) -> String {
+        format!("{}:{}", node.host, node.port)
+    }
+
+    /// This node's outlier-detection stats, creating a fresh entry the
+    /// first time a given node is seen. Kept in the pool (keyed by
+    /// host:port) rather than on `UpstreamNode` itself -- see this
+    /// struct's own field doc comment.
+    pub fn outlier_stats_for(&self, node: &UpstreamNode) -> Arc<crate::lb::outlier::NodeOutlierStats> {
+        let key = Self::outlier_key(node);
+        if let Some(stats) = self.outlier_stats.read().unwrap().get(&key) {
+            return Arc::clone(stats);
+        }
+        let mut guard = self.outlier_stats.write().unwrap();
+        Arc::clone(
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(crate::lb::outlier::NodeOutlierStats::default())),
+        )
+    }
+
+    /// Whether `node` is currently ejected by outlier detection --
+    /// consulted by node selection (`UpstreamNode::is_selectable`)
+    /// alongside the existing circuit-breaker state, so an outlier-
+    /// ejected node is skipped the same way a circuit-broken one is.
+    pub fn is_outlier_ejected(&self, node: &UpstreamNode) -> bool {
+        let key = Self::outlier_key(node);
+        match self.outlier_stats.read().unwrap().get(&key) {
+            Some(stats) => stats.is_ejected(),
+            None => false,
         }
     }
 }

@@ -196,6 +196,19 @@ pub struct LbPoolConfig {
     pub lb_passive_recover_threshold: i32,
     pub lb_half_open_retry_after_ms: i32, // circuit-breaker half-open, ms. 0=disabled
 
+    // Success-rate outlier detection (see lb::outlier) -- distinct
+    // from the passive circuit breaker above: this compares a node's
+    // success rate against its peers' rather than reacting only to
+    // that node's own consecutive failures.
+    pub outlier_detection_enabled: bool,
+    pub outlier_interval_ms: i32,
+    pub outlier_min_request_volume: i32,
+    pub outlier_min_hosts: i32,
+    pub outlier_stdev_factor: f64,
+    pub outlier_base_ejection_time_ms: i32,
+    pub outlier_max_ejection_time_ms: i32,
+    pub outlier_max_ejection_percent: i32,
+
     // Active health check
     pub lb_hc_type: HcType,
     pub lb_hc_path: String,
@@ -243,6 +256,14 @@ impl Default for LbPoolConfig {
             lb_passive_fail_threshold: 3,
             lb_passive_recover_threshold: 2,
             lb_half_open_retry_after_ms: 30_000,
+            outlier_detection_enabled: false,
+            outlier_interval_ms: 10_000,
+            outlier_min_request_volume: 100,
+            outlier_min_hosts: 3,
+            outlier_stdev_factor: 1.9,
+            outlier_base_ejection_time_ms: 30_000,
+            outlier_max_ejection_time_ms: 300_000,
+            outlier_max_ejection_percent: 20,
             lb_hc_type: HcType::default(),
             lb_hc_path: "/healthz".to_string(),
             lb_hc_interval_ms: 5_000,

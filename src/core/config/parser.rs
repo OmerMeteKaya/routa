@@ -292,6 +292,23 @@ fn parse_lb_key(
         "half_open_retry_after_ms" => {
             pool.lb_half_open_retry_after_ms = cfg_duration_ms(val, 30_000, ctx, lineno)
         }
+        "outlier_detection_enabled" => pool.outlier_detection_enabled = cfg_atob(val, false, ctx, lineno),
+        "outlier_interval_ms" => pool.outlier_interval_ms = cfg_duration_ms(val, 10_000, ctx, lineno),
+        "outlier_min_request_volume" => pool.outlier_min_request_volume = cfg_atoi(val, 100),
+        "outlier_min_hosts" => pool.outlier_min_hosts = cfg_atoi(val, 3),
+        "outlier_stdev_factor" => {
+            pool.outlier_stdev_factor = val.trim().parse().unwrap_or_else(|_| {
+                ctx.warn(lineno, format!("invalid outlier_stdev_factor: {val}"));
+                1.9
+            })
+        }
+        "outlier_base_ejection_time_ms" => {
+            pool.outlier_base_ejection_time_ms = cfg_duration_ms(val, 30_000, ctx, lineno)
+        }
+        "outlier_max_ejection_time_ms" => {
+            pool.outlier_max_ejection_time_ms = cfg_duration_ms(val, 300_000, ctx, lineno)
+        }
+        "outlier_max_ejection_percent" => pool.outlier_max_ejection_percent = cfg_atoi(val, 20),
         "hc_type" => {
             pool.lb_hc_type = match val.to_ascii_lowercase().as_str() {
                 "none" => HcType::None,

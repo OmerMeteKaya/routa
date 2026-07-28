@@ -26,7 +26,36 @@ use socket2::{Domain, Socket, Type};
 /// `SO_REUSEPORT` support itself is treated as best-effort: if the
 /// platform doesn't support it, binding still succeeds (falling back
 /// to ordinary single-listener behavior) rather than failing outright.
+/// Binds a dual-stack listener on `port`: a single IPv6 socket with
+/// `IPV6_V6ONLY` explicitly disabled, so IPv4 clients connecting via
+/// their IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) are accepted on
+/// the same socket as native IPv6 clients -- one listener instead of
+/// running separate IPv4 and IPv6 sockets side by side. Falls back to
+/// IPv4-only if IPv6 itself isn't available at all on this host (e.g.
+/// disabled at the kernel/network-namespace level) -- a dual-stack
+/// listener is preferred but plain IPv4 is still a functional server,
+/// so a full startup failure just because IPv6 is unavailable would be
+/// a worse outcome than falling back.
 pub fn bind_reuseport(port: u16, backlog: i32) -> io::Result<TcpListener> {
+    match bind_dual_stack(port, backlog) {
+        Ok(listener) => Ok(listener),
+        Err(_) => bind_ipv4_only(port, backlog),
+    }
+}
+
+fn bind_dual_stack(port: u16, backlog: i32) -> io::Result<TcpListener> {
+    let addr: SocketAddr = format!("[::]:{port}").parse().expect("valid address");
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+    socket.set_only_v6(false)?; // the key dual-stack setting -- accept both IPv4-mapped and native IPv6 traffic
+    socket.set_reuse_address(true)?;
+    let _ = socket.set_reuse_port(true); // best-effort, see doc comment above
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(backlog)?;
+    Ok(TcpListener::from_std(socket.into()))
+}
+
+fn bind_ipv4_only(port: u16, backlog: i32) -> io::Result<TcpListener> {
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse().expect("valid address");
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
@@ -77,6 +106,48 @@ mod tests {
         assert!(client.is_ok(), "should be able to connect to a bound, listening socket");
 
         drop(listener);
+    }
+
+    #[test]
+    fn bind_reuseport_accepts_ipv4_via_dual_stack_socket() {
+        // With the listener now bound on IPv6 (dual-stack), an IPv4
+        // connection must still work -- it arrives as an IPv4-mapped
+        // IPv6 address (::ffff:127.0.0.1) rather than being rejected.
+        let port = 18082;
+        let listener = bind_reuseport(port, 128).expect("bind");
+        let client = StdTcpStream::connect(("127.0.0.1", port));
+        assert!(client.is_ok(), "IPv4 connections should still work against the dual-stack listener");
+        drop(listener);
+    }
+
+    #[test]
+    fn bind_reuseport_accepts_native_ipv6_connections() {
+        let port = 18083;
+        let listener = bind_reuseport(port, 128).expect("bind");
+        let client = StdTcpStream::connect(("::1", port));
+        assert!(client.is_ok(), "native IPv6 (::1) connections should be accepted");
+        drop(listener);
+    }
+
+    #[test]
+    fn accepted_ipv4_and_ipv6_connections_are_both_readable() {
+        // Beyond just connecting, confirm the accepted socket on each
+        // side can actually exchange bytes -- proves the dual-stack
+        // listener isn't just accepting the TCP handshake while
+        // leaving the connection otherwise unusable.
+        use std::io::{Read, Write};
+        let port = 18084;
+        let listener = bind_reuseport(port, 128).expect("bind");
+        let mut std_listener: std::net::TcpListener = listener.into();
+        std_listener.set_nonblocking(false).unwrap();
+
+        let mut client = StdTcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (mut accepted, _) = std_listener.accept().unwrap();
+
+        client.write_all(b"hello").unwrap();
+        let mut buf = [0u8; 5];
+        accepted.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
     }
 
     #[test]

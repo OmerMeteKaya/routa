@@ -187,6 +187,7 @@ pub struct UpstreamMetrics {
     pub pool_connections_active: IntGaugeVec, // labels: pool, node
     pub pool_connections_idle: IntGaugeVec,   // labels: pool, node
     pub health_check_total: IntCounterVec,    // labels: pool, node, result ("ok", "fail")
+    pub outlier_ejections_total: IntCounterVec, // labels: pool, node -- see lb::outlier
     pub upstream_request_duration_seconds: HistogramVec, // labels: pool, node
 }
 
@@ -231,6 +232,10 @@ impl UpstreamMetrics {
             Opts::new("routa_upstream_health_check_total", "Total active health check probes, by pool, node, and result."),
             &["pool", "node", "result"],
         )?;
+        let outlier_ejections_total = IntCounterVec::new(
+            Opts::new("routa_upstream_outlier_ejections_total", "Total times a node was ejected by success-rate outlier detection."),
+            &["pool", "node"],
+        )?;
         let upstream_request_duration_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "routa_upstream_request_duration_seconds",
@@ -249,6 +254,7 @@ impl UpstreamMetrics {
         registry.register(Box::new(pool_connections_active.clone()))?;
         registry.register(Box::new(pool_connections_idle.clone()))?;
         registry.register(Box::new(health_check_total.clone()))?;
+        registry.register(Box::new(outlier_ejections_total.clone()))?;
         registry.register(Box::new(upstream_request_duration_seconds.clone()))?;
 
         Ok(UpstreamMetrics {
@@ -261,6 +267,7 @@ impl UpstreamMetrics {
             pool_connections_active,
             pool_connections_idle,
             health_check_total,
+            outlier_ejections_total,
             upstream_request_duration_seconds,
         })
     }

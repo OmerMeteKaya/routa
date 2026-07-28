@@ -42,6 +42,7 @@ pub struct RoutedPool {
     pub route_prefix: String,
     pub lb: Arc<LoadBalancer>,
     _health_check: Option<HealthCheckLoop>,
+    _outlier_sweep: Option<crate::lb::outlier::OutlierSweepLoop>,
 }
 
 pub struct RoutaServer {
@@ -414,10 +415,23 @@ fn build_routed_pool(pool_cfg: &LbPoolConfig, h2_pools: &Arc<H2PoolRegistry>, me
         ConfigLbAlgo::ConsistentHash => crate::lb::lb::LbAlgo::ConsistentHash,
     };
 
-    let pool = Arc::new(UpstreamPool::new(
-        pool_cfg.lb_passive_fail_threshold.max(1) as u32,
-        pool_cfg.lb_passive_recover_threshold.max(1) as u32,
-    ));
+    let outlier_config = crate::lb::outlier::OutlierConfig {
+        enabled: pool_cfg.outlier_detection_enabled,
+        interval: Duration::from_millis(pool_cfg.outlier_interval_ms.max(0) as u64),
+        min_request_volume: pool_cfg.outlier_min_request_volume.max(0) as u32,
+        min_hosts: pool_cfg.outlier_min_hosts.max(0) as usize,
+        stdev_factor: pool_cfg.outlier_stdev_factor,
+        base_ejection_time: Duration::from_millis(pool_cfg.outlier_base_ejection_time_ms.max(0) as u64),
+        max_ejection_time: Duration::from_millis(pool_cfg.outlier_max_ejection_time_ms.max(0) as u64),
+        max_ejection_percent: pool_cfg.outlier_max_ejection_percent.clamp(0, 100) as u8,
+    };
+    let pool = Arc::new(
+        UpstreamPool::new(
+            pool_cfg.lb_passive_fail_threshold.max(1) as u32,
+            pool_cfg.lb_passive_recover_threshold.max(1) as u32,
+        )
+        .with_outlier_config(outlier_config),
+    );
 
     for upstream_cfg in &pool_cfg.upstreams {
         let node = Arc::new(UpstreamNode::new(
@@ -448,7 +462,17 @@ fn build_routed_pool(pool_cfg: &LbPoolConfig, h2_pools: &Arc<H2PoolRegistry>, me
     let route_prefix = if pool_cfg.route.is_empty() { "/*".to_string() } else { pool_cfg.route.clone() };
     let pool_name = if pool_cfg.name.is_empty() { route_prefix.clone() } else { pool_cfg.name.clone() };
     let health_check = if pool.nodes().iter().any(|n| n.hc.check_type != crate::lb::upstream::HealthCheckType::None) {
-        Some(HealthCheckLoop::start_with_metrics(Arc::clone(&pool), pool_name, Some(Arc::clone(metrics))))
+        Some(HealthCheckLoop::start_with_metrics(Arc::clone(&pool), pool_name.clone(), Some(Arc::clone(metrics))))
+    } else {
+        None
+    };
+
+    let outlier_sweep = if pool.outlier_config.enabled {
+        Some(crate::lb::outlier::OutlierSweepLoop::start_with_metrics(
+            Arc::clone(&pool),
+            pool_name.clone(),
+            Some(Arc::clone(metrics)),
+        ))
     } else {
         None
     };
@@ -457,6 +481,7 @@ fn build_routed_pool(pool_cfg: &LbPoolConfig, h2_pools: &Arc<H2PoolRegistry>, me
         route_prefix,
         lb,
         _health_check: health_check,
+        _outlier_sweep: outlier_sweep,
     })
 }
 
@@ -719,6 +744,50 @@ mod tests {
         let server = RoutaServer::from_config(cfg).unwrap();
         let node = &server.pools[0].lb.pool.nodes()[0];
         assert!(server.h2_pools.uses_h2(node));
+    }
+
+    #[test]
+    fn outlier_detection_config_flows_from_lb_pool_config_to_upstream_pool() {
+        let mut cfg = minimal_config();
+        cfg.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            upstreams: vec![UpstreamConfig { host: "10.0.0.1".to_string(), port: 8080, weight: 1, use_tls: false }],
+            outlier_detection_enabled: true,
+            outlier_interval_ms: 5_000,
+            outlier_min_request_volume: 50,
+            outlier_min_hosts: 4,
+            outlier_stdev_factor: 1.5,
+            outlier_base_ejection_time_ms: 15_000,
+            outlier_max_ejection_time_ms: 120_000,
+            outlier_max_ejection_percent: 25,
+            ..Default::default()
+        });
+        let server = RoutaServer::from_config(cfg).unwrap();
+
+        let outlier_config = &server.pools[0].lb.pool.outlier_config;
+        assert!(outlier_config.enabled);
+        assert_eq!(outlier_config.interval, std::time::Duration::from_millis(5_000));
+        assert_eq!(outlier_config.min_request_volume, 50);
+        assert_eq!(outlier_config.min_hosts, 4);
+        assert_eq!(outlier_config.stdev_factor, 1.5);
+        assert_eq!(outlier_config.base_ejection_time, std::time::Duration::from_millis(15_000));
+        assert_eq!(outlier_config.max_ejection_time, std::time::Duration::from_millis(120_000));
+        assert_eq!(outlier_config.max_ejection_percent, 25);
+    }
+
+    #[test]
+    fn outlier_detection_disabled_by_default() {
+        let mut cfg = minimal_config();
+        cfg.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            lb_enabled: true,
+            upstreams: vec![UpstreamConfig { host: "10.0.0.1".to_string(), port: 8080, weight: 1, use_tls: false }],
+            ..Default::default()
+        });
+        let server = RoutaServer::from_config(cfg).unwrap();
+        assert!(!server.pools[0].lb.pool.outlier_config.enabled);
     }
 
     #[test]
