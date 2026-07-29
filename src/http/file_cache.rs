@@ -92,6 +92,20 @@ pub struct FileCacheConfig {
     /// larger files are served via a different path (sendfile, once
     /// `http::static_files` implements it).
     pub mmap_threshold: u64,
+    /// Soft byte budget for cached content (0 = no byte-based limit,
+    /// only `max_entries`' count-based limit applies). Checked
+    /// alongside `max_entries` -- whichever limit a `put` would
+    /// exceed first triggers eviction.
+    pub max_memory_bytes: u64,
+    /// How many independent, independently-locked eviction-order
+    /// shards `SharedMetadataCache` splits its bookkeeping into (path
+    /// hash decides which shard a given entry belongs to). `1` behaves
+    /// like a single global lock; only meaningful in `SharedMetadata`
+    /// mode, ignored by `Local` mode (each worker's `LocalCache` is
+    /// already single-threaded, so there's no contention to shard
+    /// away). Always at least `1`; a caller passing `0` gets the same
+    /// single-shard behavior as `1`.
+    pub eviction_shards: usize,
 }
 
 impl Default for FileCacheConfig {
@@ -105,6 +119,8 @@ impl Default for FileCacheConfig {
             eviction: EvictionPolicy::default(),
             negative_ttl: None,
             mmap_threshold: 64 * 1024,
+            max_memory_bytes: 0,
+            eviction_shards: 1,
         }
     }
 }
@@ -310,6 +326,10 @@ pub struct LocalCache {
     entries: HashMap<String, CacheEntry>,
     ordering: LocalOrdering,
     evictions_total: u64,
+    /// Sum of every currently-cached entry's `size` -- kept up to date
+    /// incrementally (rather than summed on demand) since it's checked
+    /// on every `put`.
+    total_bytes: u64,
 }
 
 impl LocalCache {
@@ -325,7 +345,14 @@ impl LocalCache {
             entries: HashMap::new(),
             ordering,
             evictions_total: 0,
+            total_bytes: 0,
         }
+    }
+
+    /// Whether the configured byte budget (0 = no byte-based limit)
+    /// would still be respected after adding `additional_bytes`.
+    fn within_memory_budget(&self, additional_bytes: u64) -> bool {
+        self.config.max_memory_bytes == 0 || self.total_bytes + additional_bytes <= self.config.max_memory_bytes
     }
 
     pub fn get(&mut self, path: &str) -> Option<CacheEntry> {
@@ -384,9 +411,23 @@ impl LocalCache {
     }
 
     pub fn put(&mut self, path: &str, entry: CacheEntry) {
-        if self.entries.len() >= self.config.max_entries && !self.entries.contains_key(path) {
+        let is_new_path = !self.entries.contains_key(path);
+        if is_new_path && self.entries.len() >= self.config.max_entries {
             self.evict_one();
         }
+        // A byte budget can require evicting more than one entry to
+        // make room for a single large incoming one -- keep evicting
+        // until either the budget is satisfied or there's nothing left
+        // to evict (an empty cache always "fits", even a single entry
+        // larger than the whole budget, rather than refusing to cache
+        // anything at all).
+        while is_new_path && !self.within_memory_budget(entry.size) && !self.entries.is_empty() {
+            self.evict_one();
+        }
+        if let Some(old) = self.entries.get(path) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.size);
+        }
+        self.total_bytes += entry.size;
 
         self.entries.insert(path.to_string(), entry);
         match &mut self.ordering {
@@ -416,7 +457,9 @@ impl LocalCache {
     }
 
     fn remove(&mut self, path: &str) {
-        self.entries.remove(path);
+        if let Some(removed) = self.entries.remove(path) {
+            self.total_bytes = self.total_bytes.saturating_sub(removed.size);
+        }
         match &mut self.ordering {
             LocalOrdering::Lru(lru) => {
                 lru.pop(path);
@@ -497,8 +540,10 @@ pub struct SharedMetadataCache {
     /// already gives safe concurrent access -- a second, simpler
     /// structure for ordering avoids needing any unsafe/intrusive
     /// linkage to keep both in sync under concurrent access.
-    order: RwLock<EvictionOrder>,
+    order_shards: Vec<RwLock<EvictionOrder>>,
+    next_evict_shard: std::sync::atomic::AtomicUsize,
     evictions_total: AtomicU64,
+    total_bytes: AtomicU64,
 }
 
 enum EvictionOrder {
@@ -509,18 +554,54 @@ enum EvictionOrder {
 
 impl SharedMetadataCache {
     pub fn new(config: FileCacheConfig) -> Self {
-        let cap = NonZeroUsize::new(config.max_entries.max(1)).unwrap();
-        let order = match config.eviction {
-            EvictionPolicy::Lru => EvictionOrder::Lru(LruCache::new(cap)),
-            EvictionPolicy::Lfu => EvictionOrder::Lfu(ApproxLfu::new()),
-            EvictionPolicy::TtlOnly => EvictionOrder::TtlOnly(Vec::new()),
-        };
+        // Rounding shard count up to a power of 2 lets `order_shard`
+        // pick a shard with a cheap bitmask instead of a modulo -- a
+        // config value that isn't already a power of 2 just rounds up
+        // rather than being rejected.
+        let n_shards = config.eviction_shards.max(1).next_power_of_two();
+        // Each shard's own LruCache/etc. capacity is the FULL
+        // configured max_entries, not a per-shard fraction of it --
+        // path hashing distributes entries unevenly across shards in
+        // practice, and this structure's own automatic "evict the
+        // oldest entry once at capacity" behavior must never actually
+        // trigger on its own. The real, authoritative limit is
+        // `self.table.len() >= self.config.max_entries` in
+        // `put_metadata`, checked against the single shared table
+        // across every shard combined; a shard capping itself at a
+        // fraction of that would silently drop its own bookkeeping out
+        // of sync with `self.table` (removed from the shard's ordering
+        // structure without the corresponding table entry ever being
+        // removed) well before the real limit is reached.
+        let per_shard_cap = NonZeroUsize::new(config.max_entries.max(1)).unwrap();
+        let order_shards = (0..n_shards)
+            .map(|_| {
+                RwLock::new(match config.eviction {
+                    EvictionPolicy::Lru => EvictionOrder::Lru(LruCache::new(per_shard_cap)),
+                    EvictionPolicy::Lfu => EvictionOrder::Lfu(ApproxLfu::new()),
+                    EvictionPolicy::TtlOnly => EvictionOrder::TtlOnly(Vec::new()),
+                })
+            })
+            .collect();
         SharedMetadataCache {
             config,
             table: DashMap::new(),
-            order: RwLock::new(order),
+            order_shards,
+            next_evict_shard: std::sync::atomic::AtomicUsize::new(0),
             evictions_total: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Selects which shard's eviction-order lock a given path belongs
+    /// to -- every operation on that path (recording access, eviction
+    /// candidate selection, removal) must consistently pick the same
+    /// shard, or its position in one shard's LRU/LFU/TTL ordering goes
+    /// stale relative to what `self.table` actually holds.
+    fn order_shard(&self, path: &str) -> &RwLock<EvictionOrder> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(path, &mut hasher);
+        let index = (std::hash::Hasher::finish(&hasher) as usize) & (self.order_shards.len() - 1);
+        &self.order_shards[index]
     }
 
     pub fn len(&self) -> usize {
@@ -575,7 +656,7 @@ impl SharedMetadataCache {
     }
 
     fn touch(&self, path: &str) {
-        let mut order = self.order.write().unwrap();
+        let mut order = self.order_shard(path).write().unwrap();
         match &mut *order {
             EvictionOrder::Lru(lru) => {
                 lru.promote(path);
@@ -590,9 +671,22 @@ impl SharedMetadataCache {
     fn put_metadata(&self, path: &str, snapshot: SharedMetaSnapshot) -> u64 {
         let generation = next_generation();
 
-        if self.table.len() >= self.config.max_entries && !self.table.contains_key(path) {
+        let is_new_path = !self.table.contains_key(path);
+        if is_new_path && self.table.len() >= self.config.max_entries {
             self.evict_one();
         }
+        let budget = self.config.max_memory_bytes;
+        while is_new_path
+            && budget != 0
+            && self.total_bytes.load(Ordering::Relaxed) + snapshot.size > budget
+            && !self.table.is_empty()
+        {
+            self.evict_one();
+        }
+        if let Some(old) = self.table.get(path) {
+            self.total_bytes.fetch_sub(old.size, Ordering::Relaxed);
+        }
+        self.total_bytes.fetch_add(snapshot.size, Ordering::Relaxed);
 
         self.table.insert(
             path.to_string(),
@@ -609,7 +703,7 @@ impl SharedMetadataCache {
             },
         );
 
-        let mut order = self.order.write().unwrap();
+        let mut order = self.order_shard(path).write().unwrap();
         match &mut *order {
             EvictionOrder::Lru(lru) => {
                 lru.put(path.to_string(), ());
@@ -627,10 +721,23 @@ impl SharedMetadataCache {
         generation
     }
 
+    /// Finds and removes one victim entry -- not necessarily from the
+    /// same shard a caller's own about-to-be-inserted path happens to
+    /// hash to, since the entry that actually needs to go (the
+    /// globally-oldest/least-used one) can land in any shard
+    /// regardless of which path is triggering this eviction. Sweeps
+    /// shards round-robin (via `next_evict_shard`, shared across every
+    /// call) starting from a different point each time rather than
+    /// always shard 0, so no single shard bears all the eviction
+    /// pressure when several are empty.
     fn evict_one(&self) {
-        let victim = {
-            let mut order = self.order.write().unwrap();
-            match &mut *order {
+        let n_shards = self.order_shards.len();
+        let start = self.next_evict_shard.fetch_add(1, Ordering::Relaxed) % n_shards;
+        let mut victim = None;
+        for offset in 0..n_shards {
+            let shard_idx = (start + offset) % n_shards;
+            let mut order = self.order_shards[shard_idx].write().unwrap();
+            let found = match &mut *order {
                 EvictionOrder::Lru(lru) => lru.pop_lru().map(|(k, _)| k),
                 EvictionOrder::Lfu(lfu) => lfu.sample_eviction_candidate(),
                 EvictionOrder::TtlOnly(o) => {
@@ -640,11 +747,17 @@ impl SharedMetadataCache {
                         Some(o.remove(0))
                     }
                 }
+            };
+            if found.is_some() {
+                victim = found;
+                break;
             }
-        };
+        }
         if let Some(victim) = victim {
-            self.table.remove(&victim);
-            if let EvictionOrder::Lfu(lfu) = &mut *self.order.write().unwrap() {
+            if let Some((_, removed)) = self.table.remove(&victim) {
+                self.total_bytes.fetch_sub(removed.size, Ordering::Relaxed);
+            }
+            if let EvictionOrder::Lfu(lfu) = &mut *self.order_shard(&victim).write().unwrap() {
                 lfu.remove(&victim);
             }
             self.evictions_total.fetch_add(1, Ordering::Relaxed);
@@ -658,8 +771,10 @@ impl SharedMetadataCache {
     /// generation to preserve across this removal -- see this module's
     /// top doc comment.
     pub fn invalidate(&self, path: &str) {
-        self.table.remove(path);
-        let mut order = self.order.write().unwrap();
+        if let Some((_, removed)) = self.table.remove(path) {
+            self.total_bytes.fetch_sub(removed.size, Ordering::Relaxed);
+        }
+        let mut order = self.order_shard(path).write().unwrap();
         match &mut *order {
             EvictionOrder::Lru(lru) => {
                 lru.pop(path);
@@ -1190,6 +1305,66 @@ mod tests {
         assert_eq!(cache.evictions_total(), 1);
     }
 
+    #[test]
+    fn max_entries_holds_across_shards_regardless_of_which_shard_each_path_lands_in() {
+        // Eviction must be driven off the single shared table's total
+        // size, not off whichever shard happens to hold the path
+        // currently being inserted -- otherwise two entries that hash
+        // into two different shards would never trigger eviction of
+        // each other, and the table would grow past max_entries
+        // indefinitely.
+        let cache = FileCache::new(FileCacheConfig {
+            mode: CacheMode::SharedMetadata,
+            eviction: EvictionPolicy::Lru,
+            max_entries: 2,
+            eviction_shards: 16,
+            ..Default::default()
+        });
+        let now = SystemTime::now();
+        for i in 0..20 {
+            cache.put(&format!("/{i}"), PathBuf::from(format!("/{i}")), 1, now);
+        }
+        assert_eq!(cache.entry_count(), 2, "max_entries must hold regardless of how many shards are configured");
+    }
+
+    #[test]
+    fn sharded_eviction_order_does_not_serialize_unrelated_paths() {
+        let cache = Arc::new(FileCache::new(FileCacheConfig {
+            mode: CacheMode::SharedMetadata,
+            eviction: EvictionPolicy::Lru,
+            max_entries: 1000,
+            eviction_shards: 16,
+            ..Default::default()
+        }));
+        let now = SystemTime::now();
+        for i in 0..64 {
+            cache.put(&format!("/{i}"), PathBuf::from(format!("/{i}")), 1, now);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|worker| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut mmap_cache = cache.worker_mmap_cache();
+                    for _ in 0..1000 {
+                        for i in 0..64 {
+                            if i % 2 == worker {
+                                let _ = cache.get(&format!("/{i}"), &mut mmap_cache);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(cache.entry_count(), 64);
+    }
+
     // ─── SHARED_METADATA mode ────────────────────────────────────────
 
     #[test]
@@ -1330,6 +1505,72 @@ mod tests {
             .filter(|i| cache.get(&format!("/{i}"), &mut mmap_cache).is_some())
             .count();
         assert!(hits <= 3, "expected at most 3 entries retained, got {hits}");
+    }
+
+    #[test]
+    fn max_memory_bytes_triggers_eviction_before_max_entries_would_local() {
+        let cache = FileCache::new(FileCacheConfig {
+            mode: CacheMode::Local,
+            eviction: EvictionPolicy::Lru,
+            max_entries: 100,
+            max_memory_bytes: 300,
+            ..Default::default()
+        });
+        let mut mmap_cache = cache.worker_mmap_cache();
+        let now = SystemTime::now();
+
+        for i in 0..10 {
+            cache.put(&format!("/{i}"), PathBuf::from(format!("/{i}")), 100, now);
+        }
+
+        let hits = (0..10)
+            .filter(|i| cache.get(&format!("/{i}"), &mut mmap_cache).is_some())
+            .count();
+        assert!(hits <= 3, "expected at most 3 entries retained under a 300-byte budget at 100 bytes each, got {hits}");
+    }
+
+    #[test]
+    fn max_memory_bytes_triggers_eviction_before_max_entries_would_shared() {
+        let cache = FileCache::new(FileCacheConfig {
+            mode: CacheMode::SharedMetadata,
+            eviction: EvictionPolicy::Lru,
+            max_entries: 100,
+            max_memory_bytes: 300,
+            ..Default::default()
+        });
+        let mut mmap_cache = cache.worker_mmap_cache();
+        let now = SystemTime::now();
+
+        for i in 0..10 {
+            cache.put(&format!("/{i}"), PathBuf::from(format!("/{i}")), 100, now);
+        }
+
+        let hits = (0..10)
+            .filter(|i| cache.get(&format!("/{i}"), &mut mmap_cache).is_some())
+            .count();
+        assert!(hits <= 3, "expected at most 3 entries retained under a 300-byte budget at 100 bytes each, got {hits}");
+    }
+
+    #[test]
+    fn max_memory_bytes_zero_means_unlimited() {
+        let cache = FileCache::new(FileCacheConfig {
+            mode: CacheMode::Local,
+            eviction: EvictionPolicy::Lru,
+            max_entries: 100,
+            max_memory_bytes: 0,
+            ..Default::default()
+        });
+        let mut mmap_cache = cache.worker_mmap_cache();
+        let now = SystemTime::now();
+
+        for i in 0..10 {
+            cache.put(&format!("/{i}"), PathBuf::from(format!("/{i}")), 1_000_000, now);
+        }
+
+        let hits = (0..10)
+            .filter(|i| cache.get(&format!("/{i}"), &mut mmap_cache).is_some())
+            .count();
+        assert_eq!(hits, 10, "a zero byte budget must impose no memory-based limit at all");
     }
 
     #[test]

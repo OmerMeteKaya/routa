@@ -440,6 +440,11 @@ fn build_file_cache(config: &RoutaConfig) -> FileCache {
             None
         },
         mmap_threshold: config.file_cache_mmap_threshold.max(0) as u64,
+        max_memory_bytes: config.file_cache_max_memory_mb.max(0) as u64 * 1024 * 1024,
+        eviction_shards: match config.file_cache_lock {
+            crate::core::config::FileCacheLock::Global => 1,
+            crate::core::config::FileCacheLock::Sharded => config.file_cache_shards.max(1) as usize,
+        },
     })
 }
 
