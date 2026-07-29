@@ -278,6 +278,16 @@ pub struct CacheMetrics {
     pub requests_total: IntCounterVec, // labels: result ("hit", "miss", "negative_hit")
     pub evictions_total: IntCounter,
     pub entries: IntGauge,
+    /// How much of `http::file_cache::FileCache::evictions_total`'s
+    /// running total (a plain counter on the cache itself, not a
+    /// Prometheus metric) has already been folded into
+    /// `evictions_total` above -- see `core::server`'s `/metrics`
+    /// handler, the only place this is read/written, for why: a
+    /// Prometheus `Counter` only exposes `inc()`/`inc_by()`, so
+    /// reconciling it with an externally-tracked absolute total needs
+    /// this same delta-tracking `main.rs` already does for
+    /// `worker_restarts_total`.
+    pub evictions_reported: std::sync::atomic::AtomicU64,
 }
 
 impl CacheMetrics {
@@ -300,6 +310,7 @@ impl CacheMetrics {
             requests_total,
             evictions_total,
             entries,
+            evictions_reported: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }

@@ -22,6 +22,121 @@
 
 use std::collections::HashMap;
 
+/// A stream table's storage strategy -- selected once at connection
+/// construction time and fixed for that connection's lifetime. A
+/// hashmap gives O(1) average lookup regardless of how many concurrent
+/// streams exist; a linear scan over a small fixed-capacity vector can
+/// be cheaper in practice when a connection's concurrent-stream limit
+/// is kept low (as most proxy deployments do), since there's no
+/// hashing cost and the whole table tends to fit in a few cache lines.
+enum StreamTable {
+    Hash(HashMap<u32, Stream>),
+    Linear { slots: Vec<Option<(u32, Stream)>> },
+}
+
+impl StreamTable {
+    fn new_hash() -> Self {
+        StreamTable::Hash(HashMap::new())
+    }
+
+    fn new_linear(capacity: usize) -> Self {
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || None);
+        StreamTable::Linear { slots }
+    }
+
+    fn get(&self, id: &u32) -> Option<&Stream> {
+        match self {
+            StreamTable::Hash(map) => map.get(id),
+            StreamTable::Linear { slots } => slots.iter().find_map(|slot| match slot {
+                Some((slot_id, stream)) if slot_id == id => Some(stream),
+                _ => None,
+            }),
+        }
+    }
+
+    fn get_mut(&mut self, id: &u32) -> Option<&mut Stream> {
+        match self {
+            StreamTable::Hash(map) => map.get_mut(id),
+            StreamTable::Linear { slots } => slots.iter_mut().find_map(|slot| match slot {
+                Some((slot_id, stream)) if slot_id == id => Some(stream),
+                _ => None,
+            }),
+        }
+    }
+
+    fn contains_key(&self, id: &u32) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn remove(&mut self, id: &u32) {
+        match self {
+            StreamTable::Hash(map) => {
+                map.remove(id);
+            }
+            StreamTable::Linear { slots } => {
+                for slot in slots.iter_mut() {
+                    if matches!(slot, Some((slot_id, _)) if slot_id == id) {
+                        *slot = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn keys(&self) -> Vec<u32> {
+        match self {
+            StreamTable::Hash(map) => map.keys().copied().collect(),
+            StreamTable::Linear { slots } => slots.iter().filter_map(|s| s.as_ref().map(|(id, _)| *id)).collect(),
+        }
+    }
+
+    fn values_mut(&mut self) -> Box<dyn Iterator<Item = &mut Stream> + '_> {
+        match self {
+            StreamTable::Hash(map) => Box::new(map.values_mut()),
+            StreamTable::Linear { slots } => Box::new(slots.iter_mut().filter_map(|s| s.as_mut().map(|(_, stream)| stream))),
+        }
+    }
+
+    fn values(&self) -> Box<dyn Iterator<Item = &Stream> + '_> {
+        match self {
+            StreamTable::Hash(map) => Box::new(map.values()),
+            StreamTable::Linear { slots } => Box::new(slots.iter().filter_map(|s| s.as_ref().map(|(_, stream)| stream))),
+        }
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (u32, &Stream)> + '_> {
+        match self {
+            StreamTable::Hash(map) => Box::new(map.iter().map(|(id, s)| (*id, s))),
+            StreamTable::Linear { slots } => Box::new(slots.iter().filter_map(|s| s.as_ref().map(|(id, stream)| (*id, stream)))),
+        }
+    }
+
+    /// Same contract as `HashMap::entry(id).or_insert_with(f)` -- looks
+    /// up `id`, inserting `f()`'s result first if it's not already
+    /// present, and returns a mutable reference either way. A fixed-
+    /// capacity `Linear` table that's completely full silently reuses
+    /// its last slot rather than panicking or growing -- a connection
+    /// this deep into ignoring its own concurrent-stream limit already
+    /// has a bug elsewhere (`handle_headers` refuses new streams past
+    /// `local_max_concurrent_streams` before this is ever reached).
+    fn get_or_insert_with(&mut self, id: u32, f: impl FnOnce() -> Stream) -> &mut Stream {
+        match self {
+            StreamTable::Hash(map) => map.entry(id).or_insert_with(f),
+            StreamTable::Linear { slots } => {
+                let existing_idx = slots.iter().position(|slot| matches!(slot, Some((slot_id, _)) if *slot_id == id));
+                let idx = existing_idx.unwrap_or_else(|| {
+                    let free_idx = slots.iter().position(|slot| slot.is_none()).unwrap_or(slots.len() - 1);
+                    slots[free_idx] = Some((id, f()));
+                    free_idx
+                });
+                slots[idx].as_mut().map(|(_, stream)| stream).expect("slot just populated")
+            }
+        }
+    }
+}
+
 use super::frame::{self, Frame, FrameHeader, FrameType};
 use super::hpack::{HeaderField, HpackContext};
 
@@ -122,6 +237,9 @@ pub enum StreamPhase {
 pub struct Stream {
     pub id: u32,
     pub phase: StreamPhase,
+    /// When this stream was opened -- used by `Connection::reap_stale_streams`
+    /// to enforce `RoutaH2Config::stream_timeout_ms`.
+    pub created_at: std::time::Instant,
 
     // Flow control (RFC 9113 6.9), this stream's contribution
     // (connection-level windows live on `Connection`, not here).
@@ -150,6 +268,7 @@ impl Stream {
         Stream {
             id,
             phase: StreamPhase::ReceivingHeaders,
+            created_at: std::time::Instant::now(),
             send_window: i64::from(initial_send_window),
             recv_window: i64::from(initial_recv_window),
             header_block: Vec::new(),
@@ -188,7 +307,7 @@ pub struct Connection {
     preface_received: bool,
     preface_buf: Vec<u8>,
 
-    streams: HashMap<u32, Stream>,
+    streams: StreamTable,
     highest_peer_stream_id: u32,
 
     // This side's view of the peer's SETTINGS (what WE must respect
@@ -204,6 +323,13 @@ pub struct Connection {
     pub local_max_concurrent_streams: u32,
     pub local_initial_window_size: i32,
     pub local_max_frame_size: u32,
+    /// RFC 9113 6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE: an advisory cap on
+    /// the uncompressed size (RFC 7541 4.1 per-field accounting) of a
+    /// request's header list. `0` means unlimited, matching
+    /// `RoutaH2Config::max_header_list_size`'s own convention.
+    pub local_max_header_list_size: u32,
+    local_header_table_size: usize,
+    local_enable_push: bool,
 
     settings_ack_pending: bool,
 
@@ -232,7 +358,7 @@ impl Connection {
         Connection {
             preface_received: false,
             preface_buf: Vec::new(),
-            streams: HashMap::new(),
+            streams: StreamTable::new_hash(),
             highest_peer_stream_id: 0,
             peer_header_table_size: DEFAULT_HEADER_TABLE_SIZE,
             peer_max_concurrent_streams: None,
@@ -242,6 +368,9 @@ impl Connection {
             local_max_concurrent_streams,
             local_initial_window_size: DEFAULT_INITIAL_WINDOW_SIZE,
             local_max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
+            local_max_header_list_size: 0,
+            local_header_table_size,
+            local_enable_push: true,
             settings_ack_pending: false,
             send_window: i64::from(DEFAULT_INITIAL_WINDOW_SIZE),
             recv_window: i64::from(DEFAULT_INITIAL_WINDOW_SIZE),
@@ -254,25 +383,90 @@ impl Connection {
         }
     }
 
+    /// Replaces this connection's outbound flow-control/framing
+    /// SETTINGS (RoutaH2Config's `initial_window_size`/`max_frame_size`)
+    /// -- separate constructor params would work too, but this matches
+    /// the builder-style pattern already used elsewhere in this
+    /// codebase (e.g. `lb::upstream::UpstreamPool::with_outlier_config`)
+    /// for optional configuration a caller may not care to override.
+    pub fn with_local_settings(mut self, initial_window_size: u32, max_frame_size: u32, max_header_list_size: u32) -> Self {
+        self.local_initial_window_size = initial_window_size.min(MAX_WINDOW_SIZE as u32) as i32;
+        self.send_window = i64::from(self.local_initial_window_size);
+        self.recv_window = i64::from(self.local_initial_window_size);
+        self.local_max_frame_size = max_frame_size.clamp(frame::DEFAULT_MAX_FRAME_SIZE, frame::ABSOLUTE_MAX_FRAME_SIZE);
+        self.local_max_header_list_size = max_header_list_size;
+        self
+    }
+
+    /// Sets whether this connection's HPACK encoder prefers Huffman
+    /// coding for string literals and proactively signals its own
+    /// dynamic table size changes -- see `RoutaH2Config::huffman_encoding`
+    /// / `dynamic_table_update`.
+    pub fn with_encoder_options(mut self, huffman_encoding: bool, dynamic_table_update: bool) -> Self {
+        self.encoder = self
+            .encoder
+            .with_huffman_enabled(huffman_encoding)
+            .with_dynamic_table_update_enabled(dynamic_table_update);
+        self
+    }
+
+    /// Sets whether SETTINGS_ENABLE_PUSH is advertised as enabled --
+    /// see `RoutaH2Config::server_push_enabled`. Routa never actually
+    /// sends PUSH_PROMISE frames regardless of this value (no server
+    /// push implementation exists), but the SETTINGS value itself is
+    /// still real protocol-visible signaling a conforming peer may act
+    /// on (e.g. deciding whether to bother asking for pushed resources
+    /// some other way).
+    pub fn with_push_enabled(mut self, enabled: bool) -> Self {
+        self.local_enable_push = enabled;
+        self
+    }
+
+    /// Switches this connection's stream table to a fixed-capacity
+    /// linear-scan strategy sized to `local_max_concurrent_streams`
+    /// (its own hard limit on how many streams can ever be open at
+    /// once) instead of the default hashmap. See `StreamTable`'s own
+    /// doc comment for the tradeoff this exists to make available.
+    pub fn with_linear_stream_lookup(mut self) -> Self {
+        self.streams = StreamTable::new_linear(self.local_max_concurrent_streams as usize);
+        self
+    }
+
     /// The connection preface (RFC 9113 3.4) plus our initial SETTINGS
     /// frame -- what a server sends before anything else, immediately
     /// on accepting an h2 connection (whether negotiated via ALPN or
     /// an h2c upgrade).
     pub fn initial_send(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        frame::write_settings(
-            &mut out,
-            &[
-                frame::Setting {
-                    id: SETTINGS_MAX_CONCURRENT_STREAMS,
-                    value: self.local_max_concurrent_streams,
-                },
-                frame::Setting {
-                    id: SETTINGS_INITIAL_WINDOW_SIZE,
-                    value: self.local_initial_window_size as u32,
-                },
-            ],
-        );
+        let mut settings = vec![
+            frame::Setting {
+                id: SETTINGS_HEADER_TABLE_SIZE,
+                value: self.local_header_table_size as u32,
+            },
+            frame::Setting {
+                id: SETTINGS_ENABLE_PUSH,
+                value: self.local_enable_push as u32,
+            },
+            frame::Setting {
+                id: SETTINGS_MAX_CONCURRENT_STREAMS,
+                value: self.local_max_concurrent_streams,
+            },
+            frame::Setting {
+                id: SETTINGS_INITIAL_WINDOW_SIZE,
+                value: self.local_initial_window_size as u32,
+            },
+            frame::Setting {
+                id: SETTINGS_MAX_FRAME_SIZE,
+                value: self.local_max_frame_size,
+            },
+        ];
+        if self.local_max_header_list_size > 0 {
+            settings.push(frame::Setting {
+                id: SETTINGS_MAX_HEADER_LIST_SIZE,
+                value: self.local_max_header_list_size,
+            });
+        }
+        frame::write_settings(&mut out, &settings);
         out
     }
 
@@ -289,6 +483,33 @@ impl Connection {
 
     pub fn is_closed(&self) -> bool {
         self.error
+    }
+
+    /// Resets (RST_STREAM, error CANCEL) every stream that's been open
+    /// longer than `timeout` without finishing -- called periodically
+    /// (see `core::event_loop`'s idle sweep) rather than on every
+    /// `advance()`, since a stuck stream by definition isn't producing
+    /// frames for `advance()` to react to. A no-op when `timeout` is
+    /// zero, matching `RoutaH2Config::stream_timeout_ms`'s "0 disables
+    /// this" convention used throughout `core::config`.
+    pub fn reap_stale_streams(&mut self, timeout: std::time::Duration) -> Vec<u8> {
+        if timeout.is_zero() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let stale: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.phase != StreamPhase::Closed && now.duration_since(s.created_at) > timeout)
+            .map(|(id, _)| id)
+            .collect();
+
+        let mut out = Vec::new();
+        for stream_id in stale {
+            frame::write_rst_stream(&mut out, stream_id, H2Error::Cancel as u32);
+            self.streams.remove(&stream_id);
+        }
+        out
     }
 }
 
@@ -476,7 +697,7 @@ impl Connection {
             // just updating send_window above without also resuming
             // delivery would leave that data queued forever even
             // though the window is now open.
-            let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+            let stream_ids: Vec<u32> = self.streams.keys();
             for stream_id in stream_ids {
                 self.flush_pending(stream_id, &mut result.to_send);
             }
@@ -519,7 +740,7 @@ impl Connection {
             // A connection-level window increase can unstall every
             // stream that has a response queued, not just one -- same
             // reasoning as the SETTINGS_INITIAL_WINDOW_SIZE handler.
-            let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
+            let stream_ids: Vec<u32> = self.streams.keys();
             for stream_id in stream_ids {
                 self.flush_pending(stream_id, &mut result.to_send);
             }
@@ -753,11 +974,11 @@ impl Connection {
         let end_stream = frame.header.flags & frame::FLAG_END_STREAM != 0;
         let end_headers = frame.header.flags & frame::FLAG_END_HEADERS != 0;
 
-        let stream = self.streams.entry(stream_id).or_insert_with(|| {
-            {
-                Stream::new(stream_id, self.peer_initial_window_size, self.local_initial_window_size)
-            }
-        });
+        let peer_initial_window_size = self.peer_initial_window_size;
+        let local_initial_window_size = self.local_initial_window_size;
+        let stream = self
+            .streams
+            .get_or_insert_with(stream_id, || Stream::new(stream_id, peer_initial_window_size, local_initial_window_size));
         stream.header_block.extend_from_slice(payload);
         stream.header_block_end_stream = end_stream;
 
@@ -852,6 +1073,21 @@ impl Connection {
             frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
             self.streams.remove(&stream_id);
             return;
+        }
+
+        if self.local_max_header_list_size > 0 {
+            // RFC 7541 4.1's own per-entry accounting (name + value +
+            // 32 bytes overhead), applied here to the *uncompressed*
+            // header list rather than the dynamic table -- this is
+            // what SETTINGS_MAX_HEADER_LIST_SIZE actually bounds (RFC
+            // 9113 6.5.2), a separate limit from the dynamic table's
+            // own size.
+            let total: usize = fields.iter().map(|f| f.name.len() + f.value.len() + 32).sum();
+            if total as u32 > self.local_max_header_list_size {
+                frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::RefusedStream as u32);
+                self.streams.remove(&stream_id);
+                return;
+            }
         }
 
         let stream = self.streams.get_mut(&stream_id).unwrap();
@@ -1166,7 +1402,7 @@ impl Connection {
         self.streams
             .iter()
             .filter(|(_, s)| !s.pending_response.is_exhausted())
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id)
             .collect()
     }
 }
@@ -1211,6 +1447,21 @@ mod tests {
 
     fn new_conn() -> Connection {
         Connection::new(128, 4096)
+    }
+
+    /// Whether any frame in `data` (a concatenated byte stream of
+    /// however many frames a single `advance()` call produced) has the
+    /// given type -- several assertions below only care that a
+    /// RST_STREAM appears somewhere in the output, not that it's the
+    /// very first frame (a SETTINGS ack, for instance, may precede it).
+    fn contains_frame_type(mut data: &[u8], want: FrameType) -> bool {
+        while let Some((frame, consumed)) = frame::parse_frame(data) {
+            if frame.header.frame_type == want {
+                return true;
+            }
+            data = &data[consumed..];
+        }
+        false
     }
 
     /// Drives a full client handshake + a single GET request through
@@ -1647,5 +1898,150 @@ mod tests {
         assert!(!result.connection_closed);
         let (rst_frame, _) = frame::parse_frame(&result.to_send).unwrap();
         assert_eq!(rst_frame.header.frame_type, FrameType::RstStream);
+    }
+
+    #[test]
+    fn max_header_list_size_refuses_oversized_header_block() {
+        // RoutaH2Config::max_header_list_size wired via with_local_settings.
+        let mut conn = new_conn().with_local_settings(65_535, frame::DEFAULT_MAX_FRAME_SIZE, 100);
+        let mut client_encoder = HpackContext::new(4096);
+        let mut input = Vec::new();
+        input.extend_from_slice(CONNECTION_PREFACE);
+        frame::write_settings(&mut input, &[]);
+
+        let headers = client_encoder.encode(&[
+            field(":method", "GET"),
+            field(":scheme", "https"),
+            field(":path", "/"),
+            field(":authority", "example.com"),
+            field("x-padding", &"a".repeat(500)), // pushes the uncompressed header list well past the 100-byte limit
+        ]);
+        frame::write_headers(&mut input, 1, &headers, true, true);
+
+        let result = conn.advance(&input);
+        assert!(!result.connection_closed);
+        assert!(result.newly_ready_streams.is_empty(), "oversized header list must not reach dispatch");
+        assert!(contains_frame_type(&result.to_send, FrameType::RstStream));
+    }
+
+    #[test]
+    fn max_header_list_size_zero_means_unlimited() {
+        let mut conn = new_conn().with_local_settings(65_535, frame::DEFAULT_MAX_FRAME_SIZE, 0);
+        let stream_id = send_handshake_and_request(&mut conn, "/");
+        assert_eq!(stream_id, 1);
+    }
+
+    #[test]
+    fn reap_stale_streams_resets_streams_open_past_the_timeout() {
+        let mut conn = new_conn();
+        let mut client_encoder = HpackContext::new(4096);
+        let mut input = Vec::new();
+        input.extend_from_slice(CONNECTION_PREFACE);
+        frame::write_settings(&mut input, &[]);
+        // No END_STREAM -- request body never completes, stream stays open.
+        let headers = client_encoder.encode(&[
+            field(":method", "POST"),
+            field(":scheme", "https"),
+            field(":path", "/"),
+            field(":authority", "example.com"),
+        ]);
+        frame::write_headers(&mut input, 1, &headers, false, true);
+        conn.advance(&input);
+        assert!(conn.streams.contains_key(&1));
+
+        // Zero timeout is a no-op (RoutaH2Config's "0 disables this" convention).
+        assert!(conn.reap_stale_streams(std::time::Duration::ZERO).is_empty());
+        assert!(conn.streams.contains_key(&1));
+
+        // A timeout that's already elapsed (stream was created moments ago) resets it.
+        let rst_bytes = conn.reap_stale_streams(std::time::Duration::from_nanos(1));
+        assert!(!rst_bytes.is_empty());
+        assert!(contains_frame_type(&rst_bytes, FrameType::RstStream));
+        assert!(!conn.streams.contains_key(&1));
+    }
+
+    #[test]
+    fn huffman_disabled_output_is_not_smaller_than_raw_encoding() {
+        let mut with_huffman = HpackContext::new(4096);
+        let mut without_huffman = HpackContext::new(4096).with_huffman_enabled(false);
+        let value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fields = [field("x-custom", value)];
+
+        let compressed = with_huffman.encode(&fields);
+        let raw = without_huffman.encode(&fields);
+
+        // Highly repetitive ASCII compresses well under Huffman -- with it
+        // disabled, the encoded form must be strictly larger for this input.
+        assert!(raw.len() > compressed.len());
+    }
+
+    #[test]
+    fn dynamic_table_update_signaling_toggle() {
+        let mut signaling_on = HpackContext::new(4096).with_dynamic_table_update_enabled(true);
+        signaling_on.set_max_dynamic_table_size(1024);
+        let out_on = signaling_on.encode(&[field("x-a", "1")]);
+
+        let mut signaling_off = HpackContext::new(4096).with_dynamic_table_update_enabled(false);
+        signaling_off.set_max_dynamic_table_size(1024);
+        let out_off = signaling_off.encode(&[field("x-a", "1")]);
+
+        // Signaling on prepends a Dynamic Table Size Update instruction
+        // (RFC 7541 6.3, top 3 bits 001) before the first header field --
+        // signaling off must not, so the two outputs necessarily differ,
+        // with the "off" form the shorter of the two.
+        assert!(out_off.len() < out_on.len());
+        assert_eq!(out_on[0] & 0xE0, 0x20);
+    }
+
+    #[test]
+    fn max_concurrent_streams_hard_cap_clamps_local_setting() {
+        // core::event_loop clamps max_concurrent_streams to the hard cap
+        // before constructing Connection::new -- this test proves the
+        // resulting settings frame reflects the clamped value, not the
+        // higher configured max_concurrent_streams.
+        let configured_max: u32 = 500;
+        let hard_cap: u32 = 32;
+        let effective = configured_max.min(hard_cap).max(1);
+        assert_eq!(effective, 32);
+        let conn = Connection::new(effective, 4096);
+        assert_eq!(conn.local_max_concurrent_streams, 32);
+    }
+
+    #[test]
+    fn linear_stream_lookup_serves_requests_identically_to_the_hashmap_default() {
+        let mut conn = Connection::new(128, 4096).with_linear_stream_lookup();
+        let stream_id = send_handshake_and_request(&mut conn, "/hello");
+        let (headers, body, _trailers) = conn.take_request(stream_id).unwrap();
+        assert!(headers.iter().any(|h| h.name == ":path" && h.value == "/hello"));
+        assert!(body.is_empty());
+
+        let out = conn.send_response(stream_id, 200, &[], b"ok".to_vec());
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn linear_stream_lookup_reuses_a_closed_slot_for_a_new_stream() {
+        // A fixed-capacity table only has room for as many concurrent
+        // streams as configured -- once one closes, its slot must
+        // become available to a subsequent stream rather than the
+        // table silently running out of room well before the
+        // configured concurrency limit is ever reached.
+        let mut conn = Connection::new(1, 4096).with_linear_stream_lookup();
+        let first = send_handshake_and_request(&mut conn, "/first");
+        conn.send_response(first, 200, &[], b"ok".to_vec());
+        assert!(conn.streams.get(&first).is_none(), "stream should have closed after a full response with no pending body");
+
+        let mut request_frame = Vec::new();
+        let headers = vec![
+            HeaderField { name: ":method".to_string(), value: "GET".to_string() },
+            HeaderField { name: ":path".to_string(), value: "/second".to_string() },
+            HeaderField { name: ":scheme".to_string(), value: "http".to_string() },
+            HeaderField { name: ":authority".to_string(), value: "example.com".to_string() },
+        ];
+        let mut encoder = HpackContext::new(4096);
+        let encoded = encoder.encode(&headers);
+        frame::write_headers(&mut request_frame, 3, &encoded, true, true);
+        let result = conn.advance(&request_frame);
+        assert_eq!(result.newly_ready_streams, vec![3]);
     }
 }

@@ -240,6 +240,7 @@ fn acquire_connection(node: &Arc<UpstreamNode>, h2_pools: &H2PoolRegistry) -> Ac
                     created_at: Instant::now(),
                     last_used: Instant::now(),
                     requests_served: 0,
+                    freshly_connected: true,
                 },
             })
         }
@@ -301,6 +302,11 @@ pub struct ProxyConfig {
     pub proxy_identity: String,
     pub read_timeout: Duration,
     pub write_timeout: Duration,
+    /// Bounds only the non-blocking TCP handshake (see
+    /// `IdleConn::freshly_connected`) -- distinct from `write_timeout`,
+    /// which bounds writing the request once a connection is already
+    /// established.
+    pub connect_timeout: Duration,
 }
 
 impl Default for ProxyConfig {
@@ -309,6 +315,7 @@ impl Default for ProxyConfig {
             proxy_identity: "routa".to_string(),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -322,6 +329,10 @@ pub enum ForwardError {
     /// itself failed (e.g. the upstream reset the connection
     /// mid-response).
     UpstreamError(std::io::Error),
+    /// This pool's own ACL rejected the client before any upstream was
+    /// even considered -- distinct from the global ACL, which a
+    /// request already passed through earlier in the middleware chain.
+    AclDenied,
 }
 
 /// Forwards `req` to whichever upstream node `lb` selects, retrying
@@ -337,6 +348,13 @@ pub fn forward(
     config: &ProxyConfig,
     metrics: &crate::util::metrics::Metrics,
 ) -> Result<HttpResponse, ForwardError> {
+    if let Some(acl) = &lb.config.acl {
+        if let Some(ip) = req.remote_addr {
+            if !acl.check(&ip) {
+                return Err(ForwardError::AclDenied);
+            }
+        }
+    }
     let pool_name = &config.proxy_identity; // used as the pool label until pools carry their own configured name through to here
     let client_ip_str = req.remote_addr.map(|a| a.to_string());
     let sticky_value = req.get_header(&sticky_cookie_header_name(lb)).map(|s| s.to_string());
@@ -501,6 +519,13 @@ fn forward_http1(
         .map(|h| (h.name, h.value))
         .collect();
 
+    if conn.freshly_connected {
+        if let Err(e) = wait_for_connect(&mut conn.stream, config.connect_timeout) {
+            node.release_conn(conn, false);
+            return Err(e);
+        }
+    }
+
     let request_bytes = upstream_req.serialize();
     if let Err(e) = write_all_with_timeout(&mut conn.stream, &request_bytes, config.write_timeout) {
         node.release_conn(conn, false);
@@ -517,6 +542,36 @@ fn forward_http1(
         Err(e) => {
             node.release_conn(conn, false);
             Err(e)
+        }
+    }
+}
+
+/// Waits for a non-blocking `connect_async` TCP handshake to actually
+/// complete, bounded by `LbPoolConfig::lb_pool_connect_timeout_ms`.
+/// `peer_addr()` fails with `NotConnected` while the handshake is
+/// still in progress and succeeds the moment it completes -- a
+/// standard way to detect non-blocking connect completion without a
+/// poller, matching the busy-poll-with-sleep style
+/// `write_all_with_timeout`/`read_http1_response` already use for the
+/// same reason (this module drives sockets synchronously within one
+/// `forward()` call rather than through `core::event_loop`'s poller).
+/// A hard connection failure (e.g. `ECONNREFUSED`) surfaces via
+/// `take_error` rather than lingering until this timeout.
+fn wait_for_connect(stream: &mut mio::net::TcpStream, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match stream.peer_addr() {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                if let Ok(Some(err)) = stream.take_error() {
+                    return Err(err);
+                }
+                if Instant::now() > deadline {
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -962,6 +1017,48 @@ mod tests {
         let metrics = crate::util::metrics::Metrics::new();
         let resp = forward(&lb, &h2_pools, &req, &config, &metrics).unwrap();
         assert_eq!(resp.body(), b"good");
+    }
+
+    #[test]
+    fn connect_timeout_bounds_a_stalled_tcp_handshake() {
+        // 192.0.2.0/24 is RFC 5737's TEST-NET-1 -- reserved for
+        // documentation, guaranteed unroutable, so the SYN this sends
+        // never gets a response at all (unlike a closed port, which
+        // fails fast with RST). wait_for_connect's own deadline is
+        // what ends this, not anything the OS/network does -- proves
+        // LbPoolConfig::lb_pool_connect_timeout_ms bounds the wait
+        // rather than the connection attempt just hanging until some
+        // much longer OS-level TCP connect timeout.
+        let pool = Arc::new(UpstreamPool::new(1, 1));
+        let node = Arc::new(UpstreamNode::new("192.0.2.1".to_string(), 1, 1, false, 8));
+        add_node(&pool, node);
+
+        let lb = LoadBalancer::new(
+            LbConfig {
+                algo: LbAlgo::RoundRobin,
+                max_retries: 0,
+                ..Default::default()
+            },
+            pool,
+        );
+        let h2_pools = H2PoolRegistry::new();
+        let config = ProxyConfig {
+            connect_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+
+        let req = make_request(HttpMethod::Get, "/", &[("Host", "example.com")]);
+        let metrics = crate::util::metrics::Metrics::new();
+
+        let started = Instant::now();
+        let result = forward(&lb, &h2_pools, &req, &config, &metrics);
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "connect_timeout should have bounded the wait to roughly 200ms, took {elapsed:?}"
+        );
     }
 
     #[test]

@@ -182,15 +182,65 @@ impl Default for Http1Connection {
 pub struct Http2Connection {
     pub inner: crate::http::h2::stream::Connection,
     pub write_buf: Buf,
+    pub created_at: Instant,
+}
+
+/// The subset of `core::config::RoutaH2Config` a new `Http2Connection`
+/// needs -- computed once per worker (see `core::event_loop::EventLoopWorker::new`)
+/// rather than re-read from the full server config on every accepted
+/// H2 connection.
+#[derive(Debug, Clone, Copy)]
+pub struct Http2Settings {
+    pub max_concurrent_streams: u32,
+    pub header_table_size: usize,
+    pub initial_window_size: u32,
+    pub max_frame_size: u32,
+    pub max_header_list_size: u32,
+    pub huffman_encoding: bool,
+    pub dynamic_table_update: bool,
+    pub server_push_enabled: bool,
+    pub stream_timeout: std::time::Duration,
+    pub keepalive_timeout: std::time::Duration,
+    pub stream_lookup: crate::core::config::H2StreamLookup,
 }
 
 impl Http2Connection {
-    pub fn new(local_max_concurrent_streams: u32, local_header_table_size: usize) -> Self {
-        let inner = crate::http::h2::stream::Connection::new(local_max_concurrent_streams, local_header_table_size);
+    pub fn new(settings: &Http2Settings) -> Self {
+        let local_max_concurrent_streams = settings.max_concurrent_streams;
+        let mut inner = crate::http::h2::stream::Connection::new(local_max_concurrent_streams, settings.header_table_size)
+            .with_local_settings(settings.initial_window_size, settings.max_frame_size, settings.max_header_list_size)
+            .with_encoder_options(settings.huffman_encoding, settings.dynamic_table_update)
+            .with_push_enabled(settings.server_push_enabled);
+        if settings.stream_lookup == crate::core::config::H2StreamLookup::Linear {
+            inner = inner.with_linear_stream_lookup();
+        }
         let mut write_buf = Buf::new();
         write_buf.push(&inner.initial_send());
-        Http2Connection { inner, write_buf }
+        Http2Connection {
+            inner,
+            write_buf,
+            created_at: Instant::now(),
+        }
     }
+}
+
+/// The subset of `core::config::WsConfig` needed once a connection has
+/// already been accepted and is running the WS protocol state machine
+/// -- computed once per worker (see `core::event_loop::EventLoopWorker::new`),
+/// same rationale as `Http2Settings`.
+#[derive(Debug, Clone, Copy)]
+pub struct WsSettings {
+    pub max_frame_size: u64,
+    pub max_message_size: u64,
+    pub require_masking: bool,
+    pub compression_level: u32,
+    pub write_queue_max_bytes: u64,
+    pub idle_timeout: Option<std::time::Duration>,
+    pub ping_interval: std::time::Duration,
+    pub ping_timeout: std::time::Duration,
+    pub max_ping_misses: u32,
+    pub read_buf_size: usize,
+    pub write_buf_size: usize,
 }
 
 /// WebSocket connection state on this connection -- delegates all
@@ -200,6 +250,17 @@ impl Http2Connection {
 pub struct WsConnection {
     pub inner: crate::http::ws::WsConnection,
     pub write_buf: Buf,
+    /// `WsSettings::write_queue_max_bytes` for the connection this
+    /// belongs to -- `core::event_loop` checks `write_buf`'s length
+    /// against this after every push to enforce
+    /// `WsConfig::write_queue_max` backpressure.
+    pub write_queue_max_bytes: u64,
+    /// Ping/pong keepalive bookkeeping (`WsConfig::ping_interval_ms`
+    /// / `ping_timeout_ms` / `max_ping_misses`), driven by
+    /// `core::event_loop`'s periodic sweep -- see `ping_sweep_ws_connections`.
+    pub last_pong_at: Instant,
+    pub last_ping_sent: Option<Instant>,
+    pub ping_misses: u32,
 }
 
 impl WsConnection {
@@ -207,6 +268,27 @@ impl WsConnection {
         WsConnection {
             inner: crate::http::ws::WsConnection::new(pmd, max_message_size),
             write_buf: Buf::new(),
+            write_queue_max_bytes: u64::MAX,
+            last_pong_at: Instant::now(),
+            last_ping_sent: None,
+            ping_misses: 0,
+        }
+    }
+
+    pub fn with_settings(pmd: Option<crate::http::ws::PmdContext>, settings: &WsSettings) -> Self {
+        WsConnection {
+            inner: crate::http::ws::WsConnection::with_read_buf_capacity(
+                pmd,
+                settings.max_message_size as usize,
+                settings.max_frame_size,
+                settings.require_masking,
+                settings.read_buf_size,
+            ),
+            write_buf: Buf::with_capacity(settings.write_buf_size),
+            write_queue_max_bytes: settings.write_queue_max_bytes,
+            last_pong_at: Instant::now(),
+            last_ping_sent: None,
+            ping_misses: 0,
         }
     }
 }

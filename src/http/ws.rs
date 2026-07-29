@@ -219,7 +219,7 @@ struct ParsedHeader {
     header_len: usize, // total bytes this header occupied
 }
 
-fn parse_frame_header(data: &[u8]) -> Result<Option<ParsedHeader>, CloseCode> {
+fn parse_frame_header(data: &[u8], require_masking: bool) -> Result<Option<ParsedHeader>, CloseCode> {
     if data.len() < 2 {
         return Ok(None); // need at least the two fixed bytes
     }
@@ -242,8 +242,12 @@ fn parse_frame_header(data: &[u8]) -> Result<Option<ParsedHeader>, CloseCode> {
     };
 
     let masked = byte1 & 0x80 != 0;
-    if !masked {
+    if !masked && require_masking {
         // RFC 6455 5.1: every client-to-server frame MUST be masked.
+        // `require_masking` exists purely as an interop escape hatch
+        // (see `WsConfig::require_masking`) -- disabling it accepts
+        // non-conformant clients (e.g. certain test/debug tooling) at
+        // the cost of RFC compliance, never the other way around.
         return Err(CloseCode::ProtocolError);
     }
 
@@ -275,18 +279,23 @@ fn parse_frame_header(data: &[u8]) -> Result<Option<ParsedHeader>, CloseCode> {
         return Err(CloseCode::ProtocolError);
     }
 
-    if data.len() < pos + 4 {
-        return Ok(None);
-    }
-    let mut mask = [0u8; 4];
-    mask.copy_from_slice(&data[pos..pos + 4]);
-    pos += 4;
+    let mask = if masked {
+        if data.len() < pos + 4 {
+            return Ok(None);
+        }
+        let mut mask = [0u8; 4];
+        mask.copy_from_slice(&data[pos..pos + 4]);
+        pos += 4;
+        Some(mask)
+    } else {
+        None
+    };
 
     Ok(Some(ParsedHeader {
         fin,
         rsv1,
         opcode,
-        mask: Some(mask),
+        mask,
         payload_len,
         header_len: pos,
     }))
@@ -316,8 +325,18 @@ pub struct PmdContext {
 
 impl PmdContext {
     pub fn new(params: PmdParams) -> Self {
+        Self::with_compression_level(params, 6)
+    }
+
+    /// Same as `new`, but with `WsConfig::compression_level` (1-9,
+    /// zlib/deflate's usual speed-vs-ratio knob) applied instead of
+    /// flate2's default -- kept separate from `new` for the same
+    /// reason `WsConnection::with_limits` is separate from
+    /// `WsConnection::new` (see its doc comment).
+    pub fn with_compression_level(params: PmdParams, compression_level: u32) -> Self {
+        let level = flate2::Compression::new(compression_level.clamp(0, 9));
         PmdContext {
-            compress: flate2::Compress::new(flate2::Compression::default(), false),
+            compress: flate2::Compress::new(level, false),
             decompress: flate2::Decompress::new(false),
             server_no_context_takeover: params.server_no_context_takeover,
             client_no_context_takeover: params.client_no_context_takeover,
@@ -442,6 +461,10 @@ pub struct WsAdvanceResult {
     pub to_send: Vec<u8>,
     pub events: Vec<WsEvent>,
     pub protocol_error: bool,
+    /// Set when a PONG frame was received this call -- see
+    /// `WsRegistry::record_pong`, which this drives (through
+    /// `core::event_loop`) to reset the connection's missed-ping count.
+    pub pong_received: bool,
 }
 
 enum FragmentState {
@@ -462,17 +485,46 @@ pub struct WsConnection {
     fragment: FragmentState,
     pmd: Option<PmdContext>,
     max_message_size: usize,
+    max_frame_size: u64,
+    require_masking: bool,
     close_sent: bool,
     close_received: bool,
 }
 
 impl WsConnection {
     pub fn new(pmd: Option<PmdContext>, max_message_size: usize) -> Self {
+        Self::with_limits(pmd, max_message_size, u64::MAX, true)
+    }
+
+    /// Same as `new`, but with `WsConfig::max_frame_size` and
+    /// `WsConfig::require_masking` also applied -- kept as a separate
+    /// constructor rather than extra `new` parameters so every existing
+    /// caller/test that only cares about PMD and the message-size cap
+    /// (the two limits this type has always enforced) doesn't need to
+    /// grow two more arguments it has no opinion on.
+    pub fn with_limits(pmd: Option<PmdContext>, max_message_size: usize, max_frame_size: u64, require_masking: bool) -> Self {
+        Self::with_read_buf_capacity(pmd, max_message_size, max_frame_size, require_masking, 0)
+    }
+
+    /// Same as `with_limits`, but additionally reserves
+    /// `WsConfig::read_buf_size` bytes of capacity in `read_buf` up
+    /// front -- purely a throughput optimization (avoids repeated
+    /// reallocation as the first few frames arrive), never a hard cap:
+    /// `read_buf` still grows past this if a frame needs more room.
+    pub fn with_read_buf_capacity(
+        pmd: Option<PmdContext>,
+        max_message_size: usize,
+        max_frame_size: u64,
+        require_masking: bool,
+        read_buf_size: usize,
+    ) -> Self {
         WsConnection {
-            read_buf: Vec::new(),
+            read_buf: Vec::with_capacity(read_buf_size),
             fragment: FragmentState::None,
             pmd,
             max_message_size,
+            max_frame_size,
+            require_masking,
             close_sent: false,
             close_received: false,
         }
@@ -493,7 +545,7 @@ impl WsConnection {
         let mut result = WsAdvanceResult::default();
 
         loop {
-            let header = match parse_frame_header(&self.read_buf) {
+            let header = match parse_frame_header(&self.read_buf, self.require_masking) {
                 Ok(Some(h)) => h,
                 Ok(None) => break, // incomplete -- wait for more bytes
                 Err(close_code) => {
@@ -502,14 +554,23 @@ impl WsConnection {
                 }
             };
 
+            if header.payload_len > self.max_frame_size {
+                // WsConfig::max_frame_size bounds a single frame's
+                // payload -- distinct from max_message_size, which
+                // bounds a (possibly multi-frame) reassembled message.
+                self.fail(CloseCode::MessageTooBig, &mut result);
+                return result;
+            }
+
             let total_len = header.header_len + header.payload_len as usize;
             if self.read_buf.len() < total_len {
                 break; // header parsed, but payload hasn't fully arrived yet
             }
 
-            let mask = header.mask.expect("client frames are always masked, checked in parse_frame_header");
             let mut payload = self.read_buf[header.header_len..total_len].to_vec();
-            unmask_payload(&mut payload, mask);
+            if let Some(mask) = header.mask {
+                unmask_payload(&mut payload, mask);
+            }
 
             if let Err(close_code) = self.handle_frame(&header, payload, &mut result) {
                 self.fail(close_code, &mut result);
@@ -557,7 +618,10 @@ impl WsConnection {
                 result.to_send.extend_from_slice(&payload);
                 Ok(())
             }
-            Opcode::Pong => Ok(()), // no action needed beyond having been received
+            Opcode::Pong => {
+                result.pong_received = true;
+                Ok(())
+            }
             Opcode::Close => {
                 self.close_received = true;
                 let (code, reason) = parse_close_payload(&payload)?;
@@ -1069,7 +1133,7 @@ mod tests {
     #[test]
     fn parses_small_masked_frame() {
         let frame = build_client_frame(Opcode::Text, true, b"hello", [1, 2, 3, 4]);
-        let header = parse_frame_header(&frame).unwrap().unwrap();
+        let header = parse_frame_header(&frame, true).unwrap().unwrap();
         assert_eq!(header.opcode, Opcode::Text);
         assert!(header.fin);
         assert_eq!(header.payload_len, 5);
@@ -1079,7 +1143,7 @@ mod tests {
     fn unmasked_client_frame_is_protocol_error() {
         let mut frame = build_client_frame(Opcode::Text, true, b"hi", [0, 0, 0, 0]);
         frame[1] &= 0x7f; // clear the mask bit -- client frames must always be masked
-        let result = parse_frame_header(&frame);
+        let result = parse_frame_header(&frame, true);
         assert_eq!(result, Err(CloseCode::ProtocolError));
     }
 
@@ -1087,7 +1151,7 @@ mod tests {
     fn extended_16_bit_length_parses_correctly() {
         let payload = vec![b'x'; 200]; // > 125, needs the 16-bit length form
         let frame = build_client_frame(Opcode::Binary, true, &payload, [9, 9, 9, 9]);
-        let header = parse_frame_header(&frame).unwrap().unwrap();
+        let header = parse_frame_header(&frame, true).unwrap().unwrap();
         assert_eq!(header.payload_len, 200);
     }
 
@@ -1095,40 +1159,40 @@ mod tests {
     fn extended_64_bit_length_parses_correctly() {
         let payload = vec![b'x'; 70_000]; // > 65535, needs the 64-bit length form
         let frame = build_client_frame(Opcode::Binary, true, &payload, [1, 1, 1, 1]);
-        let header = parse_frame_header(&frame).unwrap().unwrap();
+        let header = parse_frame_header(&frame, true).unwrap().unwrap();
         assert_eq!(header.payload_len, 70_000);
     }
 
     #[test]
     fn incomplete_header_returns_none_not_error() {
-        assert_eq!(parse_frame_header(&[0x81]).unwrap(), None);
+        assert_eq!(parse_frame_header(&[0x81], true).unwrap(), None);
     }
 
     #[test]
     fn reserved_opcode_is_protocol_error() {
         let mut frame = build_client_frame(Opcode::Text, true, b"x", [1, 2, 3, 4]);
         frame[0] = (frame[0] & 0xf0) | 0x3; // 0x3 is a reserved (undefined) opcode
-        assert_eq!(parse_frame_header(&frame), Err(CloseCode::ProtocolError));
+        assert_eq!(parse_frame_header(&frame, true), Err(CloseCode::ProtocolError));
     }
 
     #[test]
     fn rsv2_or_rsv3_set_is_protocol_error() {
         let mut frame = build_client_frame(Opcode::Text, true, b"x", [1, 2, 3, 4]);
         frame[0] |= 0x20; // RSV2
-        assert_eq!(parse_frame_header(&frame), Err(CloseCode::ProtocolError));
+        assert_eq!(parse_frame_header(&frame, true), Err(CloseCode::ProtocolError));
     }
 
     #[test]
     fn fragmented_control_frame_is_protocol_error() {
         let frame = build_client_frame(Opcode::Ping, false, b"x", [1, 2, 3, 4]); // fin=false
-        assert_eq!(parse_frame_header(&frame), Err(CloseCode::ProtocolError));
+        assert_eq!(parse_frame_header(&frame, true), Err(CloseCode::ProtocolError));
     }
 
     #[test]
     fn oversized_control_frame_is_protocol_error() {
         let payload = vec![b'x'; 126]; // > 125-byte control frame limit
         let frame = build_client_frame(Opcode::Ping, true, &payload, [1, 2, 3, 4]);
-        assert_eq!(parse_frame_header(&frame), Err(CloseCode::ProtocolError));
+        assert_eq!(parse_frame_header(&frame, true), Err(CloseCode::ProtocolError));
     }
 
     // ─── WsConnection: single-frame messages ─────────────────────────
@@ -1386,6 +1450,50 @@ mod tests {
         input.extend_from_slice(&build_client_frame(Opcode::Text, false, b"12345", [1, 1, 1, 1]));
         input.extend_from_slice(&build_client_frame(Opcode::Continuation, true, b"678910111213", [2, 2, 2, 2]));
         let result = conn.advance(&input);
+        assert!(result.protocol_error);
+    }
+
+    #[test]
+    fn max_frame_size_rejects_a_single_oversized_frame() {
+        // WsConfig::max_frame_size bounds one frame's payload, distinct
+        // from max_message_size (which governs the reassembled total).
+        // A generous message-size limit here proves it's genuinely the
+        // frame-size check firing, not the message-size one.
+        let mut conn = WsConnection::with_limits(None, 1024 * 1024, 10, true);
+        let frame = build_client_frame(Opcode::Binary, true, &[0u8; 50], [1, 2, 3, 4]);
+        let result = conn.advance(&frame);
+        assert!(result.protocol_error);
+    }
+
+    #[test]
+    fn max_frame_size_allows_frames_at_or_under_the_limit() {
+        let mut conn = WsConnection::with_limits(None, 1024, 10, true);
+        let frame = build_client_frame(Opcode::Binary, true, &[0u8; 10], [1, 2, 3, 4]);
+        let result = conn.advance(&frame);
+        assert!(!result.protocol_error);
+    }
+
+    #[test]
+    fn require_masking_false_accepts_unmasked_frames() {
+        let mut conn = WsConnection::with_limits(None, 1024, 1024, false);
+        let mut frame = build_client_frame(Opcode::Text, true, b"hi", [0, 0, 0, 0]);
+        frame[1] &= 0x7f; // clear the mask bit -- an unmasked frame, which default (require_masking=true) rejects
+        // Payload bytes are sent raw (never masked) to match the cleared bit.
+        let header_len = 2; // opcode/fin byte + length byte, no mask key present
+        frame.truncate(header_len);
+        frame.extend_from_slice(b"hi");
+        let result = conn.advance(&frame);
+        assert!(!result.protocol_error);
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(&result.events[0], WsEvent::Message(WsMessage::Text(t)) if t == "hi"));
+    }
+
+    #[test]
+    fn require_masking_true_still_rejects_unmasked_frames() {
+        let mut conn = WsConnection::with_limits(None, 1024, 1024, true);
+        let mut frame = build_client_frame(Opcode::Text, true, b"hi", [0, 0, 0, 0]);
+        frame[1] &= 0x7f;
+        let result = conn.advance(&frame);
         assert!(result.protocol_error);
     }
 

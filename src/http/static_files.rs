@@ -154,6 +154,7 @@ pub fn serve(
     cache: &FileCache,
     worker_mmap: &mut WorkerMmapCache,
     metrics: Option<&crate::util::metrics::Metrics>,
+    watcher: Option<&crate::http::file_cache::FileWatcher>,
 ) -> HttpResponse {
     if req.method != HttpMethod::Get && req.method != HttpMethod::Head {
         return HttpResponse::new(405, "Method Not Allowed");
@@ -182,6 +183,13 @@ pub fn serve(
                 };
                 let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
                 cache.put(&req.path, resolved.clone(), metadata.len(), mtime);
+                if let Some(watcher) = watcher {
+                    // RoutaConfig::file_cache_watch = Inotify: subscribe
+                    // this freshly-cached path to filesystem change
+                    // notifications, so a later edit invalidates it
+                    // immediately instead of waiting for `ttl` to elapse.
+                    watcher.watch_path(&resolved, &req.path);
+                }
                 match cache.get(&req.path, worker_mmap) {
                     Some(l) => l,
                     None => {
@@ -356,7 +364,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/hello.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
 
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"hello world");
@@ -377,7 +385,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/nope.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 404);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -396,7 +404,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Post, "/a.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 405);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -415,7 +423,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Head, "/a.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         assert!(resp.body().is_empty());
         assert_eq!(resp.get_header("Content-Length"), Some("12"));
@@ -436,11 +444,11 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let first_req = make_request(HttpMethod::Get, "/a.txt", &[]);
-        let first_resp = serve(&first_req, &cfg, &cache, &mut mmap_cache, None);
+        let first_resp = serve(&first_req, &cfg, &cache, &mut mmap_cache, None, None);
         let etag = first_resp.get_header("ETag").unwrap().to_string();
 
         let second_req = make_request(HttpMethod::Get, "/a.txt", &[("If-None-Match", &etag)]);
-        let second_resp = serve(&second_req, &cfg, &cache, &mut mmap_cache, None);
+        let second_resp = serve(&second_req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(second_resp.status, 304);
         assert!(second_resp.body().is_empty());
 
@@ -460,7 +468,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=2-4")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 206);
         assert_eq!(resp.body(), b"234");
         assert_eq!(resp.get_header("Content-Range"), Some("bytes 2-4/10"));
@@ -481,7 +489,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=-3")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 206);
         assert_eq!(resp.body(), b"789");
 
@@ -501,7 +509,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=7-")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 206);
         assert_eq!(resp.body(), b"789");
 
@@ -521,7 +529,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=100-200")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 416);
         assert_eq!(resp.get_header("Content-Range"), Some("bytes */10"));
 
@@ -541,7 +549,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/assets/app.js", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"console.log(1)");
 
@@ -564,7 +572,7 @@ mod tests {
         // (must be a real path-segment boundary, not just a string
         // prefix).
         let req = make_request(HttpMethod::Get, "/assets-other/app.js", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 404);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -583,7 +591,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/subdir", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 403);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -602,7 +610,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/subdir", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"<h1>index</h1>");
 
@@ -625,10 +633,10 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/nope.txt", &[]);
-        let first = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let first = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(first.status, 404);
 
-        let second = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let second = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(second.status, 404);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -655,7 +663,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/big.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None);
+        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         // Large, non-mmap'd files are now sent via a FileBody
         // (sendfile-eligible) rather than being read into resp.body()

@@ -41,6 +41,10 @@ use crate::net::tls::TlsContext;
 pub struct RoutedPool {
     pub route_prefix: String,
     pub lb: Arc<LoadBalancer>,
+    /// How long an idle pooled upstream connection may sit unused
+    /// before a periodic sweep closes it -- see this pool's own
+    /// `UpstreamPool::reap_idle`, which does the actual closing.
+    pub idle_timeout: Duration,
     _health_check: Option<HealthCheckLoop>,
     _outlier_sweep: Option<crate::lb::outlier::OutlierSweepLoop>,
 }
@@ -55,6 +59,23 @@ pub struct RoutaServer {
     pub h2_pools: Arc<H2PoolRegistry>,
     pub proxy_config: ProxyConfig,
     pub metrics: Arc<crate::util::metrics::Metrics>,
+    /// Currently-open WebSocket connections, summed across every
+    /// worker (each worker has its own independent connection slab --
+    /// see `core::event_loop` -- so `WsConfig::max_connections` can
+    /// only be enforced against a total shared across all of them, not
+    /// a per-worker count).
+    pub ws_active_connections: std::sync::atomic::AtomicUsize,
+    /// Held alive for as long as the server runs -- `FileWatcher::new`'s
+    /// returned handle stops watching once dropped. `None` unless
+    /// `RoutaConfig::file_cache_watch = Inotify`.
+    pub file_watcher: Option<Arc<crate::http::file_cache::FileWatcher>>,
+    /// Set by the periodic memory check (`core::event_loop`, worker 0
+    /// only -- see `RoutaConfig::memory_soft_limit_mb`) and read by
+    /// every worker's `accept_all` to stop taking new connections while
+    /// over budget. The hard limit doesn't need an equivalent flag: it
+    /// acts immediately by signalling the same graceful shutdown every
+    /// worker already shares.
+    pub memory_over_soft_limit: std::sync::atomic::AtomicBool,
 }
 
 impl RoutaServer {
@@ -64,6 +85,17 @@ impl RoutaServer {
     /// is treated as an incomplete change, not an acceptable gap).
     pub fn from_config(config: RoutaConfig) -> Result<Self, ServerBuildError> {
         let file_cache = Arc::new(build_file_cache(&config));
+        let file_watcher = if config.file_cache_watch == crate::core::config::FileCacheWatch::Inotify {
+            match file_cache.with_watcher() {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start file cache watcher, falling back to TTL-based revalidation");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let tls_context = if config.tls_enabled {
             Some(Arc::new(build_tls_context(&config)?))
@@ -132,12 +164,25 @@ impl RoutaServer {
 
         let mut router = Router::new();
         for (url_prefix, doc_root) in &config.static_dirs {
-            register_static_route(&mut router, url_prefix.clone(), doc_root.clone(), Arc::clone(&file_cache), Arc::clone(&metrics));
+            register_static_route(
+                &mut router,
+                url_prefix.clone(),
+                doc_root.clone(),
+                Arc::clone(&file_cache),
+                Arc::clone(&metrics),
+                file_watcher.clone(),
+            );
         }
 
         let h2_pools = Arc::new(H2PoolRegistry::new());
         let mut pools = Vec::new();
         for pool_cfg in &config.pools {
+            // A pool with no upstreams configured, or explicitly
+            // disabled, is skipped entirely rather than registered as
+            // a route that can never do anything but 502.
+            if !pool_cfg.lb_enabled || pool_cfg.upstreams.is_empty() {
+                continue;
+            }
             let pool = build_routed_pool(pool_cfg, &h2_pools, &metrics)?;
             tracing::info!(
                 pool_name = %pool.route_prefix,
@@ -162,6 +207,13 @@ impl RoutaServer {
                     .first()
                     .map(|p| p.lb_upstream_write_timeout_ms.max(0) as u64)
                     .unwrap_or(30_000),
+            ),
+            connect_timeout: Duration::from_millis(
+                config
+                    .pools
+                    .first()
+                    .map(|p| p.lb_pool_connect_timeout_ms.max(0) as u64)
+                    .unwrap_or(5_000),
             ),
         };
 
@@ -199,6 +251,11 @@ impl RoutaServer {
                         resp.set_body(b"Bad Gateway\n".to_vec());
                         resp
                     }
+                    Err(crate::core::proxy::ForwardError::AclDenied) => {
+                        let mut resp = HttpResponse::new(403, "Forbidden");
+                        resp.set_body(b"Forbidden\n".to_vec());
+                        resp
+                    }
                 },
             );
         }
@@ -213,6 +270,7 @@ impl RoutaServer {
                 .iter()
                 .map(|p| (p.route_prefix.clone(), Arc::clone(&p.lb)))
                 .collect();
+            let file_cache_for_route = Arc::clone(&file_cache);
             router.add(&metrics_path, &[crate::http::request::HttpMethod::Get], move |req, _params| {
                 for (pool_name, lb) in &pool_summaries {
                     for node in lb.pool.nodes() {
@@ -228,6 +286,19 @@ impl RoutaServer {
                             .with_label_values(&[pool_name, &node_label])
                             .set(node.idle_count() as i64);
                     }
+                }
+                metrics_for_route.cache.entries.set(file_cache_for_route.entry_count() as i64);
+                // evictions_total is a monotonic counter on FileCache
+                // itself (already cumulative since startup) but a
+                // Prometheus Counter only exposes inc()/inc_by() --
+                // reconcile the two by tracking how much of the total
+                // this handler has already reported and inc_by()ing
+                // only the delta, the same pattern main.rs already uses
+                // for worker_restarts_total.
+                let current_total = file_cache_for_route.evictions_total();
+                let already_reported = metrics_for_route.cache.evictions_reported.swap(current_total, std::sync::atomic::Ordering::Relaxed);
+                if current_total > already_reported {
+                    metrics_for_route.cache.evictions_total.inc_by(current_total - already_reported);
                 }
                 crate::http::middleware::metrics::handle(req, &metrics_for_route)
             });
@@ -269,6 +340,9 @@ impl RoutaServer {
             h2_pools,
             proxy_config,
             metrics,
+            ws_active_connections: std::sync::atomic::AtomicUsize::new(0),
+            file_watcher,
+            memory_over_soft_limit: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -371,11 +445,17 @@ fn build_file_cache(config: &RoutaConfig) -> FileCache {
 
 fn build_tls_context(config: &RoutaConfig) -> Result<TlsContext, ServerBuildError> {
     let mut builder = TlsContext::builder(&config.tls_cert, &config.tls_key)
-        .map_err(|e| ServerBuildError::Tls(e.to_string()))?;
+        .map_err(|e| ServerBuildError::Tls(e.to_string()))?
+        .with_h2_enabled(config.h2.enabled);
     for sni in &config.sni_certs {
         builder = builder
             .add_sni_cert(&sni.hostname, &sni.cert, &sni.key)
             .map_err(|e| ServerBuildError::Tls(e.to_string()))?;
+    }
+    if !config.tls_ocsp_response.is_empty() {
+        let ocsp_der = std::fs::read(&config.tls_ocsp_response)
+            .map_err(|e| ServerBuildError::Tls(format!("reading tls_ocsp_response file: {e}")))?;
+        builder = builder.with_ocsp_response(ocsp_der);
     }
     builder.build().map_err(|e| ServerBuildError::Tls(e.to_string()))
 }
@@ -430,17 +510,35 @@ fn build_routed_pool(pool_cfg: &LbPoolConfig, h2_pools: &Arc<H2PoolRegistry>, me
             pool_cfg.lb_passive_fail_threshold.max(1) as u32,
             pool_cfg.lb_passive_recover_threshold.max(1) as u32,
         )
-        .with_outlier_config(outlier_config),
+        .with_outlier_config(outlier_config)
+        .with_half_open_retry_after(Duration::from_millis(pool_cfg.lb_half_open_retry_after_ms.max(0) as u64)),
     );
 
+    let hc_type = match pool_cfg.lb_hc_type {
+        crate::core::config::HcType::None => crate::lb::upstream::HealthCheckType::None,
+        crate::core::config::HcType::Tcp => crate::lb::upstream::HealthCheckType::Tcp,
+        crate::core::config::HcType::Http => crate::lb::upstream::HealthCheckType::Http,
+        crate::core::config::HcType::Custom => crate::lb::upstream::HealthCheckType::Custom,
+    };
+    let hc_config = crate::lb::upstream::HealthCheckConfig {
+        check_type: hc_type,
+        path: pool_cfg.lb_hc_path.clone(),
+        interval: Duration::from_millis(pool_cfg.lb_hc_interval_ms.max(0) as u64),
+        timeout: Duration::from_millis(pool_cfg.lb_hc_timeout_ms.max(0) as u64),
+        threshold_up: pool_cfg.lb_hc_threshold_up.max(1) as u32,
+        threshold_down: pool_cfg.lb_hc_threshold_down.max(1) as u32,
+    };
+
     for upstream_cfg in &pool_cfg.upstreams {
-        let node = Arc::new(UpstreamNode::new(
+        let mut new_node = UpstreamNode::new(
             upstream_cfg.host.clone(),
             upstream_cfg.port,
             upstream_cfg.weight,
             upstream_cfg.use_tls,
             pool_cfg.lb_pool_max_per_node.max(1) as u32,
-        ));
+        );
+        new_node.hc = hc_config.clone();
+        let node = Arc::new(new_node);
         add_node(&pool, Arc::clone(&node));
         if upstream_cfg.use_tls {
             // TLS upstreams are dialed via net::h2_client -- see
@@ -453,9 +551,37 @@ fn build_routed_pool(pool_cfg: &LbPoolConfig, h2_pools: &Arc<H2PoolRegistry>, me
 
     let lb_config = LbConfig {
         algo,
-        max_retries: 1, // one retry across the pool by default; see this struct's own field doc for how a caller overrides it
-        consistent_hash_vnodes: 100,
-        ..Default::default()
+        max_retries: pool_cfg.lb_max_retries.max(0) as u32,
+        retry_on_connect_fail: true, // always on -- see LbConfig's own field doc; no config key gates this
+        retry_on_5xx: pool_cfg.lb_retry_on_5xx,
+        consistent_hash_vnodes: pool_cfg.lb_consistent_hash_vnodes.max(1) as u32,
+        sticky_session_enabled: pool_cfg.sticky_session_enabled,
+        sticky_cookie_name: pool_cfg.sticky_cookie_name.clone(),
+        request_header_add: pool_cfg
+            .request_header_add
+            .iter()
+            .map(|h| crate::lb::lb::HeaderRule { name: h.name.clone(), value: h.value.clone() })
+            .collect(),
+        request_header_remove: pool_cfg.request_header_remove.clone(),
+        response_header_add: pool_cfg
+            .response_header_add
+            .iter()
+            .map(|h| crate::lb::lb::HeaderRule { name: h.name.clone(), value: h.value.clone() })
+            .collect(),
+        response_header_remove: pool_cfg.response_header_remove.clone(),
+        acl: if pool_cfg.acl_enabled {
+            let mut acl_cfg = crate::http::middleware::acl::AclConfig::new(pool_cfg.acl_default_allow);
+            for rule in &pool_cfg.acl_rules {
+                let action = match rule.action {
+                    crate::core::config::AclAction::Allow => crate::http::middleware::acl::AclAction::Allow,
+                    crate::core::config::AclAction::Deny => crate::http::middleware::acl::AclAction::Deny,
+                };
+                acl_cfg.add_rule(&rule.rule, action);
+            }
+            Some(acl_cfg)
+        } else {
+            None
+        },
     };
     let lb = Arc::new(LoadBalancer::new(lb_config, Arc::clone(&pool)));
 
@@ -480,12 +606,20 @@ fn build_routed_pool(pool_cfg: &LbPoolConfig, h2_pools: &Arc<H2PoolRegistry>, me
     Ok(RoutedPool {
         route_prefix,
         lb,
+        idle_timeout: Duration::from_secs(pool_cfg.lb_pool_idle_timeout_s.max(0) as u64),
         _health_check: health_check,
         _outlier_sweep: outlier_sweep,
     })
 }
 
-fn register_static_route(router: &mut Router, url_prefix: String, doc_root: String, cache: Arc<FileCache>, metrics: Arc<crate::util::metrics::Metrics>) {
+fn register_static_route(
+    router: &mut Router,
+    url_prefix: String,
+    doc_root: String,
+    cache: Arc<FileCache>,
+    metrics: Arc<crate::util::metrics::Metrics>,
+    watcher: Option<Arc<crate::http::file_cache::FileWatcher>>,
+) {
     let static_cfg = crate::http::static_files::StaticConfig {
         doc_root: std::path::PathBuf::from(doc_root),
         url_prefix: url_prefix.clone(),
@@ -506,7 +640,7 @@ fn register_static_route(router: &mut Router, url_prefix: String, doc_root: Stri
         &[crate::http::request::HttpMethod::Get, crate::http::request::HttpMethod::Head],
         move |req, _params| {
             let mut guard = mmap_cache.lock().unwrap();
-            crate::http::static_files::serve(req, &static_cfg, &cache, &mut guard, Some(&metrics))
+            crate::http::static_files::serve(req, &static_cfg, &cache, &mut guard, Some(&metrics), watcher.as_deref())
         },
     );
 }
@@ -556,6 +690,71 @@ mod tests {
         // construction didn't panic.
         let mmap_cache = server.file_cache.worker_mmap_cache();
         let _ = mmap_cache;
+    }
+
+    #[test]
+    fn file_cache_watch_disabled_leaves_file_watcher_none() {
+        let cfg = minimal_config(); // file_cache_watch defaults to None
+        let server = RoutaServer::from_config(cfg).unwrap();
+        assert!(server.file_watcher.is_none());
+    }
+
+    #[test]
+    fn file_cache_watch_inotify_invalidates_a_served_file_on_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_server_watch_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("watched.txt");
+        std::fs::write(&file_path, b"original").unwrap();
+
+        let mut cfg = minimal_config();
+        cfg.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        cfg.file_cache_strategy = crate::core::config::FileCacheStrategy::Inotify;
+        cfg.file_cache_watch = crate::core::config::FileCacheWatch::Inotify;
+        // A long TTL proves any invalidation observed is coming from
+        // the watcher, not from an ordinary TTL expiry racing it.
+        cfg.file_cache_ttl_s = 3600;
+        let server = RoutaServer::from_config(cfg).unwrap();
+        assert!(server.file_watcher.is_some(), "file_cache_watch = Inotify should have started a watcher");
+
+        let req = HttpRequest {
+            method: crate::http::request::HttpMethod::Get,
+            remote_addr: None,
+            path: "/watched.txt".to_string(),
+            query: None,
+            query_params: Vec::new(),
+            version_major: 1,
+            version_minor: 1,
+            headers: Vec::new(),
+            body: Vec::new(),
+            keep_alive: true,
+            trailers: Vec::new(),
+        };
+
+        let resp = server.middleware_chain.execute(&req);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body(), b"original");
+
+        // Give watch registration a moment, then modify the file on disk.
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(&file_path, b"changed content").unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = server.middleware_chain.execute(&req);
+            if resp.body() == b"changed content" {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("file_cache_watch did not pick up the on-disk change within the timeout");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -727,6 +926,21 @@ mod tests {
         assert_eq!(server.pools[0].route_prefix, "/api/*");
         assert_eq!(server.pools[0].lb.config.algo, crate::lb::lb::LbAlgo::LeastConn);
         assert_eq!(server.pools[0].lb.pool.node_count(), 2);
+    }
+
+    #[test]
+    fn lb_pool_connect_timeout_reaches_proxy_config() {
+        let mut cfg = minimal_config();
+        cfg.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            lb_pool_connect_timeout_ms: 1_234,
+            upstreams: vec![UpstreamConfig { host: "10.0.0.1".to_string(), port: 8080, weight: 1, use_tls: false }],
+            ..Default::default()
+        });
+        let server = RoutaServer::from_config(cfg).unwrap();
+        assert_eq!(server.proxy_config.connect_timeout, Duration::from_millis(1_234));
     }
 
     #[test]
@@ -933,6 +1147,49 @@ mod tests {
         let resp = server.middleware_chain.execute(&req);
         assert_eq!(resp.status, 200);
         assert!(resp.get_header("Content-Type").unwrap().starts_with("text/plain"));
+    }
+
+    #[test]
+    fn metrics_endpoint_reports_file_cache_entries_and_evictions() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_server_cache_metrics_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+
+        let mut cfg = minimal_config();
+        cfg.metrics_enabled = true;
+        cfg.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        cfg.file_cache_enabled = true;
+        cfg.file_cache_max_entries = 1; // forces an eviction on the second distinct file served
+        let server = RoutaServer::from_config(cfg).unwrap();
+
+        let get = |path: &str| HttpRequest {
+            method: crate::http::request::HttpMethod::Get,
+            remote_addr: None,
+            path: path.to_string(),
+            query: None,
+            query_params: Vec::new(),
+            version_major: 1,
+            version_minor: 1,
+            headers: Vec::new(),
+            body: Vec::new(),
+            keep_alive: true,
+            trailers: Vec::new(),
+        };
+
+        assert_eq!(server.middleware_chain.execute(&get("/a.txt")).status, 200);
+        assert_eq!(server.middleware_chain.execute(&get("/b.txt")).status, 200);
+
+        let resp = server.middleware_chain.execute(&get("/metrics"));
+        let body = String::from_utf8(resp.body().to_vec()).unwrap();
+        assert!(body.contains("routa_cache_entries 1"), "expected exactly 1 entry (max_entries=1), got:\n{body}");
+        assert!(body.contains("routa_cache_evictions_total 1"), "expected exactly 1 eviction, got:\n{body}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

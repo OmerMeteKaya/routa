@@ -78,6 +78,12 @@ pub struct LbConfig {
     pub request_header_remove: Vec<String>,
     pub response_header_add: Vec<HeaderRule>,
     pub response_header_remove: Vec<String>,
+
+    // Pool-scoped ACL, checked in addition to (after) any global ACL a
+    // request already passed through the middleware chain -- lets a
+    // pool restrict which clients can reach its specific upstreams
+    // beyond whatever the server-wide policy already allows.
+    pub acl: Option<crate::http::middleware::acl::AclConfig>,
 }
 
 // ─── Hashing / randomness helpers ───────────────────────────────────────

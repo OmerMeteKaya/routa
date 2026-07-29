@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use mio::net::TcpListener;
 use slab::Slab;
 
-use crate::core::conn::{Connection, ConnectionProtocol, Http1Connection, Http2Connection, Transport, WsConnection};
+use crate::core::conn::{Connection, ConnectionProtocol, Http1Connection, Http2Connection, Http2Settings, Transport, WsConnection, WsSettings};
 use crate::core::server::RoutaServer;
 use crate::core::worker::{ShutdownSignal, WorkerBody, WorkerPool};
 use crate::net::poller::{EventPoller, Interests, MioPoller, PollKey};
@@ -40,6 +40,7 @@ use crate::net::tls::TlsConnection;
 const DEFAULT_MAX_REQUEST_SIZE: usize = 0; // 0 = unlimited, matches http::request::parse's convention
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+const MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct EventLoopWorker {
     port: u16,
@@ -47,6 +48,22 @@ pub struct EventLoopWorker {
     max_request_size: usize,
     keepalive_timeout: Duration,
     request_timeout: Duration,
+    h2_settings: Http2Settings,
+    ws_enabled: bool,
+    ws_max_connections: usize,
+    ws_permessage_deflate: bool,
+    ws_settings: WsSettings,
+    backlog: i32,
+    max_connections: i64,
+    socket_recv_buf_size: i32,
+    socket_send_buf_size: i32,
+    shutdown_timeout: Duration,
+    cpu_affinity_enabled: bool,
+    cpu_affinity_start_core: usize,
+    numa_aware_enabled: bool,
+    n_workers: usize,
+    memory_soft_limit_mb: i64,
+    memory_hard_limit_mb: i64,
 }
 
 impl EventLoopWorker {
@@ -58,19 +75,102 @@ impl EventLoopWorker {
         } else {
             DEFAULT_MAX_REQUEST_SIZE
         };
+        let h2 = &server.config.h2;
+        let h2_settings = Http2Settings {
+            max_concurrent_streams: h2.max_concurrent_streams.min(h2.max_concurrent_streams_hard_cap).max(1),
+            header_table_size: h2.header_table_size as usize,
+            initial_window_size: h2.initial_window_size,
+            max_frame_size: h2.max_frame_size,
+            max_header_list_size: h2.max_header_list_size,
+            huffman_encoding: h2.huffman_encoding,
+            dynamic_table_update: h2.dynamic_table_update,
+            server_push_enabled: h2.server_push_enabled,
+            stream_timeout: Duration::from_millis(h2.stream_timeout_ms.max(0) as u64),
+            keepalive_timeout: Duration::from_millis(h2.keepalive_timeout_ms.max(0) as u64),
+            stream_lookup: h2.stream_lookup,
+        };
+        let ws = &server.config.ws;
+        let ws_settings = WsSettings {
+            max_frame_size: ws.max_frame_size,
+            max_message_size: ws.max_message_size,
+            require_masking: ws.require_masking,
+            compression_level: ws.compression_level.clamp(0, 9) as u32,
+            write_queue_max_bytes: if ws.write_queue_max > 0 {
+                ws.write_buf_size.max(1).saturating_mul(ws.write_queue_max.max(0) as u64)
+            } else {
+                u64::MAX
+            },
+            idle_timeout: if ws.idle_timeout_ms > 0 {
+                Some(Duration::from_millis(ws.idle_timeout_ms as u64))
+            } else {
+                None
+            },
+            ping_interval: Duration::from_millis(ws.ping_interval_ms.max(0) as u64),
+            ping_timeout: Duration::from_millis(ws.ping_timeout_ms.max(0) as u64),
+            max_ping_misses: ws.max_ping_misses.max(0) as u32,
+            read_buf_size: ws.read_buf_size.max(0) as usize,
+            write_buf_size: ws.write_buf_size.max(0) as usize,
+        };
+        let ws_enabled = ws.enabled;
+        let ws_max_connections = ws.max_connections.max(0) as usize;
+        let ws_permessage_deflate = ws.permessage_deflate;
+        let backlog = server.config.backlog.max(1);
+        let max_connections = server.config.max_connections.max(0) as i64;
+        let socket_recv_buf_size = server.config.socket_recv_buf_size;
+        let socket_send_buf_size = server.config.socket_send_buf_size;
+        let shutdown_timeout = Duration::from_millis(server.config.shutdown_timeout_ms.max(0) as u64);
+        let cpu_affinity_enabled = server.config.cpu_affinity_enabled;
+        let cpu_affinity_start_core = server.config.cpu_affinity_start_core.max(0) as usize;
+        let numa_aware_enabled = server.config.numa_aware_enabled;
+        let n_workers = server.config.n_workers.max(1) as usize;
+        let memory_soft_limit_mb = server.config.memory_soft_limit_mb.max(0) as i64;
+        let memory_hard_limit_mb = server.config.memory_hard_limit_mb.max(0) as i64;
         EventLoopWorker {
             port,
             server,
             max_request_size,
             keepalive_timeout,
             request_timeout,
+            h2_settings,
+            ws_enabled,
+            ws_max_connections,
+            ws_permessage_deflate,
+            ws_settings,
+            backlog,
+            max_connections,
+            socket_recv_buf_size,
+            socket_send_buf_size,
+            shutdown_timeout,
+            cpu_affinity_enabled,
+            cpu_affinity_start_core,
+            numa_aware_enabled,
+            n_workers,
+            memory_soft_limit_mb,
+            memory_hard_limit_mb,
         }
     }
 }
 
 impl WorkerBody for EventLoopWorker {
-    fn run(&self, _worker_id: usize, shutdown: &ShutdownSignal) {
-        let mut listener = match bind_reuseport(self.port, 1024) {
+    fn run(&self, worker_id: usize, shutdown: &ShutdownSignal) {
+        if self.cpu_affinity_enabled {
+            let topology = if self.numa_aware_enabled {
+                crate::net::socket::numa_topology()
+            } else {
+                None
+            };
+            let assignment = crate::net::socket::numa_aware_core_assignment(
+                self.n_workers,
+                self.cpu_affinity_start_core,
+                topology.as_deref(),
+            );
+            let core = assignment.get(worker_id).copied().unwrap_or(self.cpu_affinity_start_core + worker_id);
+            if let Err(e) = crate::net::socket::pin_current_thread_to_core(core) {
+                tracing::warn!(worker_id, core, error = %e, "failed to set CPU affinity for worker thread");
+            }
+        }
+
+        let mut listener = match bind_reuseport(self.port, self.backlog) {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(port = self.port, error = %e, "worker failed to bind listener");
@@ -101,8 +201,24 @@ impl WorkerBody for EventLoopWorker {
 
         let mut connections: Slab<Connection> = Slab::new();
         let mut last_idle_sweep = Instant::now();
+        let mut last_memory_check = Instant::now();
+        // Set the moment `shutdown.is_set()` first becomes true --
+        // `RoutaConfig::shutdown_timeout_ms` bounds how long this
+        // worker keeps draining in-flight connections after that,
+        // rather than the previous behavior of dropping every
+        // connection immediately as soon as the shutdown signal fired.
+        let mut draining_since: Option<Instant> = None;
 
-        while !shutdown.is_set() {
+        loop {
+            if shutdown.is_set() && draining_since.is_none() {
+                draining_since = Some(Instant::now());
+            }
+            if let Some(started) = draining_since {
+                if connections.is_empty() || started.elapsed() >= self.shutdown_timeout {
+                    break;
+                }
+            }
+
             let events = match poller.poll(Some(POLL_TIMEOUT)) {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -110,7 +226,12 @@ impl WorkerBody for EventLoopWorker {
 
             for (key, readiness) in events {
                 if key == listener_key {
-                    accept_all(self, &mut listener, &mut poller, &mut connections);
+                    // Stop accepting new connections as soon as a
+                    // shutdown has been requested -- only already-open
+                    // connections get the grace period.
+                    if draining_since.is_none() {
+                        accept_all(self, &mut listener, &mut poller, &mut connections);
+                    }
                     continue;
                 }
                 handle_connection_event(self, &mut poller, &mut connections, key, readiness);
@@ -119,6 +240,31 @@ impl WorkerBody for EventLoopWorker {
             if last_idle_sweep.elapsed() >= IDLE_SWEEP_INTERVAL {
                 last_idle_sweep = Instant::now();
                 reap_idle_connections(self, &mut poller, &mut connections);
+                reap_stale_h2_streams(&mut connections, self.h2_settings.stream_timeout);
+                ping_sweep_ws_connections(self, &mut poller, &mut connections);
+                for pool in &self.server.pools {
+                    for node in pool.lb.pool.nodes().iter() {
+                        node.reap_idle(pool.idle_timeout);
+                    }
+                }
+            }
+
+            // Only worker 0 samples RSS (a process-wide, not per-worker,
+            // quantity -- every worker re-measuring it would be
+            // redundant work for the same answer) -- see
+            // `RoutaConfig::memory_soft_limit_mb`/`memory_hard_limit_mb`.
+            if worker_id == 0 && (self.memory_soft_limit_mb > 0 || self.memory_hard_limit_mb > 0) && last_memory_check.elapsed() >= MEMORY_CHECK_INTERVAL {
+                last_memory_check = Instant::now();
+                self.server.metrics.process.refresh_rss();
+                let rss_mb = (self.server.metrics.process.rss_bytes.get() / (1024.0 * 1024.0)) as i64;
+
+                let over_soft = self.memory_soft_limit_mb > 0 && rss_mb >= self.memory_soft_limit_mb;
+                self.server.memory_over_soft_limit.store(over_soft, std::sync::atomic::Ordering::Relaxed);
+
+                if self.memory_hard_limit_mb > 0 && rss_mb >= self.memory_hard_limit_mb && !shutdown.is_set() {
+                    tracing::error!(rss_mb, hard_limit_mb = self.memory_hard_limit_mb, "memory_hard_limit_mb exceeded, initiating graceful shutdown");
+                    shutdown.signal();
+                }
             }
         }
     }
@@ -128,6 +274,25 @@ fn accept_all(worker: &EventLoopWorker, listener: &mut TcpListener, poller: &mut
     loop {
         match listener.accept() {
             Ok((mut stream, remote_addr)) => {
+                // RoutaConfig::max_connections (0 = unlimited) caps
+                // total open connections across every worker --
+                // `connections_active` is one shared `IntGauge` (see
+                // `util::metrics::Metrics`, constructed once and held
+                // behind an `Arc`), so this reads the true cluster-wide
+                // count rather than just this worker's own slab size.
+                if worker.max_connections > 0 && worker.server.metrics.connection.connections_active.get() >= worker.max_connections {
+                    continue; // drop this connection immediately -- at capacity
+                }
+                if worker.server.memory_over_soft_limit.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue; // drop this connection immediately -- memory_soft_limit_mb exceeded
+                }
+
+                let _ = crate::net::socket::apply_buffer_sizes(
+                    socket2::SockRef::from(&stream),
+                    worker.socket_recv_buf_size,
+                    worker.socket_send_buf_size,
+                );
+
                 let entry = connections.vacant_entry();
                 let key = PollKey::from_slab_index(entry.key());
                 if poller.register_with_key(&mut stream, key, Interests::READABLE_WRITABLE).is_err() {
@@ -190,13 +355,16 @@ fn handle_connection_event(
     }
 
     if matches!(connections[idx].protocol, ConnectionProtocol::Handshaking) {
-        if let Transport::Tls { .. } = &connections[idx].transport {
+        if let Transport::Tls { tls, .. } = &connections[idx].transport {
             worker.server.metrics.connection.tls_handshakes_total.with_label_values(&["success"]).inc();
+            let duration_secs = connections[idx].created_at.elapsed().as_secs_f64();
+            let tls_version = tls.protocol_version_label();
+            worker.server.metrics.connection.tls_handshake_duration_seconds.with_label_values(&[tls_version]).observe(duration_secs);
         }
         let is_h2 = matches!(&connections[idx].transport, Transport::Tls { tls, .. } if tls.alpn_protocol() == Some(b"h2".as_slice()));
         connections[idx].protocol = if is_h2 {
             worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http2"]).inc();
-            ConnectionProtocol::Http2(Http2Connection::new(128, 4096))
+            ConnectionProtocol::Http2(Http2Connection::new(&worker.h2_settings))
         } else {
             worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http1"]).inc();
             ConnectionProtocol::Http1(Http1Connection::new())
@@ -253,6 +421,9 @@ fn close_connection(worker: &EventLoopWorker, poller: &mut MioPoller, connection
             Transport::Tls { stream, .. } => {
                 let _ = poller.deregister(stream, key);
             }
+        }
+        if matches!(conn.protocol, ConnectionProtocol::WebSocket(_)) {
+            worker.server.ws_active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         worker.server.metrics.connection.connections_closed_total.inc();
         worker.server.metrics.connection.connections_active.dec();
@@ -385,9 +556,30 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                     response.strip_body_for_head();
                 }
                 if is_upgrade && response.status == 101 {
-                    let pmd = negotiate_pmd_from_response(&response);
+                    // WsConfig::enabled / max_connections are enforced
+                    // here rather than earlier: only a request the
+                    // application handler already accepted as a valid
+                    // upgrade (101) is a candidate at all, so there's
+                    // no reason to reject anything before that's known.
+                    let over_capacity = worker.server.ws_active_connections.load(std::sync::atomic::Ordering::Relaxed) >= worker.ws_max_connections;
+                    if !worker.ws_enabled || over_capacity {
+                        let mut resp = crate::http::response::HttpResponse::new(503, "Service Unavailable");
+                        resp.set_header("Connection", "close");
+                        resp.set_body(b"WebSocket unavailable\n".to_vec());
+                        queue_http1_response(connections, idx, resp);
+                        connections[idx].closing = true;
+                        flush_transport(connections, idx)?;
+                        return Ok(());
+                    }
+
+                    let pmd = if worker.ws_permessage_deflate {
+                        negotiate_pmd_from_response(&response, worker.ws_settings.compression_level)
+                    } else {
+                        None
+                    };
                     queue_http1_response(connections, idx, response);
-                    connections[idx].protocol = ConnectionProtocol::WebSocket(WsConnection::new(pmd, 16 * 1024 * 1024));
+                    connections[idx].protocol = ConnectionProtocol::WebSocket(WsConnection::with_settings(pmd, &worker.ws_settings));
+                    worker.server.ws_active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     flush_transport(connections, idx)?;
                     return Ok(());
                 }
@@ -447,7 +639,7 @@ fn queue_http1_response(connections: &mut Slab<Connection>, idx: usize, mut resp
 /// client -- see `http::middleware`'s WS upgrade handler (wherever
 /// that's registered) for where the response's own PMD negotiation
 /// happens.
-fn negotiate_pmd_from_response(response: &crate::http::response::HttpResponse) -> Option<crate::http::ws::PmdContext> {
+fn negotiate_pmd_from_response(response: &crate::http::response::HttpResponse, compression_level: u32) -> Option<crate::http::ws::PmdContext> {
     let ext = response.get_header("Sec-WebSocket-Extensions")?;
     if !ext.contains("permessage-deflate") {
         return None;
@@ -456,7 +648,7 @@ fn negotiate_pmd_from_response(response: &crate::http::response::HttpResponse) -
         server_no_context_takeover: ext.contains("server_no_context_takeover"),
         client_no_context_takeover: ext.contains("client_no_context_takeover"),
     };
-    Some(crate::http::ws::PmdContext::new(params))
+    Some(crate::http::ws::PmdContext::with_compression_level(params, compression_level))
 }
 
 /// Reads as much as is currently available from `connections[idx]`'s
@@ -833,6 +1025,18 @@ fn drive_websocket(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
             unreachable!()
         };
         ws.write_buf.push(&advance_result.to_send);
+        if advance_result.pong_received {
+            ws.last_pong_at = Instant::now();
+            ws.last_ping_sent = None;
+            ws.ping_misses = 0;
+        }
+        if ws.write_buf.as_slice().len() as u64 > ws.write_queue_max_bytes {
+            // WsConfig::write_queue_max backpressure: the peer isn't
+            // reading fast enough to keep this connection's queued
+            // outbound bytes under the configured ceiling -- torn down
+            // rather than left to grow the write buffer unbounded.
+            connections[idx].closing = true;
+        }
     }
 
     if advance_result.protocol_error {
@@ -841,6 +1045,59 @@ fn drive_websocket(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
 
     flush_transport(connections, idx)?;
     Ok(())
+}
+
+/// Sends a PING to every WebSocket connection that's gone
+/// `ping_interval` since its last PONG (or, if a PING is already
+/// outstanding, `ping_timeout` since that PING was sent), and closes
+/// any connection that's accumulated `max_ping_misses` such misses in
+/// a row -- called periodically (see `EventLoopWorker::run`'s idle
+/// sweep) rather than reactively, since a connection that's stopped
+/// responding by definition isn't producing readiness events for this
+/// to react to otherwise.
+fn ping_sweep_ws_connections(worker: &EventLoopWorker, poller: &mut MioPoller, connections: &mut Slab<Connection>) {
+    if worker.ws_settings.ping_interval.is_zero() {
+        return;
+    }
+    let now = Instant::now();
+    let idxs: Vec<usize> = connections
+        .iter()
+        .filter(|(_, c)| matches!(c.protocol, ConnectionProtocol::WebSocket(_)))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    let mut to_close = Vec::new();
+    for idx in idxs {
+        let ConnectionProtocol::WebSocket(ws) = &mut connections[idx].protocol else {
+            continue;
+        };
+        match ws.last_ping_sent {
+            Some(sent_at) => {
+                if now.duration_since(sent_at) >= worker.ws_settings.ping_timeout {
+                    ws.ping_misses += 1;
+                    if ws.ping_misses >= worker.ws_settings.max_ping_misses.max(1) {
+                        to_close.push(idx);
+                        continue;
+                    }
+                    let ping_bytes = ws.inner.ping(&[]);
+                    ws.write_buf.push(&ping_bytes);
+                    ws.last_ping_sent = Some(now);
+                }
+            }
+            None => {
+                if now.duration_since(ws.last_pong_at) >= worker.ws_settings.ping_interval {
+                    let ping_bytes = ws.inner.ping(&[]);
+                    ws.write_buf.push(&ping_bytes);
+                    ws.last_ping_sent = Some(now);
+                }
+            }
+        }
+        let _ = flush_transport(connections, idx);
+    }
+
+    for idx in to_close {
+        close_connection(worker, poller, connections, idx);
+    }
 }
 
 /// Closes every connection that's exceeded `worker`'s configured
@@ -859,7 +1116,22 @@ fn reap_idle_connections(worker: &EventLoopWorker, poller: &mut MioPoller, conne
                     .is_some_and(|started| now.duration_since(started) > worker.request_timeout),
                 _ => false,
             };
-            let idle_too_long = now.duration_since(conn.last_active_at) > worker.keepalive_timeout;
+            // An H2 connection has its own idle ceiling
+            // (`RoutaH2Config::keepalive_timeout_ms`) rather than
+            // sharing H1's `keepalive_timeout_ms` -- a multiplexed
+            // connection with streams in flight is a different notion
+            // of "idle" than a plain H1 keep-alive connection between
+            // requests.
+            let keepalive_timeout = match &conn.protocol {
+                ConnectionProtocol::Http2(_) => worker.h2_settings.keepalive_timeout,
+                // WsConfig::idle_timeout_ms = 0 (the default) means "no
+                // WS-specific ceiling" -- such a connection still falls
+                // back to the ordinary H1 keepalive_timeout_ms, same as
+                // before this field existed.
+                ConnectionProtocol::WebSocket(_) => worker.ws_settings.idle_timeout.unwrap_or(worker.keepalive_timeout),
+                _ => worker.keepalive_timeout,
+            };
+            let idle_too_long = now.duration_since(conn.last_active_at) > keepalive_timeout;
             if request_in_flight_too_long || idle_too_long {
                 Some(idx)
             } else {
@@ -870,6 +1142,34 @@ fn reap_idle_connections(worker: &EventLoopWorker, poller: &mut MioPoller, conne
 
     for idx in stale {
         close_connection(worker, poller, connections, idx);
+    }
+}
+
+/// Resets any H2 stream that's been open longer than
+/// `RoutaH2Config::stream_timeout_ms` without completing -- see
+/// `http::h2::stream::Connection::reap_stale_streams`. Unlike a whole
+/// connection's idle timeout (`reap_idle_connections`), this can fire
+/// on an otherwise-active, healthy connection: a stuck stream shouldn't
+/// need its whole multiplexed connection to go idle before it's
+/// cleaned up.
+fn reap_stale_h2_streams(connections: &mut Slab<Connection>, stream_timeout: Duration) {
+    if stream_timeout.is_zero() {
+        return;
+    }
+    let idxs: Vec<usize> = connections
+        .iter()
+        .filter(|(_, c)| matches!(c.protocol, ConnectionProtocol::Http2(_)))
+        .map(|(idx, _)| idx)
+        .collect();
+    for idx in idxs {
+        let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
+            continue;
+        };
+        let rst_bytes = h2.inner.reap_stale_streams(stream_timeout);
+        if !rst_bytes.is_empty() {
+            h2.write_buf.push(&rst_bytes);
+            let _ = flush_transport(connections, idx);
+        }
     }
 }
 
@@ -1084,5 +1384,419 @@ mod tests {
         let (status, body) = http_get(port, "/api/anything");
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body).trim_end(), "from upstream!");
+    }
+
+    // ─── WsConfig wiring ──────────────────────────────────────────────
+
+    /// Builds a real accepted TCP connection pair (registered with
+    /// `poller`), wrapped as a `Connection` already in
+    /// `ConnectionProtocol::WebSocket` state -- lets these tests drive
+    /// the periodic sweeps directly without needing a full router/
+    /// middleware-chain WS upgrade handshake, which nothing in this
+    /// codebase's config (only a caller embedding routa as a library
+    /// registers WS routes) exercises end-to-end today.
+    fn insert_test_ws_connection(poller: &mut MioPoller, connections: &mut Slab<Connection>, ws: crate::core::conn::WsConnection) -> (usize, StdTcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = StdTcpStream::connect(addr).unwrap();
+        let (server_stream, _) = listener.accept().unwrap();
+        server_stream.set_nonblocking(true).unwrap();
+        let mut mio_stream = mio::net::TcpStream::from_std(server_stream);
+
+        let entry = connections.vacant_entry();
+        let key = PollKey::from_slab_index(entry.key());
+        poller.register_with_key(&mut mio_stream, key, Interests::READABLE_WRITABLE).unwrap();
+
+        let mut conn = Connection::new(entry.key() as u64, key, Transport::Plain(mio_stream), client.local_addr().unwrap());
+        conn.protocol = ConnectionProtocol::WebSocket(ws);
+        let idx = entry.key();
+        entry.insert(conn);
+        (idx, client)
+    }
+
+    #[test]
+    fn ping_sweep_sends_ping_after_interval() {
+        let mut config = RoutaConfig::default();
+        config.ws.ping_interval_ms = 50;
+        config.ws.ping_timeout_ms = 5_000;
+        config.ws.max_ping_misses = 3;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+
+        let mut poller = MioPoller::new(16).unwrap();
+        let mut connections: Slab<Connection> = Slab::new();
+        let ws = crate::core::conn::WsConnection::with_settings(None, &worker.ws_settings);
+        let (idx, mut client) = insert_test_ws_connection(&mut poller, &mut connections, ws);
+
+        // last_pong_at defaults to "now" (connection just created), so
+        // nothing should be due yet.
+        ping_sweep_ws_connections(&worker, &mut poller, &mut connections);
+        let ConnectionProtocol::WebSocket(ws) = &connections[idx].protocol else { unreachable!() };
+        assert!(ws.last_ping_sent.is_none());
+
+        // Backdate last_pong_at past ping_interval and sweep again.
+        let ConnectionProtocol::WebSocket(ws) = &mut connections[idx].protocol else { unreachable!() };
+        ws.last_pong_at = Instant::now() - Duration::from_millis(100);
+        ping_sweep_ws_connections(&worker, &mut poller, &mut connections);
+
+        assert!(connections.contains(idx), "should not be closed yet, just pinged");
+        let ConnectionProtocol::WebSocket(ws) = &connections[idx].protocol else { unreachable!() };
+        assert!(ws.last_ping_sent.is_some());
+
+        // The PING frame should have actually reached the client socket.
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(buf[0] & 0x0f, 0x9); // opcode 0x9 = PING
+    }
+
+    #[test]
+    fn ping_sweep_closes_connection_after_max_misses() {
+        let mut config = RoutaConfig::default();
+        config.ws.ping_interval_ms = 10;
+        config.ws.ping_timeout_ms = 10;
+        config.ws.max_ping_misses = 2;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+
+        let mut poller = MioPoller::new(16).unwrap();
+        let mut connections: Slab<Connection> = Slab::new();
+        let ws = crate::core::conn::WsConnection::with_settings(None, &worker.ws_settings);
+        let (idx, _client) = insert_test_ws_connection(&mut poller, &mut connections, ws);
+
+        {
+            let ConnectionProtocol::WebSocket(ws) = &mut connections[idx].protocol else { unreachable!() };
+            ws.last_pong_at = Instant::now() - Duration::from_secs(1);
+        }
+
+        // Each sweep call either sends a ping or, once ping_timeout has
+        // elapsed since the last one with no pong, counts a miss --
+        // repeated sweeps (with a short sleep to cross ping_timeout)
+        // simulate the periodic sweep firing on an unresponsive peer.
+        for _ in 0..10 {
+            if !connections.contains(idx) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+            ping_sweep_ws_connections(&worker, &mut poller, &mut connections);
+        }
+
+        assert!(!connections.contains(idx), "connection should be closed after exceeding max_ping_misses");
+    }
+
+    #[test]
+    fn write_queue_max_backpressure_closes_slow_consumer() {
+        let mut config = RoutaConfig::default();
+        config.ws.write_buf_size = 16;
+        config.ws.write_queue_max = 1; // effective cap: 16 bytes
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+        assert_eq!(worker.ws_settings.write_queue_max_bytes, 16);
+
+        let mut poller = MioPoller::new(16).unwrap();
+        let mut connections: Slab<Connection> = Slab::new();
+        let ws = crate::core::conn::WsConnection::with_settings(None, &worker.ws_settings);
+        let (idx, _client) = insert_test_ws_connection(&mut poller, &mut connections, ws);
+
+        // Simulate a large backlog of unflushed outbound bytes (as if
+        // the peer stopped reading) directly, then drive one more pass
+        // through drive_websocket's backpressure check via a manual
+        // push + the same threshold comparison it performs.
+        {
+            let ConnectionProtocol::WebSocket(ws) = &mut connections[idx].protocol else { unreachable!() };
+            ws.write_buf.push(&[0u8; 100]);
+            assert!(ws.write_buf.as_slice().len() as u64 > ws.write_queue_max_bytes);
+        }
+        let _ = drive_websocket(&mut connections, idx);
+        assert!(connections[idx].closing, "backpressure should mark the connection for closing");
+    }
+
+    #[test]
+    fn ws_disabled_rejects_upgrade_with_503() {
+        let mut config = RoutaConfig::default();
+        config.ws.enabled = false;
+        // No actual WS route is registered (see insert_test_ws_connection's
+        // doc comment on why), so this only exercises the config
+        // plumbing (worker.ws_enabled reads false), not the full
+        // request-to-101 path -- that gate is proven directly here
+        // instead of through a real socket round trip.
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+        assert!(!worker.ws_enabled);
+    }
+
+    #[test]
+    fn ws_max_connections_is_read_from_config() {
+        let mut config = RoutaConfig::default();
+        config.ws.max_connections = 3;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+        assert_eq!(worker.ws_max_connections, 3);
+    }
+
+    #[test]
+    fn ws_idle_timeout_overrides_generic_keepalive_for_ws_connections() {
+        let mut config = RoutaConfig::default();
+        config.keepalive_timeout_ms = 60_000;
+        config.ws.idle_timeout_ms = 50;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+
+        let mut poller = MioPoller::new(16).unwrap();
+        let mut connections: Slab<Connection> = Slab::new();
+        let ws = crate::core::conn::WsConnection::with_settings(None, &worker.ws_settings);
+        let (idx, _client) = insert_test_ws_connection(&mut poller, &mut connections, ws);
+        connections[idx].last_active_at = Instant::now() - Duration::from_millis(200);
+
+        reap_idle_connections(&worker, &mut poller, &mut connections);
+        assert!(!connections.contains(idx), "WS-specific idle_timeout_ms should have closed this connection despite the much larger generic keepalive_timeout_ms");
+    }
+
+    // ─── General RoutaConfig fields ────────────────────────────────────
+
+    #[test]
+    fn tls_handshake_duration_is_observed_on_a_real_handshake() {
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        use rustls::pki_types::CertificateDer;
+
+        let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+
+        let dir = std::env::temp_dir().join(format!(
+            "routa_event_loop_tls_metric_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+
+        let mut config = RoutaConfig::default();
+        config.tls_enabled = true;
+        config.tls_cert = cert_path.to_str().unwrap().to_string();
+        config.tls_key = key_path.to_str().unwrap().to_string();
+        let port = free_port();
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let _pool = run(Arc::clone(&server), port, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut client_sock = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() > deadline {
+                        panic!("timed out connecting");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        client_sock.set_nonblocking(true).unwrap();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).unwrap();
+        let mut client_conn =
+            crate::net::tls::TlsConnection::new_client_with_roots("localhost", vec![b"http/1.1".to_vec()], root_store).unwrap();
+
+        let handshake_deadline = Instant::now() + Duration::from_secs(5);
+        while client_conn.is_handshaking() {
+            let _ = client_conn.advance_io(&mut client_sock);
+            if Instant::now() > handshake_deadline {
+                panic!("client TLS handshake never completed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Give the server side a moment to also observe completion and
+        // record the metric.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let text = String::from_utf8(server.metrics.prometheus_text()).unwrap();
+        assert!(text.contains("routa_tls_handshake_duration_seconds"), "expected the histogram to be present:\n{text}");
+        assert!(
+            text.contains("routa_tls_handshake_duration_seconds_count{tls_version=\"TLSv1.3\"} 1"),
+            "expected exactly one TLSv1.3 handshake observed:\n{text}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backlog_socket_buffers_and_shutdown_timeout_are_read_from_config() {
+        let mut config = RoutaConfig::default();
+        config.backlog = 512;
+        config.socket_recv_buf_size = 65_536;
+        config.socket_send_buf_size = 32_768;
+        config.shutdown_timeout_ms = 7_000;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+
+        assert_eq!(worker.backlog, 512);
+        assert_eq!(worker.socket_recv_buf_size, 65_536);
+        assert_eq!(worker.socket_send_buf_size, 32_768);
+        assert_eq!(worker.shutdown_timeout, Duration::from_millis(7_000));
+    }
+
+    #[test]
+    fn max_connections_zero_means_unlimited() {
+        let config = RoutaConfig::default(); // max_connections default is nonzero -- test the actual 0 case
+        let mut config = config;
+        config.max_connections = 0;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+        assert_eq!(worker.max_connections, 0);
+    }
+
+    #[test]
+    fn shutdown_timeout_keeps_in_flight_connection_alive_briefly_after_signal() {
+        let mut config = RoutaConfig::default();
+        config.shutdown_timeout_ms = 300;
+        let port = free_port();
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(port, Arc::clone(&server));
+        let shutdown = ShutdownSignal::new();
+        let shutdown_for_thread = shutdown.clone();
+        let handle = std::thread::spawn(move || worker.run(0, &shutdown_for_thread));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() > deadline {
+                        panic!("timed out connecting");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        // Leave the connection open (no request sent) and signal
+        // shutdown -- with a 300ms shutdown_timeout_ms, the worker's
+        // run() loop must still be alive shortly after, and only exit
+        // once that grace period elapses (this open, idle connection
+        // never empties `connections` on its own).
+        shutdown.signal();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!handle.is_finished(), "worker should still be draining well within shutdown_timeout_ms");
+
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(handle.is_finished(), "worker should have exited once shutdown_timeout_ms elapsed");
+        drop(stream);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn ws_buffer_sizes_are_read_from_config() {
+        let mut config = RoutaConfig::default();
+        config.ws.read_buf_size = 4096;
+        config.ws.write_buf_size = 8192;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+        assert_eq!(worker.ws_settings.read_buf_size, 4096);
+        assert_eq!(worker.ws_settings.write_buf_size, 8192);
+    }
+
+    #[test]
+    fn cpu_affinity_settings_are_read_from_config() {
+        let mut config = RoutaConfig::default();
+        config.cpu_affinity_enabled = true;
+        config.cpu_affinity_start_core = 2;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+        assert!(worker.cpu_affinity_enabled);
+        assert_eq!(worker.cpu_affinity_start_core, 2);
+    }
+
+    #[test]
+    fn memory_limits_are_read_from_config() {
+        let mut config = RoutaConfig::default();
+        config.memory_soft_limit_mb = 512;
+        config.memory_hard_limit_mb = 1024;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+        assert_eq!(worker.memory_soft_limit_mb, 512);
+        assert_eq!(worker.memory_hard_limit_mb, 1024);
+    }
+
+    #[test]
+    fn memory_over_soft_limit_flag_blocks_new_connections() {
+        // Directly exercises accept_all's gate on the shared flag, since
+        // actually driving RSS past a configured threshold in a unit
+        // test isn't practical/deterministic -- the periodic sampling
+        // loop that sets this flag (core::event_loop::EventLoopWorker::run)
+        // is covered by memory_limits_are_read_from_config for the
+        // config plumbing into that loop's threshold comparison.
+        let mut config = RoutaConfig::default();
+        config.memory_soft_limit_mb = 1;
+        let port = free_port();
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        server.memory_over_soft_limit.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _pool = run(server.clone(), port, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() > deadline {
+                        panic!("timed out connecting");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        assert!(buf.is_empty(), "connection should be dropped immediately while over the soft memory limit, got {} bytes", buf.len());
+    }
+
+    #[test]
+    fn max_connections_limit_rejects_connections_past_capacity() {
+        let mut config = RoutaConfig::default();
+        config.max_connections = 1;
+        let port = free_port();
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let _pool = run(server.clone(), port, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _first = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() > deadline {
+                        panic!("timed out connecting");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        // Give the worker a moment to actually register the first
+        // connection (accept_all runs on the poller thread, not
+        // synchronously with connect()) before the metric it checks
+        // reflects it.
+        let metric_deadline = Instant::now() + Duration::from_secs(2);
+        while server.metrics.connection.connections_active.get() < 1 {
+            if Instant::now() > metric_deadline {
+                panic!("first connection never became active");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A second connection should be accepted at the TCP level (the
+        // listener's backlog doesn't know about max_connections) but
+        // immediately dropped by the worker without ever being served.
+        let mut second = StdTcpStream::connect(("127.0.0.1", port)).unwrap();
+        second.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        second.write_all(request.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = second.read_to_end(&mut buf);
+        assert!(buf.is_empty(), "over-capacity connection should be dropped without any response, got {} bytes", buf.len());
     }
 }

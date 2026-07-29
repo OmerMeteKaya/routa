@@ -703,15 +703,17 @@ fn decode_integer(data: &[u8], prefix_bits: u8) -> Result<(u64, usize), HpackErr
 /// encoding -- for short strings (many header values) the fixed
 /// per-symbol code lengths in the Huffman table don't always beat one
 /// byte per character.
-fn encode_string(out: &mut Vec<u8>, s: &str) {
-    let huffman = huffman_encode(s.as_bytes());
-    if huffman.len() < s.len() {
-        encode_integer(out, huffman.len() as u64, 7, 0x80);
-        out.extend_from_slice(&huffman);
-    } else {
-        encode_integer(out, s.len() as u64, 7, 0x00);
-        out.extend_from_slice(s.as_bytes());
+fn encode_string(out: &mut Vec<u8>, s: &str, huffman_enabled: bool) {
+    if huffman_enabled {
+        let huffman = huffman_encode(s.as_bytes());
+        if huffman.len() < s.len() {
+            encode_integer(out, huffman.len() as u64, 7, 0x80);
+            out.extend_from_slice(&huffman);
+            return;
+        }
     }
+    encode_integer(out, s.len() as u64, 7, 0x00);
+    out.extend_from_slice(s.as_bytes());
 }
 
 /// Decodes an HPACK string literal starting at `data[0]`. Returns the
@@ -751,13 +753,40 @@ fn decode_string(data: &[u8]) -> Result<(String, usize), HpackError> {
 /// those, callers hold two.
 pub struct HpackContext {
     table: DynamicTable,
+    /// Whether `encode` prefers Huffman coding for string literals
+    /// (RFC 7541 5.2 makes Huffman optional for an encoder -- disabling
+    /// it trades away compression for output that's trivially
+    /// human-readable off the wire, e.g. while debugging with a packet
+    /// capture).
+    huffman_enabled: bool,
+    /// Whether an encoder-side change to this table's own max size
+    /// (see `set_max_dynamic_table_size`) is proactively signaled to
+    /// the peer via a Dynamic Table Size Update instruction (RFC 7541
+    /// 6.3) on the next `encode` call, rather than relying solely on
+    /// the peer already knowing the new ceiling from the SETTINGS
+    /// frame that triggered it.
+    dynamic_table_update_enabled: bool,
+    pending_table_size_update: Option<usize>,
 }
 
 impl HpackContext {
     pub fn new(max_dynamic_table_size: usize) -> Self {
         HpackContext {
             table: DynamicTable::new(max_dynamic_table_size),
+            huffman_enabled: true,
+            dynamic_table_update_enabled: true,
+            pending_table_size_update: None,
         }
+    }
+
+    pub fn with_huffman_enabled(mut self, enabled: bool) -> Self {
+        self.huffman_enabled = enabled;
+        self
+    }
+
+    pub fn with_dynamic_table_update_enabled(mut self, enabled: bool) -> Self {
+        self.dynamic_table_update_enabled = enabled;
+        self
     }
 
     /// Called when THIS side's own SETTINGS_HEADER_TABLE_SIZE changes
@@ -769,6 +798,9 @@ impl HpackContext {
     pub fn set_max_dynamic_table_size(&mut self, new_size: usize) {
         self.table.set_advertised_max_size(new_size);
         let _ = self.table.set_max_size(new_size); // can't fail: new_size is now also the ceiling
+        if self.dynamic_table_update_enabled {
+            self.pending_table_size_update = Some(new_size);
+        }
     }
 
     /// Resolves a combined static+dynamic index (1-based, per RFC 7541
@@ -896,6 +928,12 @@ impl HpackContext {
     pub fn encode(&mut self, fields: &[HeaderField]) -> Vec<u8> {
         let mut out = Vec::new();
 
+        if let Some(new_size) = self.pending_table_size_update.take() {
+            // RFC 7541 6.3: a Dynamic Table Size Update, when present,
+            // must be the first thing in a header block.
+            encode_integer(&mut out, new_size as u64, 5, 0x20);
+        }
+
         for field in fields {
             if let Some(static_index) = find_exact_static_match(field) {
                 encode_integer(&mut out, static_index as u64, 7, 0x80);
@@ -909,10 +947,10 @@ impl HpackContext {
                 }
                 None => {
                     out.push(0x40);
-                    encode_string(&mut out, &field.name);
+                    encode_string(&mut out, &field.name, self.huffman_enabled);
                 }
             }
-            encode_string(&mut out, &field.value);
+            encode_string(&mut out, &field.value, self.huffman_enabled);
             self.table.insert(field.clone());
         }
 
@@ -1052,7 +1090,7 @@ mod tests {
     fn string_round_trips_with_and_without_huffman_preference() {
         for s in ["hello world", "x", "", "a-fairly-long-realistic-header-value-here"] {
             let mut out = Vec::new();
-            encode_string(&mut out, s);
+            encode_string(&mut out, s, true);
             let (decoded, consumed) = decode_string(&out).unwrap();
             assert_eq!(decoded, s);
             assert_eq!(consumed, out.len());
@@ -1119,8 +1157,8 @@ mod tests {
         let mut ctx = HpackContext::new(4096);
         let mut data = Vec::new();
         data.push(0x40); // literal with incremental indexing, new name
-        encode_string(&mut data, "x-custom");
-        encode_string(&mut data, "hello");
+        encode_string(&mut data, "x-custom", true);
+        encode_string(&mut data, "hello", true);
 
         let fields = ctx.decode(&data).unwrap();
         assert_eq!(fields, vec![field("x-custom", "hello")]);

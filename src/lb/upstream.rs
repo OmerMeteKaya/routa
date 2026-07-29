@@ -144,6 +144,16 @@ pub struct IdleConn {
     pub created_at: Instant,
     pub last_used: Instant,
     pub requests_served: u32,
+    /// `true` only for a connection that just came back from
+    /// `UpstreamNode::connect_async` and has never yet had a request
+    /// written to it -- its non-blocking TCP handshake may still be in
+    /// progress. `core::proxy::forward_http1` uses this to know
+    /// whether to bound the wait for that handshake to complete by
+    /// `LbPoolConfig::lb_pool_connect_timeout_ms` before applying the
+    /// ordinary write timeout, rather than conflating the two. Always
+    /// `false` for a connection reused from the idle pool -- see
+    /// `release_conn`, which clears it.
+    pub freshly_connected: bool,
 }
 
 // ─── UpstreamNode ───────────────────────────────────────────────────────
@@ -467,6 +477,7 @@ impl UpstreamNode {
         }
         conn.last_used = Instant::now();
         conn.requests_served += 1;
+        conn.freshly_connected = false;
         let mut idle = self.idle_conns.lock().unwrap();
         if (idle.len() as u32) < self.pool_max {
             idle.push(conn);
@@ -550,6 +561,18 @@ impl UpstreamPool {
     /// supply one.
     pub fn with_outlier_config(mut self, config: crate::lb::outlier::OutlierConfig) -> Self {
         self.outlier_config = config;
+        self
+    }
+
+    /// Replaces this pool's half-open retry interval (how long a node
+    /// with no active health check stays circuit-broken before the
+    /// next request through it is let through as a recovery trial --
+    /// see `NodeState::HalfOpen`) -- same builder-style pattern as
+    /// `with_outlier_config`, for the same reason: most of this
+    /// module's own tests don't care about this and shouldn't be
+    /// forced to supply one.
+    pub fn with_half_open_retry_after(mut self, duration: Duration) -> Self {
+        self.half_open_retry_after = duration;
         self
     }
 

@@ -309,6 +309,7 @@ pub struct LocalCache {
     config: FileCacheConfig,
     entries: HashMap<String, CacheEntry>,
     ordering: LocalOrdering,
+    evictions_total: u64,
 }
 
 impl LocalCache {
@@ -323,6 +324,7 @@ impl LocalCache {
             config,
             entries: HashMap::new(),
             ordering,
+            evictions_total: 0,
         }
     }
 
@@ -445,7 +447,12 @@ impl LocalCache {
             if let LocalOrdering::Lfu(lfu) = &mut self.ordering {
                 lfu.remove(&victim);
             }
+            self.evictions_total += 1;
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -491,6 +498,7 @@ pub struct SharedMetadataCache {
     /// structure for ordering avoids needing any unsafe/intrusive
     /// linkage to keep both in sync under concurrent access.
     order: RwLock<EvictionOrder>,
+    evictions_total: AtomicU64,
 }
 
 enum EvictionOrder {
@@ -511,7 +519,12 @@ impl SharedMetadataCache {
             config,
             table: DashMap::new(),
             order: RwLock::new(order),
+            evictions_total: AtomicU64::new(0),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
     }
 
     /// Looks up `path`'s shared metadata (not including any mapped
@@ -634,6 +647,7 @@ impl SharedMetadataCache {
             if let EvictionOrder::Lfu(lfu) = &mut *self.order.write().unwrap() {
                 lfu.remove(&victim);
             }
+            self.evictions_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -794,6 +808,23 @@ impl FileCache {
     /// regardless of mode so callers don't need to branch on it.
     pub fn worker_mmap_cache(&self) -> WorkerMmapCache {
         WorkerMmapCache::new()
+    }
+
+    /// Current number of entries held (see `CacheMetrics::entries`).
+    pub fn entry_count(&self) -> usize {
+        match &self.backend {
+            Backend::Local(local) => local.lock().unwrap().len(),
+            Backend::SharedMetadata(shared) => shared.len(),
+        }
+    }
+
+    /// Total entries evicted to make room for a new one, since this
+    /// cache was constructed (see `CacheMetrics::evictions_total`).
+    pub fn evictions_total(&self) -> u64 {
+        match &self.backend {
+            Backend::Local(local) => local.lock().unwrap().evictions_total,
+            Backend::SharedMetadata(shared) => shared.evictions_total.load(Ordering::Relaxed),
+        }
     }
 
     /// Looks up `path`. `worker_mmap` is this worker's own mapping
@@ -1112,6 +1143,51 @@ mod tests {
         assert!(cache.get("/a", &mut mmap_cache).is_some());
         assert!(cache.get("/b", &mut mmap_cache).is_none());
         assert!(cache.get("/c", &mut mmap_cache).is_some());
+    }
+
+    #[test]
+    fn entry_count_and_evictions_total_track_local_mode() {
+        let cache = FileCache::new(FileCacheConfig {
+            mode: CacheMode::Local,
+            eviction: EvictionPolicy::Lru,
+            max_entries: 2,
+            ..Default::default()
+        });
+        let now = SystemTime::now();
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.evictions_total(), 0);
+
+        cache.put("/a", PathBuf::from("/a"), 1, now);
+        cache.put("/b", PathBuf::from("/b"), 1, now);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.evictions_total(), 0);
+
+        // Over max_entries -- must evict exactly one entry to make room.
+        cache.put("/c", PathBuf::from("/c"), 1, now);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.evictions_total(), 1);
+
+        cache.put("/d", PathBuf::from("/d"), 1, now);
+        assert_eq!(cache.evictions_total(), 2);
+    }
+
+    #[test]
+    fn entry_count_and_evictions_total_track_shared_metadata_mode() {
+        let cache = FileCache::new(FileCacheConfig {
+            mode: CacheMode::SharedMetadata,
+            eviction: EvictionPolicy::Lru,
+            max_entries: 2,
+            ..Default::default()
+        });
+        let now = SystemTime::now();
+        cache.put("/a", PathBuf::from("/a"), 1, now);
+        cache.put("/b", PathBuf::from("/b"), 1, now);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.evictions_total(), 0);
+
+        cache.put("/c", PathBuf::from("/c"), 1, now);
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.evictions_total(), 1);
     }
 
     // ─── SHARED_METADATA mode ────────────────────────────────────────
