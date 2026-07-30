@@ -52,6 +52,14 @@ pub struct HttpResponse {
     /// any `Content-Length` header a caller may have set (the two are
     /// mutually exclusive per RFC 9112 6.1).
     pub chunked: bool,
+    /// Header fields for a `103 Early Hints` informational response
+    /// (RFC 8297) to send ahead of this response's own status/headers
+    /// -- lets a client start fetching resources (stylesheets,
+    /// scripts) this response's `Link` headers point to before the
+    /// full response is even ready. Empty means no early hints are
+    /// sent; a route handler populates this the same way it populates
+    /// any other header.
+    pub early_hints: Vec<(String, String)>,
 }
 
 impl HttpResponse {
@@ -63,7 +71,17 @@ impl HttpResponse {
             body: Vec::new(),
             file_body: None,
             chunked: false,
+            early_hints: Vec::new(),
         }
+    }
+
+    /// Adds one `Link` header value to this response's early hints --
+    /// call once per resource to hint (e.g. once for a stylesheet,
+    /// once for a script). No-op if `early_hints` was never populated
+    /// by anything -- a route handler that never calls this simply
+    /// sends no 103 at all.
+    pub fn add_early_hint_link(&mut self, link_value: impl Into<String>) {
+        self.early_hints.push(("Link".to_string(), link_value.into()));
     }
 
     /// Sets this response's body to be sent directly from `file`
@@ -346,6 +364,17 @@ mod tests {
         assert_eq!(resp.get_header("Content-Length"), Some("5"));
         let out = serialize_to_string(&resp);
         assert!(out.ends_with("hello"));
+    }
+
+    #[test]
+    fn add_early_hint_link_populates_early_hints_as_a_link_header() {
+        let mut resp = HttpResponse::new(200, "OK");
+        assert!(resp.early_hints.is_empty());
+        resp.add_early_hint_link("</style.css>; rel=preload; as=style");
+        resp.add_early_hint_link("</app.js>; rel=preload; as=script");
+        assert_eq!(resp.early_hints.len(), 2);
+        assert_eq!(resp.early_hints[0], ("Link".to_string(), "</style.css>; rel=preload; as=style".to_string()));
+        assert_eq!(resp.early_hints[1], ("Link".to_string(), "</app.js>; rel=preload; as=script".to_string()));
     }
 
     #[test]

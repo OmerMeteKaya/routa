@@ -384,7 +384,7 @@ impl crate::http::middleware::Middleware for GlobalHeaderRules {
 /// HTTP status codes, so every caller (this module's own middleware
 /// chain today, `core::event_loop` once it's wired in) sees identical
 /// 404/405 behavior.
-fn dispatch(router: &Router, req: &HttpRequest) -> HttpResponse {
+pub(crate) fn dispatch(router: &Router, req: &HttpRequest) -> HttpResponse {
     match router.dispatch(req) {
         crate::http::router::Dispatch::Matched { handler, params } => handler(req, &params),
         crate::http::router::Dispatch::MethodNotAllowed { allowed } => {

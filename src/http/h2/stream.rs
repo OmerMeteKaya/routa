@@ -146,6 +146,18 @@ const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const DEFAULT_HEADER_TABLE_SIZE: usize = 4096;
 const DEFAULT_INITIAL_WINDOW_SIZE: i32 = 65_535;
 const MAX_WINDOW_SIZE: i64 = (1i64 << 31) - 1;
+
+/// Hard ceiling on a single stream's assembled (still-compressed)
+/// header block size, checked as HEADERS/CONTINUATION payloads accumulate
+/// -- independent of, and enforced well before, SETTINGS_MAX_HEADER_LIST_SIZE's
+/// own check on the *decoded* header list. Without this, a peer that
+/// never sends END_HEADERS can grow a stream's header_block without
+/// bound purely by sending CONTINUATION frames, exhausting memory
+/// before decoding (and therefore the decoded-size check) ever
+/// happens. 256KiB comfortably exceeds any legitimate header block
+/// while still bounding worst-case per-stream memory to something
+/// trivial at scale.
+const MAX_HEADER_BLOCK_SIZE: usize = 256 * 1024;
 const CONNECTION_STREAM_ID: u32 = 0;
 
 // ─── Settings (RFC 9113 6.5.2) ──────────────────────────────────────────
@@ -1021,6 +1033,10 @@ impl Connection {
             .get_or_insert_with(stream_id, || Stream::new(stream_id, peer_initial_window_size, local_initial_window_size));
         stream.header_block.extend_from_slice(payload);
         stream.header_block_end_stream = end_stream;
+        if stream.header_block.len() > MAX_HEADER_BLOCK_SIZE {
+            self.conn_error(H2Error::EnhanceYourCalm, result);
+            return;
+        }
 
         if end_headers {
             self.finish_header_block(stream_id, result);
@@ -1045,6 +1061,10 @@ impl Connection {
         }
 
         stream.header_block.extend_from_slice(frame.payload);
+        if stream.header_block.len() > MAX_HEADER_BLOCK_SIZE {
+            self.conn_error(H2Error::EnhanceYourCalm, result);
+            return;
+        }
 
         if frame.header.flags & frame::FLAG_END_HEADERS != 0 {
             self.expecting_continuation_for = None;
@@ -1325,6 +1345,29 @@ impl Connection {
     /// `handle_window_update`'s caller in `core::event_loop`, which is
     /// expected to call `resume_pending` for affected streams after
     /// observing new send-window headroom).
+    /// Sends a `1xx` informational response (RFC 9110 15.2) ahead of
+    /// this stream's real response -- currently only used for `103
+    /// Early Hints` (RFC 8297), but the shape is general. Unlike
+    /// `send_response`, this never marks the stream's response as
+    /// sent (`response_headers_sent` stays false), since an
+    /// informational response doesn't consume the one real response a
+    /// stream gets -- `send_response` is still expected to follow.
+    pub fn send_informational_response(&mut self, stream_id: u32, status: u16, headers: &[HeaderField]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.streams.contains_key(&stream_id) {
+            return out;
+        }
+        let mut fields = Vec::with_capacity(headers.len() + 1);
+        fields.push(HeaderField {
+            name: ":status".to_string(),
+            value: status.to_string(),
+        });
+        fields.extend_from_slice(headers);
+        let encoded = self.encoder.encode(&fields);
+        write_header_block_frames(&mut out, stream_id, &encoded, self.peer_max_frame_size, false);
+        out
+    }
+
     pub fn send_response(
         &mut self,
         stream_id: u32,
@@ -1580,6 +1623,25 @@ mod tests {
     // ─── Response sending ───────────────────────────────────────────
 
     #[test]
+    fn early_hints_informational_response_precedes_the_real_response() {
+        let mut conn = new_conn();
+        let stream_id = send_handshake_and_request(&mut conn, "/");
+
+        let hints_out = conn.send_informational_response(stream_id, 103, &[field("link", "</style.css>; rel=preload; as=style")]);
+        let (hints_frame, _) = frame::parse_frame(&hints_out).unwrap();
+        assert_eq!(hints_frame.header.frame_type, FrameType::Headers);
+        assert_eq!(hints_frame.header.flags & frame::FLAG_END_STREAM, 0, "an informational response never ends the stream");
+
+        // The real response must still be sendable afterward -- an
+        // informational response doesn't consume the one real
+        // response a stream gets.
+        let real_out = conn.send_response(stream_id, 200, &[], b"done".to_vec());
+        assert!(!real_out.is_empty(), "the real response must still go out after an informational one");
+        let (real_frame, _) = frame::parse_frame(&real_out).unwrap();
+        assert_eq!(real_frame.header.frame_type, FrameType::Headers);
+    }
+
+    #[test]
     fn send_response_produces_headers_and_data_frames() {
         let mut conn = new_conn();
         let stream_id = send_handshake_and_request(&mut conn, "/");
@@ -1829,6 +1891,47 @@ mod tests {
     }
 
     #[test]
+    fn continuation_flood_is_rejected_before_memory_grows_unbounded() {
+        let mut conn = new_conn();
+        let mut input = Vec::new();
+        input.extend_from_slice(CONNECTION_PREFACE);
+        frame::write_settings(&mut input, &[]);
+
+        let mut headers_frame = Vec::new();
+        let header = FrameHeader {
+            length: 3,
+            frame_type: FrameType::Headers,
+            flags: 0,
+            stream_id: 1,
+        };
+        header.write(&mut headers_frame);
+        headers_frame.extend_from_slice(&[0x82, 0x87, 0x84]);
+        input.extend_from_slice(&headers_frame);
+
+        let result = conn.advance(&input);
+        assert!(!result.connection_closed, "the initial HEADERS frame alone should not trip anything");
+
+        let chunk = vec![0u8; 4096];
+        let mut closed = false;
+        for _ in 0..(MAX_HEADER_BLOCK_SIZE / chunk.len() + 4) {
+            let mut cont_frame = Vec::new();
+            let cont_header = FrameHeader {
+                length: chunk.len() as u32,
+                frame_type: FrameType::Continuation,
+                flags: 0,
+                stream_id: 1,
+            };
+            cont_header.write(&mut cont_frame);
+            cont_frame.extend_from_slice(&chunk);
+            let result = conn.advance(&cont_frame);
+            if result.connection_closed {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "connection should have been closed once the accumulated header block exceeded the size limit");
+    }
+
     fn push_promise_from_client_is_protocol_error() {
         let mut conn = new_conn();
         let mut input = Vec::new();

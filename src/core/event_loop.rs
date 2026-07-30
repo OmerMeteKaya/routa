@@ -566,6 +566,20 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                 );
 
                 let mut response = response;
+                if !response.early_hints.is_empty() {
+                    let mut early_hints_response = String::from("HTTP/1.1 103 Early Hints\r\n");
+                    for (name, value) in &response.early_hints {
+                        early_hints_response.push_str(name);
+                        early_hints_response.push_str(": ");
+                        early_hints_response.push_str(value);
+                        early_hints_response.push_str("\r\n");
+                    }
+                    early_hints_response.push_str("\r\n");
+                    let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else {
+                        unreachable!()
+                    };
+                    h1.write_buf.push(early_hints_response.as_bytes());
+                }
                 if request.method == crate::http::request::HttpMethod::Head {
                     // RFC 9110 9.3.2: a HEAD response reports the same
                     // headers a GET would (Content-Length included),
@@ -929,11 +943,20 @@ fn drive_http2(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
         let duration_secs = dispatch_start.elapsed().as_secs_f64();
         worker.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).dec();
         worker.server.metrics.record_request(&method_str, &route, response.status, duration_secs, request_body_len, response.body().len());
+        let early_hints: Vec<crate::http::h2::hpack::HeaderField> = response
+            .early_hints
+            .iter()
+            .map(|(name, value)| crate::http::h2::hpack::HeaderField { name: name.clone(), value: value.clone() })
+            .collect();
         let (status, headers, body) = split_response_for_h2(response);
 
         let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
             unreachable!()
         };
+        if !early_hints.is_empty() {
+            let hints_out = h2.inner.send_informational_response(stream_id, 103, &early_hints);
+            h2.write_buf.push(&hints_out);
+        }
         let out = h2.inner.send_response(stream_id, status, &headers, body);
         h2.write_buf.push(&out);
     }
@@ -1343,6 +1366,52 @@ mod tests {
 
         let (status, _body) = http_get(port, "/does-not-exist");
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn early_hints_103_precedes_the_real_response_over_http1() {
+        let config = RoutaConfig::default();
+        let mut server = RoutaServer::from_config(config).unwrap();
+        let mut router = crate::http::router::Router::new();
+        router.add(
+            "/hints",
+            &[crate::http::request::HttpMethod::Get],
+            |_req, _params| {
+                let mut resp = crate::http::response::HttpResponse::new(200, "OK");
+                resp.add_early_hint_link("</style.css>; rel=preload; as=style");
+                resp.set_body(b"done".to_vec());
+                resp
+            },
+        );
+        let router = Arc::new(router);
+        server.router = Arc::clone(&router);
+        server.middleware_chain = Arc::new(
+            crate::http::middleware::ChainBuilder::new().build(move |req| crate::core::server::dispatch(&router, req)),
+        );
+        let server = Arc::new(server);
+        let port = free_port();
+        let _pool = run(server, port, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+        stream.write_all(b"GET /hints HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+
+        let mut buf = Vec::new();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+
+        let hints_pos = text.find("103 Early Hints").expect("expected a 103 Early Hints status line");
+        let ok_pos = text.find("200 OK").expect("expected the real 200 response to follow");
+        assert!(hints_pos < ok_pos, "103 must arrive before the real response");
+        assert!(text.contains("Link: </style.css>; rel=preload; as=style"));
+        assert!(text.ends_with("done"));
     }
 
     #[test]
