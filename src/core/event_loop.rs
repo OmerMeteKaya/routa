@@ -61,6 +61,7 @@ pub struct EventLoopWorker {
     cpu_affinity_enabled: bool,
     cpu_affinity_start_core: usize,
     numa_aware_enabled: bool,
+    h2c_upgrade_enabled: bool,
     n_workers: usize,
     memory_soft_limit_mb: i64,
     memory_hard_limit_mb: i64,
@@ -122,6 +123,7 @@ impl EventLoopWorker {
         let cpu_affinity_enabled = server.config.cpu_affinity_enabled;
         let cpu_affinity_start_core = server.config.cpu_affinity_start_core.max(0) as usize;
         let numa_aware_enabled = server.config.numa_aware_enabled;
+        let h2c_upgrade_enabled = server.config.h2.h2c_upgrade_enabled;
         let n_workers = server.config.n_workers.max(1) as usize;
         let memory_soft_limit_mb = server.config.memory_soft_limit_mb.max(0) as i64;
         let memory_hard_limit_mb = server.config.memory_hard_limit_mb.max(0) as i64;
@@ -145,6 +147,7 @@ impl EventLoopWorker {
             cpu_affinity_start_core,
             numa_aware_enabled,
             n_workers,
+            h2c_upgrade_enabled,
             memory_soft_limit_mb,
             memory_hard_limit_mb,
         }
@@ -526,6 +529,22 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                 h1.read_buf.consume(consumed);
                 h1.request_started_at = None; // request is now fully parsed -- see the timeout sweep, which only fires while this is Some
                 h1.continue_sent = false; // ready for the next request on this (keep-alive) connection to potentially need its own 100 Continue
+
+                if worker.h2c_upgrade_enabled && crate::http::h2::is_h2c_upgrade_request(&request) {
+                    let settings_payload = crate::http::h2::decode_http2_settings_header(&request).unwrap_or_default();
+                    let mut resp = crate::http::response::HttpResponse::new(101, "Switching Protocols");
+                    resp.set_header("Connection", "Upgrade");
+                    resp.set_header("Upgrade", "h2c");
+                    queue_http1_response(connections, idx, resp);
+                    flush_transport(connections, idx)?;
+
+                    let mut h2 = crate::core::conn::Http2Connection::new(&worker.h2_settings);
+                    h2.inner.assume_preface_received();
+                    h2.inner.apply_upgrade_settings(&settings_payload);
+                    h2.write_buf.push(&h2.inner.initial_send());
+                    connections[idx].protocol = ConnectionProtocol::Http2(h2);
+                    return drive_http2(worker, connections, idx);
+                }
 
                 let is_upgrade = crate::http::ws::is_upgrade_request(&request);
                 let request_body_len = request.body.len();
@@ -1290,6 +1309,51 @@ mod tests {
 
         let (status, _body) = http_get(port, "/does-not-exist");
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn h2c_upgrade_switches_a_plaintext_connection_to_http2() {
+        let mut config = RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        let port = free_port();
+        let _pool = start_test_server(config, port);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+
+        let settings_header = "AAAAAA";
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: {settings_header}\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut status_line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut status_line).unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 101"), "expected 101 Switching Protocols, got: {status_line}");
+        loop {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        stream.write_all(&preface).unwrap();
+
+        let mut response_header = [0u8; 9];
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        std::io::Read::read_exact(&mut reader, &mut response_header).unwrap();
+        let frame_type = response_header[3];
+        assert_eq!(frame_type, 0x4, "expected a SETTINGS frame as the first bytes back over the upgraded connection");
     }
 
     #[test]

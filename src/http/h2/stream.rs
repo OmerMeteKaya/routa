@@ -432,6 +432,46 @@ impl Connection {
         self
     }
 
+    /// Marks this connection as having already exchanged its preface
+    /// through some other means -- an HTTP/1.1 `Upgrade: h2c` request
+    /// switches a connection to HTTP/2 without either side ever
+    /// sending the `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` bytes `advance`
+    /// otherwise requires up front, since the upgrade response itself
+    /// already served that purpose.
+    pub fn assume_preface_received(&mut self) {
+        self.preface_received = true;
+    }
+
+    /// Feeds an already-decoded HTTP2-Settings header payload (RFC
+    /// 9113 3.2: the base64url-decoded bytes of an `Upgrade: h2c`
+    /// request's own `HTTP2-Settings` header, i.e. one SETTINGS
+    /// frame's payload with no frame header of its own) through the
+    /// same settings-processing path a normal SETTINGS frame would --
+    /// this is how the client's initial settings for an upgraded
+    /// connection get applied, since they never arrive as an actual
+    /// framed SETTINGS frame the way a prior-knowledge connection's
+    /// would.
+    pub fn apply_upgrade_settings(&mut self, settings_payload: &[u8]) {
+        let mut result = AdvanceResult::default();
+        let synthetic_frame = Frame {
+            header: FrameHeader {
+                length: settings_payload.len() as u32,
+                frame_type: FrameType::Settings,
+                flags: 0,
+                stream_id: CONNECTION_STREAM_ID,
+            },
+            payload: settings_payload,
+        };
+        self.handle_settings(&synthetic_frame, &mut result);
+        // The resulting SETTINGS ACK belongs with whatever else this
+        // connection sends first post-upgrade (its own initial_send)
+        // rather than being lost here -- discard just the ACK bytes
+        // and let initial_send's own SETTINGS establish this side's
+        // policy; a client that already sent HTTP2-Settings isn't
+        // waiting on an ACK for it specifically before proceeding.
+        let _ = result.to_send;
+    }
+
     /// The connection preface (RFC 9113 3.4) plus our initial SETTINGS
     /// frame -- what a server sends before anything else, immediately
     /// on accepting an h2 connection (whether negotiated via ALPN or
