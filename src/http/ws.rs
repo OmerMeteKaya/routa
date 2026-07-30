@@ -720,15 +720,23 @@ fn parse_close_payload(payload: &[u8]) -> Result<(Option<u16>, String), CloseCod
     Ok((Some(code), reason))
 }
 
-/// RFC 6455 7.4: codes 1004, 1005, 1006, and 1015 describe local/internal
-/// conditions and must never actually appear on the wire; codes below
-/// 1000 or above 4999 are outside any defined range at all. This
-/// deliberately doesn't enumerate every code in the 1012-2999
-/// reserved-for-future-use range as individually invalid, so a
-/// legitimately IANA-registered future code isn't rejected just for
-/// being unrecognized today.
+/// RFC 6455 7.4.1/7.4.2: the 1000-2999 range is reserved for this
+/// protocol's own definitions, so only the specific codes the RFC
+/// itself defines are valid there -- an unrecognized code in that
+/// range (even one that looks plausible) is a protocol violation, not
+/// a forward-compatible extension point, since claiming a code the
+/// protocol hasn't actually assigned would be indistinguishable from
+/// simply making one up. 1004/1005/1006/1015 are explicitly reserved
+/// and must never appear on the wire even though they fall in a
+/// range that otherwise contains valid codes. 3000-3999 (library/
+/// framework use) and 4000-4999 (private/application use) are both
+/// wide open by design -- any value in either is valid.
 fn is_valid_close_code(code: u16) -> bool {
-    !matches!(code, 1004 | 1005 | 1006 | 1015) && (1000..=4999).contains(&code)
+    match code {
+        1000..=1003 | 1007..=1011 => true,
+        3000..=4999 => true,
+        _ => false,
+    }
 }
 
 impl WsConnection {

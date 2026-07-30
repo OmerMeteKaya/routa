@@ -632,11 +632,17 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                     };
                     let upgrade_path = request.path.clone();
                     queue_http1_response(connections, idx, response);
+                    // The 101 response was just queued into this
+                    // connection's Http1 write_buf -- flushed here,
+                    // before the protocol switch below replaces the
+                    // Http1 state (and its write_buf) with a fresh
+                    // WsConnection, since nothing carries pending
+                    // bytes across that replacement otherwise.
+                    flush_transport(connections, idx)?;
                     connections[idx].protocol = ConnectionProtocol::WebSocket(
                         WsConnection::with_settings(pmd, &worker.ws_settings).with_upgrade_path(upgrade_path),
                     );
                     worker.server.ws_active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    flush_transport(connections, idx)?;
                     return Ok(());
                 }
 
@@ -2060,6 +2066,57 @@ mod tests {
         let idx = entry.key();
         entry.insert(conn);
         (idx, client)
+    }
+
+    #[test]
+    fn real_http1_upgrade_handshake_reaches_the_client_over_a_real_tcp_socket() {
+        // Exercises the actual HTTP/1.1 Upgrade path end to end (a
+        // route handler returning 101, drive_http1 switching the
+        // connection's protocol) rather than
+        // insert_test_ws_connection's shortcut of constructing an
+        // already-WebSocket connection directly -- the two exercise
+        // different code, and only this one proves the 101 response
+        // itself actually reaches the client before the connection's
+        // protocol state is replaced.
+        let mut config = RoutaConfig::default();
+        config.ws.enabled = true;
+        let mut server = RoutaServer::from_config(config).unwrap();
+        let mut router = crate::http::router::Router::new();
+        router.add("/ws", &[crate::http::request::HttpMethod::Get], |req, _params| {
+            crate::http::ws::build_handshake_response(req, None)
+        });
+        router.add_websocket_route("/ws", |msg| Some(msg.clone()));
+        let router = Arc::new(router);
+        server.router = Arc::clone(&router);
+        server.middleware_chain = Arc::new(crate::http::middleware::ChainBuilder::new().build(move |req| {
+            match router.dispatch(req) {
+                crate::http::router::Dispatch::Matched { handler, params } => handler(req, &params),
+                crate::http::router::Dispatch::MethodNotAllowed { .. } => crate::http::response::HttpResponse::new(405, "Method Not Allowed"),
+                crate::http::router::Dispatch::NotFound => crate::http::response::HttpResponse::new(404, "Not Found"),
+            }
+        }));
+        let server = Arc::new(server);
+        let port = free_port();
+        let _pool = run(server, port, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let request = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).expect("the 101 handshake response must reach the client");
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.starts_with("HTTP/1.1 101"), "expected a 101 response, got: {response}");
+        assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
     }
 
     #[test]
