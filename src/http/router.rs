@@ -166,14 +166,55 @@ pub enum Dispatch<'a> {
     NotFound,
 }
 
+/// A WebSocket message handler -- called once per received
+/// application (text/binary) message, returning the message (if any)
+/// to send back. Kept separate from `RouteHandler` since a WS
+/// connection's lifetime spans many messages rather than one
+/// request/response pair, so a WS handler's shape is "one message
+/// in, zero-or-one messages out" rather than "one request in, one
+/// response out".
+pub type WsMessageHandler = Box<dyn Fn(&crate::http::ws::WsMessage) -> Option<crate::http::ws::WsMessage> + Send + Sync>;
+
+struct WsRoute {
+    pattern: Pattern,
+    handler: WsMessageHandler,
+}
+
 #[derive(Default)]
 pub struct Router {
     routes: Vec<Route>,
+    ws_routes: Vec<WsRoute>,
 }
 
 impl Router {
     pub fn new() -> Self {
-        Router { routes: Vec::new() }
+        Router { routes: Vec::new(), ws_routes: Vec::new() }
+    }
+
+    /// Registers a WebSocket message handler for `path` -- matched the
+    /// same way `add`'s HTTP routes are (see `Pattern`), but against
+    /// the path the client originally upgraded on, checked once per
+    /// received application message for the connection's lifetime
+    /// rather than once per request. Every WS upgrade is a GET
+    /// request (RFC 6455 4.1), so unlike `add` there's no method list
+    /// to match against.
+    pub fn add_websocket_route(
+        &mut self,
+        path: &str,
+        handler: impl Fn(&crate::http::ws::WsMessage) -> Option<crate::http::ws::WsMessage> + Send + Sync + 'static,
+    ) {
+        self.ws_routes.push(WsRoute {
+            pattern: Pattern::compile(path),
+            handler: Box::new(handler),
+        });
+    }
+
+    /// Finds the message handler registered for `path`, if any --
+    /// `core::event_loop` calls this once when a connection completes
+    /// its WS upgrade (not per message), and holds onto the resulting
+    /// reference for that connection's lifetime.
+    pub fn dispatch_websocket(&self, path: &str) -> Option<&WsMessageHandler> {
+        self.ws_routes.iter().find(|route| route.pattern.matches(path).is_some()).map(|route| &route.handler)
     }
 
     /// Registers a route. `path` may contain `:name` parameter

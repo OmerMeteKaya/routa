@@ -234,6 +234,7 @@ pub struct WsSettings {
     pub max_message_size: u64,
     pub require_masking: bool,
     pub compression_level: u32,
+    pub compression_threshold: usize,
     pub write_queue_max_bytes: u64,
     pub idle_timeout: Option<std::time::Duration>,
     pub ping_interval: std::time::Duration,
@@ -250,6 +251,15 @@ pub struct WsSettings {
 pub struct WsConnection {
     pub inner: crate::http::ws::WsConnection,
     pub write_buf: Buf,
+    /// The path this connection originally upgraded on -- looked back
+    /// up against `Router::dispatch_websocket` for every received
+    /// message, rather than resolving and caching a handler reference
+    /// once, since a request-scoped router lookup is already cheap
+    /// (a linear scan over however many WS routes exist, typically
+    /// few) and keeping just the path avoids this struct needing a
+    /// lifetime or an `Arc` cycle back into the router that registered
+    /// it.
+    pub upgrade_path: String,
     /// `WsSettings::write_queue_max_bytes` for the connection this
     /// belongs to -- `core::event_loop` checks `write_buf`'s length
     /// against this after every push to enforce
@@ -272,7 +282,13 @@ impl WsConnection {
             last_pong_at: Instant::now(),
             last_ping_sent: None,
             ping_misses: 0,
+            upgrade_path: String::new(),
         }
+    }
+
+    pub fn with_upgrade_path(mut self, path: String) -> Self {
+        self.upgrade_path = path;
+        self
     }
 
     pub fn with_settings(pmd: Option<crate::http::ws::PmdContext>, settings: &WsSettings) -> Self {
@@ -289,6 +305,7 @@ impl WsConnection {
             last_pong_at: Instant::now(),
             last_ping_sent: None,
             ping_misses: 0,
+            upgrade_path: String::new(),
         }
     }
 }

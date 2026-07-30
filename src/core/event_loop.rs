@@ -96,6 +96,7 @@ impl EventLoopWorker {
             max_message_size: ws.max_message_size,
             require_masking: ws.require_masking,
             compression_level: ws.compression_level.clamp(0, 9) as u32,
+            compression_threshold: ws.compression_threshold.max(0) as usize,
             write_queue_max_bytes: if ws.write_queue_max > 0 {
                 ws.write_buf_size.max(1).saturating_mul(ws.write_queue_max.max(0) as u64)
             } else {
@@ -378,7 +379,7 @@ fn handle_connection_event(
         ConnectionProtocol::Handshaking => Ok(()), // TLS handshake still in progress (plaintext connections never linger here)
         ConnectionProtocol::Http1(_) => drive_http1(worker, connections, idx),
         ConnectionProtocol::Http2(_) => drive_http2(worker, connections, idx),
-        ConnectionProtocol::WebSocket(_) => drive_websocket(connections, idx),
+        ConnectionProtocol::WebSocket(_) => drive_websocket(worker, connections, idx),
     };
 
     if result.is_err() || connections[idx].closing {
@@ -596,8 +597,11 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                     } else {
                         None
                     };
+                    let upgrade_path = request.path.clone();
                     queue_http1_response(connections, idx, response);
-                    connections[idx].protocol = ConnectionProtocol::WebSocket(WsConnection::with_settings(pmd, &worker.ws_settings));
+                    connections[idx].protocol = ConnectionProtocol::WebSocket(
+                        WsConnection::with_settings(pmd, &worker.ws_settings).with_upgrade_path(upgrade_path),
+                    );
                     worker.server.ws_active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     flush_transport(connections, idx)?;
                     return Ok(());
@@ -1029,7 +1033,7 @@ fn split_response_for_h2(response: crate::http::response::HttpResponse) -> (u16,
 /// job ends at the `101` upgrade response); a future addition wiring
 /// a per-route WS handler would consume `advance_result.events` here
 /// instead of this function currently discarding them.
-fn drive_websocket(connections: &mut Slab<Connection>, idx: usize) -> std::io::Result<()> {
+fn drive_websocket(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx: usize) -> std::io::Result<()> {
     let incoming = read_transport_bytes(connections, idx)?;
 
     let advance_result = {
@@ -1039,11 +1043,41 @@ fn drive_websocket(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
         ws.inner.advance(&incoming)
     };
 
+    let upgrade_path = {
+        let ConnectionProtocol::WebSocket(ws) = &connections[idx].protocol else {
+            unreachable!()
+        };
+        ws.upgrade_path.clone()
+    };
+    // Each received application message is looked up against the
+    // registered WS routes and handed to whatever matched -- a
+    // connection with no matching route simply has its messages go
+    // unanswered rather than the connection being torn down, since
+    // receiving messages nobody asked for isn't itself a protocol
+    // violation.
+    let mut outgoing_messages = Vec::new();
+    for event in &advance_result.events {
+        if let crate::http::ws::WsEvent::Message(msg) = event {
+            if let Some(handler) = worker.server.router.dispatch_websocket(&upgrade_path) {
+                if let Some(reply) = handler(msg) {
+                    outgoing_messages.push(reply);
+                }
+            }
+        }
+    }
+
     {
         let ConnectionProtocol::WebSocket(ws) = &mut connections[idx].protocol else {
             unreachable!()
         };
         ws.write_buf.push(&advance_result.to_send);
+        for reply in outgoing_messages {
+            let framed = match reply {
+                crate::http::ws::WsMessage::Text(text) => ws.inner.send_text(&text, worker.ws_settings.compression_threshold),
+                crate::http::ws::WsMessage::Binary(data) => ws.inner.send_binary(&data, worker.ws_settings.compression_threshold),
+            };
+            ws.write_buf.push(&framed);
+        }
         if advance_result.pong_received {
             ws.last_pong_at = Instant::now();
             ws.last_ping_sent = None;
@@ -1479,6 +1513,47 @@ mod tests {
     }
 
     #[test]
+    fn ws_message_handler_registered_on_router_receives_and_replies_to_a_real_message() {
+        let config = RoutaConfig::default();
+        let mut server = RoutaServer::from_config(config).unwrap();
+        // The router built inside from_config is already shared with
+        // the middleware chain's dispatch closure by this point, so
+        // it can't be mutated through server.router directly (its
+        // strong count is already > 1) -- build a fresh Router with
+        // the same WS route instead and swap it in before anything
+        // else gets a chance to clone the Arc.
+        let mut router = crate::http::router::Router::new();
+        router.add_websocket_route("/echo", |msg| match msg {
+            crate::http::ws::WsMessage::Text(text) => Some(crate::http::ws::WsMessage::Text(format!("echo:{text}"))),
+            crate::http::ws::WsMessage::Binary(data) => Some(crate::http::ws::WsMessage::Binary(data.clone())),
+        });
+        server.router = Arc::new(router);
+        let server = Arc::new(server);
+        let worker = EventLoopWorker::new(free_port(), Arc::clone(&server));
+
+        let mut poller = MioPoller::new(16).unwrap();
+        let mut connections: Slab<Connection> = Slab::new();
+        let mut ws = crate::core::conn::WsConnection::with_settings(None, &worker.ws_settings);
+        ws.upgrade_path = "/echo".to_string();
+        let (idx, mut client) = insert_test_ws_connection(&mut poller, &mut connections, ws);
+
+        // A masked text frame carrying "hi" -- client-to-server frames
+        // must be masked per RFC 6455 5.1.
+        let mut frame = vec![0x81u8, 0x82, 0x00, 0x00, 0x00, 0x00];
+        frame.extend_from_slice(b"hi");
+        client.write_all(&frame).unwrap();
+
+        drive_websocket(&worker, &mut connections, idx).unwrap();
+
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut response = [0u8; 32];
+        let n = client.read(&mut response).unwrap();
+        let payload_len = (response[1] & 0x7f) as usize;
+        let payload = &response[2..2 + payload_len];
+        assert_eq!(payload, b"echo:hi", "handler's reply should have reached the real client socket, got {} bytes", n);
+    }
+
+    #[test]
     fn ping_sweep_sends_ping_after_interval() {
         let mut config = RoutaConfig::default();
         config.ws.ping_interval_ms = 50;
@@ -1571,7 +1646,7 @@ mod tests {
             ws.write_buf.push(&[0u8; 100]);
             assert!(ws.write_buf.as_slice().len() as u64 > ws.write_queue_max_bytes);
         }
-        let _ = drive_websocket(&mut connections, idx);
+        let _ = drive_websocket(&worker, &mut connections, idx);
         assert!(connections[idx].closing, "backpressure should mark the connection for closing");
     }
 
