@@ -89,6 +89,7 @@ impl EventLoopWorker {
             stream_timeout: Duration::from_millis(h2.stream_timeout_ms.max(0) as u64),
             keepalive_timeout: Duration::from_millis(h2.keepalive_timeout_ms.max(0) as u64),
             stream_lookup: h2.stream_lookup,
+            connect_protocol_enabled: h2.enabled && server.config.ws.enabled,
         };
         let ws = &server.config.ws;
         let ws_settings = WsSettings {
@@ -979,6 +980,90 @@ fn drive_http2(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
         h2.write_buf.push(&out);
     }
 
+    // RFC 8441 Extended CONNECT: each candidate is looked up against
+    // the same registered WS routes the HTTP/1.1 upgrade path uses
+    // (`Router::dispatch_websocket`) -- this lookup, and the
+    // WsConfig::enabled/max_connections gate below it, can only happen
+    // here rather than inside `http::h2::stream`, since that module has
+    // no access to a `Router` or to `worker`'s shared WS accounting.
+    for stream_id in advance_result.new_ws_tunnel_streams {
+        let path = {
+            let ConnectionProtocol::Http2(h2) = &connections[idx].protocol else {
+                unreachable!()
+            };
+            h2.inner.stream_path(stream_id).map(|p| p.to_string())
+        };
+        let Some(path) = path else { continue };
+        let route_matched = worker.server.router.dispatch_websocket(&path).is_some();
+        let over_capacity = worker.server.ws_active_connections.load(std::sync::atomic::Ordering::Relaxed) >= worker.ws_max_connections;
+
+        let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
+            unreachable!()
+        };
+        if !route_matched {
+            // Same "unmatched path" response an ordinary request gets
+            // (see `core::server::dispatch`'s `Dispatch::NotFound` arm)
+            // -- Extended CONNECT is matched by path against the WS
+            // route table exactly like a normal request is matched
+            // against the regular route table, so an unmatched path
+            // means the same thing either way.
+            let out = h2.inner.reject_ws_tunnel(stream_id, 404, b"Not Found\n".to_vec());
+            h2.write_buf.push(&out);
+            continue;
+        }
+        if !worker.ws_enabled || over_capacity {
+            let out = h2.inner.reject_ws_tunnel(stream_id, 503, b"WebSocket unavailable\n".to_vec());
+            h2.write_buf.push(&out);
+            continue;
+        }
+
+        let pmd = if worker.ws_permessage_deflate {
+            let ext_header = h2.inner.stream_header(stream_id, "sec-websocket-extensions");
+            crate::http::ws::negotiate_pmd(ext_header)
+        } else {
+            None
+        };
+        let accept_headers: Vec<crate::http::h2::hpack::HeaderField> = pmd
+            .as_ref()
+            .map(|params| {
+                vec![crate::http::h2::hpack::HeaderField {
+                    name: "sec-websocket-extensions".to_string(),
+                    value: crate::http::ws::pmd_response_extension_header(params),
+                }]
+            })
+            .unwrap_or_default();
+        let pmd_context = pmd.map(|params| crate::http::ws::PmdContext::with_compression_level(params, worker.ws_settings.compression_level));
+        let ws_tunnel = crate::http::ws::WsConnection::with_read_buf_capacity(
+            pmd_context,
+            worker.ws_settings.max_message_size as usize,
+            worker.ws_settings.max_frame_size,
+            worker.ws_settings.require_masking,
+            worker.ws_settings.read_buf_size,
+        );
+        let (out, buffered_input) = h2.inner.accept_ws_tunnel(stream_id, ws_tunnel, &accept_headers);
+        h2.write_buf.push(&out);
+        worker.server.ws_active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !buffered_input.is_empty() {
+            drive_ws_tunnel_input(worker, connections, idx, stream_id, buffered_input);
+        }
+    }
+
+    let ws_tunnel_streams_with_input = {
+        let ConnectionProtocol::Http2(h2) = &connections[idx].protocol else {
+            unreachable!()
+        };
+        h2.inner.ws_tunnel_streams_with_input()
+    };
+    for stream_id in ws_tunnel_streams_with_input {
+        let input = {
+            let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
+                unreachable!()
+            };
+            h2.inner.take_ws_tunnel_input(stream_id)
+        };
+        drive_ws_tunnel_input(worker, connections, idx, stream_id, input);
+    }
+
     if advance_result.connection_closed {
         connections[idx].closing = true;
     }
@@ -986,6 +1071,82 @@ fn drive_http2(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
     flush_transport(connections, idx)?;
     let _ = worker;
     Ok(())
+}
+
+/// Feeds newly-arrived bytes on a WS-tunnel H2 stream through its
+/// `WsConnection`, dispatches any resulting application messages to the
+/// same `Router::dispatch_websocket` handler `drive_websocket` uses for
+/// the HTTP/1.1 upgrade path, and queues whatever needs to go back out
+/// (auto PONGs/close-echoes plus any framed reply) as H2 DATA on the
+/// same stream -- respecting its own flow control via
+/// `queue_ws_tunnel_data`. Tears the tunnel down (`finish_ws_tunnel`,
+/// decrementing `ws_active_connections`) once the WebSocket
+/// connection's own close handshake has completed on both sides.
+fn drive_ws_tunnel_input(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx: usize, stream_id: u32, input: Vec<u8>) {
+    if input.is_empty() {
+        return;
+    }
+    let path = {
+        let ConnectionProtocol::Http2(h2) = &connections[idx].protocol else {
+            unreachable!()
+        };
+        h2.inner.stream_path(stream_id).map(|p| p.to_string())
+    };
+
+    let (advance_result, is_closed) = {
+        let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
+            unreachable!()
+        };
+        let Some(ws) = h2.inner.ws_tunnel_mut(stream_id) else {
+            return;
+        };
+        let advance_result = ws.advance(&input);
+        let is_closed = ws.is_closed();
+        (advance_result, is_closed)
+    };
+
+    // Each received application message is looked up against the
+    // registered WS routes and handed to whatever matched -- same
+    // "unanswered, not torn down" behavior as `drive_websocket` for a
+    // tunnel with no matching handler (there always is one here, since
+    // `new_ws_tunnel_streams` handling above already rejected any path
+    // without a match before ever calling `accept_ws_tunnel`, but the
+    // lookup is repeated per-message rather than cached for the same
+    // reason `drive_websocket` repeats it: a request-scoped lookup is
+    // already cheap, and avoids this function needing to carry a
+    // handler reference across calls).
+    let mut outgoing = advance_result.to_send;
+    for event in &advance_result.events {
+        if let crate::http::ws::WsEvent::Message(msg) = event {
+            let Some(path) = &path else { continue };
+            let reply = worker.server.router.dispatch_websocket(path).and_then(|handler| handler(msg));
+            if let Some(reply) = reply {
+                let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
+                    unreachable!()
+                };
+                let Some(ws) = h2.inner.ws_tunnel_mut(stream_id) else {
+                    continue;
+                };
+                let framed = match reply {
+                    crate::http::ws::WsMessage::Text(text) => ws.send_text(&text, worker.ws_settings.compression_threshold),
+                    crate::http::ws::WsMessage::Binary(data) => ws.send_binary(&data, worker.ws_settings.compression_threshold),
+                };
+                outgoing.extend(framed);
+            }
+        }
+    }
+
+    let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else {
+        unreachable!()
+    };
+    let out = h2.inner.queue_ws_tunnel_data(stream_id, outgoing);
+    h2.write_buf.push(&out);
+
+    if is_closed {
+        let out = h2.inner.finish_ws_tunnel(stream_id);
+        h2.write_buf.push(&out);
+        worker.server.ws_active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Builds an `HttpRequest` from an H2 stream's decoded pseudo-headers
@@ -1528,6 +1689,257 @@ mod tests {
         assert_eq!(frame_type, 0x4, "expected a SETTINGS frame as the first bytes back over the upgraded connection");
     }
 
+    /// Reads exactly one H2 frame (header + payload) off `reader` --
+    /// the test-side equivalent of `frame::parse_frame`, but reading
+    /// from a live socket a byte at a time instead of an
+    /// already-buffered slice.
+    fn read_one_h2_frame(reader: &mut impl std::io::BufRead) -> (u8, u8, Vec<u8>) {
+        let mut header = [0u8; 9];
+        std::io::Read::read_exact(reader, &mut header).unwrap();
+        let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+        let frame_type = header[3];
+        let flags = header[4];
+        let mut payload = vec![0u8; len];
+        std::io::Read::read_exact(reader, &mut payload).unwrap();
+        (frame_type, flags, payload)
+    }
+
+    /// Reads frames until a HEADERS frame (type `0x1`) arrives,
+    /// skipping anything else (a SETTINGS ACK for the client's own
+    /// preface SETTINGS frame, WINDOW_UPDATEs, etc.) -- returns the
+    /// decoded `:status` value and whether END_STREAM was set.
+    fn read_h2_status_headers(reader: &mut impl std::io::BufRead, decoder: &mut crate::http::h2::hpack::HpackContext) -> (String, bool) {
+        let (status, end_stream, _fields) = read_h2_response_headers(reader, decoder);
+        (status, end_stream)
+    }
+
+    /// Same as `read_h2_status_headers`, but also returns every
+    /// decoded header field -- for callers that need to inspect
+    /// something beyond `:status` (e.g. a negotiated
+    /// `sec-websocket-extensions` value).
+    fn read_h2_response_headers(
+        reader: &mut impl std::io::BufRead,
+        decoder: &mut crate::http::h2::hpack::HpackContext,
+    ) -> (String, bool, Vec<crate::http::h2::hpack::HeaderField>) {
+        loop {
+            let (frame_type, flags, payload) = read_one_h2_frame(reader);
+            if frame_type != 0x1 {
+                continue;
+            }
+            let fields = decoder.decode(&payload).unwrap();
+            let status = fields.iter().find(|h| h.name == ":status").unwrap().value.clone();
+            return (status, flags & 0x1 != 0, fields);
+        }
+    }
+
+    /// Reads frames until a DATA frame (type `0x0`) arrives, skipping
+    /// anything else -- returns its payload.
+    fn read_h2_data_payload(reader: &mut impl std::io::BufRead) -> Vec<u8> {
+        loop {
+            let (frame_type, _flags, payload) = read_one_h2_frame(reader);
+            if frame_type != 0x0 {
+                continue;
+            }
+            return payload;
+        }
+    }
+
+    /// A minimal masked client-to-server WebSocket TEXT frame (RFC
+    /// 6455 5.2) carrying `text` -- small-payload-only (no extended
+    /// length), which is all this test needs.
+    fn build_masked_ws_text_frame(text: &str) -> Vec<u8> {
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126);
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        let masked: Vec<u8> = payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]).collect();
+        let mut frame = vec![0x81u8, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend_from_slice(&masked);
+        frame
+    }
+
+    /// Parses a minimal unmasked server-to-client WebSocket frame (RFC
+    /// 6455 5.2: a server must never mask its own frames) -- returns
+    /// its opcode and payload. Small-payload-only, same limitation as
+    /// `build_masked_ws_text_frame`.
+    fn parse_unmasked_ws_frame(data: &[u8]) -> (u8, Vec<u8>) {
+        let opcode = data[0] & 0x0f;
+        assert_eq!(data[1] & 0x80, 0, "a server must never mask its own WebSocket frames");
+        let len = (data[1] & 0x7f) as usize;
+        (opcode, data[2..2 + len].to_vec())
+    }
+
+    #[test]
+    fn extended_connect_websocket_tunnel_end_to_end_over_real_tcp() {
+        let mut config = RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        config.ws.enabled = true;
+        let mut server = RoutaServer::from_config(config).unwrap();
+        let mut router = crate::http::router::Router::new();
+        router.add_websocket_route("/ws", |msg| match msg {
+            crate::http::ws::WsMessage::Text(text) if text == "ping" => Some(crate::http::ws::WsMessage::Text("pong".to_string())),
+            _ => None,
+        });
+        server.router = Arc::new(router);
+        let server = Arc::new(server);
+        let port = free_port();
+        let _pool = run(server, port, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        // h2c upgrade dance -- same as
+        // `h2c_upgrade_switches_a_plaintext_connection_to_http2`.
+        // An empty HTTP2-Settings value base64url-decodes to zero
+        // bytes -- a validly-shaped (empty) SETTINGS payload. Unlike
+        // the placeholder "AAAAAA" used elsewhere in this test module,
+        // which decodes to 4 bytes (not a multiple of 6) and silently
+        // poisons the connection's error state via
+        // `apply_upgrade_settings`, this test continues the exchange
+        // far enough afterward that such poisoning would be observed.
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: \r\n\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut status_line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut status_line).unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 101"));
+        loop {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+
+        // `assume_preface_received` (used by the h2c-upgrade path this
+        // test drives through) means the server does not expect the
+        // client to resend the literal "PRI * HTTP/2.0..." connection
+        // preface on this connection -- the HTTP/1.1 request that
+        // upgraded it already served that purpose. Only the client's
+        // own (empty) SETTINGS frame follows.
+        stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).unwrap();
+
+        // The server's initial SETTINGS frame must advertise
+        // SETTINGS_ENABLE_CONNECT_PROTOCOL now that both h2 and ws are
+        // enabled.
+        let (frame_type, _flags, settings_payload) = read_one_h2_frame(&mut reader);
+        assert_eq!(frame_type, 0x4, "expected a SETTINGS frame");
+        let has_connect_setting = settings_payload.chunks_exact(6).any(|c| u16::from_be_bytes([c[0], c[1]]) == 0x8);
+        assert!(has_connect_setting, "server must advertise SETTINGS_ENABLE_CONNECT_PROTOCOL");
+
+        // A real Extended CONNECT request for the registered WS route.
+        let mut client_encoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let hf = |name: &str, value: &str| crate::http::h2::hpack::HeaderField {
+            name: name.to_string(),
+            value: value.to_string(),
+        };
+        let header_block = client_encoder.encode(&[
+            hf(":method", "CONNECT"),
+            hf(":protocol", "websocket"),
+            hf(":scheme", "http"),
+            hf(":path", "/ws"),
+            hf(":authority", "localhost"),
+        ]);
+        let mut headers_frame = Vec::new();
+        crate::http::h2::frame::write_headers(&mut headers_frame, 1, &header_block, false, true);
+        stream.write_all(&headers_frame).unwrap();
+
+        let mut server_decoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let (status, end_stream) = read_h2_status_headers(&mut reader, &mut server_decoder);
+        assert_eq!(status, "200");
+        assert!(!end_stream, "an accepted WS tunnel's 200 response must not end the stream");
+
+        // A real WebSocket TEXT frame, sent as H2 DATA on the tunnel.
+        let ws_frame = build_masked_ws_text_frame("ping");
+        let mut data_frame = Vec::new();
+        crate::http::h2::frame::write_data(&mut data_frame, 1, &ws_frame, false);
+        stream.write_all(&data_frame).unwrap();
+
+        // The registered handler's reply ("pong"), framed by the real
+        // `WsConnection` and carried back as H2 DATA on the same
+        // stream.
+        let reply_payload = read_h2_data_payload(&mut reader);
+        let (opcode, payload) = parse_unmasked_ws_frame(&reply_payload);
+        assert_eq!(opcode, 0x1, "expected a text frame");
+        assert_eq!(payload, b"pong");
+    }
+
+    #[test]
+    fn extended_connect_negotiates_permessage_deflate_from_the_request_header() {
+        let mut config = RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        config.ws.enabled = true;
+        config.ws.permessage_deflate = true;
+        let mut server = RoutaServer::from_config(config).unwrap();
+        let mut router = crate::http::router::Router::new();
+        router.add_websocket_route("/ws", |_msg| None);
+        server.router = Arc::new(router);
+        let server = Arc::new(server);
+        let port = free_port();
+        let _pool = run(server, port, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: \r\n\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut status_line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut status_line).unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 101"));
+        loop {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).unwrap();
+        let (frame_type, _flags, _settings_payload) = read_one_h2_frame(&mut reader);
+        assert_eq!(frame_type, 0x4, "expected a SETTINGS frame");
+
+        let mut client_encoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let hf = |name: &str, value: &str| crate::http::h2::hpack::HeaderField {
+            name: name.to_string(),
+            value: value.to_string(),
+        };
+        let header_block = client_encoder.encode(&[
+            hf(":method", "CONNECT"),
+            hf(":protocol", "websocket"),
+            hf(":scheme", "http"),
+            hf(":path", "/ws"),
+            hf(":authority", "localhost"),
+            hf("sec-websocket-extensions", "permessage-deflate; client_no_context_takeover"),
+        ]);
+        let mut headers_frame = Vec::new();
+        crate::http::h2::frame::write_headers(&mut headers_frame, 1, &header_block, false, true);
+        stream.write_all(&headers_frame).unwrap();
+
+        let mut server_decoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let (status, end_stream, fields) = read_h2_response_headers(&mut reader, &mut server_decoder);
+        assert_eq!(status, "200");
+        assert!(!end_stream);
+        let ext = fields
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("sec-websocket-extensions"))
+            .expect("server should have accepted permessage-deflate and echoed the extension header");
+        assert!(ext.value.contains("permessage-deflate"));
+    }
     #[test]
     fn keep_alive_connection_serves_multiple_requests() {
         let dir = std::env::temp_dir().join(format!(

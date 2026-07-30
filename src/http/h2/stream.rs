@@ -168,6 +168,10 @@ const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
 const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
+/// RFC 8441 3: a server sends this (value 1) to tell clients it
+/// supports the Extended CONNECT method -- the mechanism WebSocket
+/// (and other protocols) tunnel over an HTTP/2 stream through.
+const SETTINGS_ENABLE_CONNECT_PROTOCOL: u16 = 0x8;
 
 // ─── Error codes (RFC 9113 7) ───────────────────────────────────────────
 
@@ -243,6 +247,14 @@ pub enum StreamPhase {
     /// Client sent END_STREAM -- request is fully received, dispatched
     /// to the router, response streaming out.
     HalfClosedRemote,
+    /// An accepted RFC 8441 Extended CONNECT request -- this stream's
+    /// DATA frames carry WebSocket frames in both directions instead
+    /// of an HTTP request/response body, and the stream stays open
+    /// indefinitely (independent of END_STREAM) until the WebSocket
+    /// connection's own close handshake finishes (see
+    /// `Connection::finish_ws_tunnel`). Set once by
+    /// `Connection::accept_ws_tunnel`, never left by any other path.
+    WsTunnel,
     Closed,
 }
 
@@ -273,6 +285,7 @@ pub struct Stream {
     /// trailers arrive after the body and are exempt from the
     /// pseudo-header validation regular request headers require.
     pub trailers: Vec<HeaderField>,
+    pub ws_tunnel: Option<crate::http::ws::WsConnection>,
 }
 
 impl Stream {
@@ -290,6 +303,7 @@ impl Stream {
             pending_response: PendingBody::None,
             response_headers_sent: false,
             trailers: Vec::new(),
+            ws_tunnel: None,
         }
     }
 }
@@ -313,6 +327,17 @@ pub struct AdvanceResult {
     /// (END_STREAM on the request side) and are ready to be dispatched
     /// to a router -- see `Connection::take_ready_streams`.
     pub newly_ready_streams: Vec<u32>,
+    /// Stream ids that just became a candidate RFC 8441 Extended
+    /// CONNECT WebSocket tunnel (`:method: CONNECT` + `:protocol:
+    /// websocket`, accepted per `SETTINGS_ENABLE_CONNECT_PROTOCOL`) --
+    /// unlike `newly_ready_streams`, this fires as soon as the request
+    /// headers are seen, without waiting for END_STREAM, since the
+    /// tunnel's response starts flowing independent of when (or
+    /// whether) the client ever ends its side of the stream. A caller
+    /// looks each of these up against its registered WS routes (this
+    /// module has no `Router` of its own to do that lookup itself) and
+    /// either `accept_ws_tunnel`s or `reject_ws_tunnel`s it.
+    pub new_ws_tunnel_streams: Vec<u32>,
 }
 
 pub struct Connection {
@@ -342,6 +367,10 @@ pub struct Connection {
     pub local_max_header_list_size: u32,
     local_header_table_size: usize,
     local_enable_push: bool,
+    /// Whether this connection advertises RFC 8441 Extended CONNECT
+    /// support (SETTINGS_ENABLE_CONNECT_PROTOCOL) and accepts it on
+    /// incoming streams -- see `with_connect_protocol_enabled`.
+    local_enable_connect_protocol: bool,
 
     settings_ack_pending: bool,
 
@@ -383,6 +412,7 @@ impl Connection {
             local_max_header_list_size: 0,
             local_header_table_size,
             local_enable_push: true,
+            local_enable_connect_protocol: false,
             settings_ack_pending: false,
             send_window: i64::from(DEFAULT_INITIAL_WINDOW_SIZE),
             recv_window: i64::from(DEFAULT_INITIAL_WINDOW_SIZE),
@@ -431,6 +461,13 @@ impl Connection {
     /// some other way).
     pub fn with_push_enabled(mut self, enabled: bool) -> Self {
         self.local_enable_push = enabled;
+        self
+    }
+
+    /// Advertises (and accepts) RFC 8441 Extended CONNECT support --
+    /// see `SETTINGS_ENABLE_CONNECT_PROTOCOL`'s own doc comment.
+    pub fn with_connect_protocol_enabled(mut self, enabled: bool) -> Self {
+        self.local_enable_connect_protocol = enabled;
         self
     }
 
@@ -518,6 +555,12 @@ impl Connection {
                 value: self.local_max_header_list_size,
             });
         }
+        if self.local_enable_connect_protocol {
+            settings.push(frame::Setting {
+                id: SETTINGS_ENABLE_CONNECT_PROTOCOL,
+                value: 1,
+            });
+        }
         frame::write_settings(&mut out, &settings);
         out
     }
@@ -552,7 +595,17 @@ impl Connection {
         let stale: Vec<u32> = self
             .streams
             .iter()
-            .filter(|(_, s)| s.phase != StreamPhase::Closed && now.duration_since(s.created_at) > timeout)
+            .filter(|(_, s)| {
+                // A stream carrying a WS-over-H2 tunnel is open for
+                // the lifetime of the WebSocket connection it carries,
+                // not for one bounded request/response exchange, so
+                // this timeout -- which bounds how long a stream may
+                // sit without completing a normal request -- doesn't
+                // apply to it.
+                s.phase != StreamPhase::Closed
+                    && s.phase != StreamPhase::WsTunnel
+                    && now.duration_since(s.created_at) > timeout
+            })
             .map(|(id, _)| id)
             .collect();
 
@@ -1129,7 +1182,7 @@ impl Connection {
             Err(_) => return self.conn_error(H2Error::CompressionError, result),
         };
 
-        if !validate_request_pseudo_headers(&fields) {
+        if !validate_request_pseudo_headers(&fields, self.local_enable_connect_protocol) {
             frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
             self.streams.remove(&stream_id);
             return;
@@ -1152,6 +1205,21 @@ impl Connection {
 
         let stream = self.streams.get_mut(&stream_id).unwrap();
         stream.request_headers = fields;
+
+        // RFC 8441 5: an Extended CONNECT request asking for the
+        // `websocket` protocol is routed to a WS handler rather than
+        // waiting for a complete request body the way an ordinary
+        // request is -- `validate_request_pseudo_headers` already
+        // guarantees `:protocol` only appears at all when
+        // `local_enable_connect_protocol` is true, so checking its
+        // value here is sufficient without re-checking the setting.
+        let is_extended_connect_websocket = stream.request_headers.iter().any(|h| h.name == ":method" && h.value == "CONNECT")
+            && stream.request_headers.iter().any(|h| h.name == ":protocol" && h.value.eq_ignore_ascii_case("websocket"));
+        if is_extended_connect_websocket {
+            stream.phase = StreamPhase::Open;
+            result.new_ws_tunnel_streams.push(stream_id);
+            return;
+        }
 
         if stream.header_block_end_stream {
             stream.phase = StreamPhase::HalfClosedRemote;
@@ -1188,11 +1256,12 @@ fn validate_trailer_fields(fields: &[HeaderField]) -> bool {
     true
 }
 
-fn validate_request_pseudo_headers(fields: &[HeaderField]) -> bool {
+fn validate_request_pseudo_headers(fields: &[HeaderField], connect_protocol_enabled: bool) -> bool {
     let mut method = None;
     let mut scheme = None;
     let mut path = None;
     let mut authority = None;
+    let mut protocol = None;
     let mut seen_regular_header = false;
 
     for field in fields {
@@ -1205,10 +1274,14 @@ fn validate_request_pseudo_headers(fields: &[HeaderField]) -> bool {
                 ":scheme" if scheme.is_none() => scheme = Some(&field.value),
                 ":path" if path.is_none() => path = Some(&field.value),
                 ":authority" if authority.is_none() => authority = Some(&field.value),
+                // RFC 8441 4: only valid alongside Extended CONNECT,
+                // and only if this connection actually advertised
+                // support for it -- an unrecognized pseudo-header
+                // otherwise, same as any other unknown one.
+                ":protocol" if protocol.is_none() && connect_protocol_enabled => protocol = Some(&field.value),
                 _ => return false, // duplicate or unrecognized pseudo-header
             }
         } else {
-            seen_regular_header = true;
             // RFC 9113 8.2.1: field names are always lowercase in
             // HTTP/2 -- an uppercase letter anywhere in the name is a
             // protocol error, not just a stylistic nit, since h2's
@@ -1284,7 +1357,15 @@ impl Connection {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             return self.conn_error(H2Error::StreamClosed, result);
         };
-        if stream.phase != StreamPhase::Open {
+        // A WS-tunnel stream's DATA frames carry WebSocket bytes
+        // rather than a request body, and the stream stays open past
+        // any single frame regardless of END_STREAM -- everything
+        // else about the frame (padding already stripped above,
+        // receive-window accounting below) is identical to an
+        // ordinary request body's DATA frames, since RFC 9113 6.9 flow
+        // control doesn't care what the payload means.
+        let is_ws_tunnel = stream.phase == StreamPhase::WsTunnel;
+        if !is_ws_tunnel && stream.phase != StreamPhase::Open {
             let stream_id = stream_id;
             frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::StreamClosed as u32);
             self.streams.remove(&stream_id);
@@ -1298,27 +1379,31 @@ impl Connection {
             return;
         }
 
+        // Repurposed as the not-yet-driven WS input queue for a
+        // WS-tunnel stream -- see `Connection::take_ws_tunnel_input`.
         stream.request_body.extend_from_slice(payload);
 
-        let end_stream = frame.header.flags & frame::FLAG_END_STREAM != 0;
-        if end_stream {
-            // RFC 9113 8.3.2 / RFC 9110 8.6: if a content-length
-            // header was sent, the actual received body size must
-            // match it exactly.
-            if let Some(declared) = stream
-                .request_headers
-                .iter()
-                .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-                .and_then(|h| h.value.parse::<usize>().ok())
-            {
-                if declared != stream.request_body.len() {
-                    frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
-                    self.streams.remove(&stream_id);
-                    return;
+        if !is_ws_tunnel {
+            let end_stream = frame.header.flags & frame::FLAG_END_STREAM != 0;
+            if end_stream {
+                // RFC 9113 8.3.2 / RFC 9110 8.6: if a content-length
+                // header was sent, the actual received body size must
+                // match it exactly.
+                if let Some(declared) = stream
+                    .request_headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|h| h.value.parse::<usize>().ok())
+                {
+                    if declared != stream.request_body.len() {
+                        frame::write_rst_stream(&mut result.to_send, stream_id, H2Error::ProtocolError as u32);
+                        self.streams.remove(&stream_id);
+                        return;
+                    }
                 }
+                stream.phase = StreamPhase::HalfClosedRemote;
+                result.newly_ready_streams.push(stream_id);
             }
-            stream.phase = StreamPhase::HalfClosedRemote;
-            result.newly_ready_streams.push(stream_id);
         }
 
         // Replenish flow-control windows immediately (simplest
@@ -1449,7 +1534,13 @@ impl Connection {
             let chunk = remaining[..chunk_len].to_vec();
             let is_last_chunk =
                 chunk_len == remaining.len(); // this drains the whole remaining buffer
-            frame::write_data(out, stream_id, &chunk, is_last_chunk);
+            // A WS tunnel's queue draining right now doesn't mean the
+            // stream is done -- more application traffic can be queued
+            // onto it at any later time (see `queue_ws_tunnel_data`),
+            // unlike an ordinary response whose body is fixed up front
+            // by `send_response`.
+            let end_stream_flag = is_last_chunk && stream.phase != StreamPhase::WsTunnel;
+            frame::write_data(out, stream_id, &chunk, end_stream_flag);
 
             self.send_window -= chunk_len as i64;
             let stream = self.streams.get_mut(&stream_id).unwrap();
@@ -1487,6 +1578,160 @@ impl Connection {
             .filter(|(_, s)| !s.pending_response.is_exhausted())
             .map(|(id, _)| id)
             .collect()
+    }
+
+    /// The `:path` a stream's request was made against -- used to look
+    /// a `new_ws_tunnel_streams` candidate up against the registered WS
+    /// routes, the same way `core::conn::WsConnection::upgrade_path`
+    /// does for an HTTP/1.1 WS upgrade.
+    pub fn stream_path(&self, stream_id: u32) -> Option<&str> {
+        self.streams.get(&stream_id)?.request_headers.iter().find(|h| h.name == ":path").map(|h| h.value.as_str())
+    }
+
+    /// Looks up one regular (non-pseudo) request header's value by
+    /// name for an Extended CONNECT stream -- used to read
+    /// `sec-websocket-extensions` for permessage-deflate negotiation,
+    /// the same header an ordinary HTTP/1.1 WebSocket upgrade
+    /// negotiates from.
+    pub fn stream_header(&self, stream_id: u32, name: &str) -> Option<&str> {
+        self.streams
+            .get(&stream_id)?
+            .request_headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+    }
+
+    /// Rejects an Extended CONNECT request that didn't match any
+    /// registered WS route: sends the same "unmatched path" response an
+    /// ordinary request would get (see `core::server::dispatch`'s
+    /// `NotFound` case) and tears the stream down immediately -- a
+    /// rejected tunnel attempt has nothing further to exchange, unlike
+    /// an ordinary response whose stream only closes once its body is
+    /// fully flushed (see `flush_pending`).
+    pub fn reject_ws_tunnel(&mut self, stream_id: u32, status: u16, body: Vec<u8>) -> Vec<u8> {
+        let out = self.send_response(stream_id, status, &[], body);
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.phase = StreamPhase::Closed;
+        }
+        self.streams.remove(&stream_id);
+        out
+    }
+
+    /// Accepts an Extended CONNECT request as a WebSocket tunnel (RFC
+    /// 8441 5): sends the `:status: 200` HEADERS response with no
+    /// END_STREAM and no body -- from this point on, DATA frames on
+    /// this stream in both directions carry WebSocket frames instead of
+    /// an HTTP request/response body -- stores `ws_tunnel`, and moves
+    /// the stream to `StreamPhase::WsTunnel` for the rest of its life.
+    /// Returns the bytes to send plus any bytes the client already sent
+    /// before this decision was made (buffered in `request_body` while
+    /// the stream awaited routing -- see `finish_header_block`): those
+    /// are real WebSocket bytes, not request-body bytes, and the caller
+    /// is expected to drive them through `ws_tunnel` immediately so
+    /// nothing sent early is lost.
+    pub fn accept_ws_tunnel(
+        &mut self,
+        stream_id: u32,
+        ws_tunnel: crate::http::ws::WsConnection,
+        extra_headers: &[HeaderField],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let buffered_input = {
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
+                return (Vec::new(), Vec::new());
+            };
+            if stream.response_headers_sent {
+                return (Vec::new(), Vec::new());
+            }
+            stream.response_headers_sent = true;
+            stream.phase = StreamPhase::WsTunnel;
+            let buffered = std::mem::take(&mut stream.request_body);
+            stream.ws_tunnel = Some(ws_tunnel);
+            buffered
+        };
+
+        let mut out = Vec::new();
+        let mut fields = Vec::with_capacity(1 + extra_headers.len());
+        fields.push(HeaderField {
+            name: ":status".to_string(),
+            value: "200".to_string(),
+        });
+        fields.extend_from_slice(extra_headers);
+        let encoded = self.encoder.encode(&fields);
+        write_header_block_frames(&mut out, stream_id, &encoded, self.peer_max_frame_size, false);
+        (out, buffered_input)
+    }
+
+    /// A WS-tunnel stream's `WsConnection` -- the caller drives this
+    /// directly (rather than through a wrapper method on `Connection`)
+    /// since dispatching the application messages it produces needs a
+    /// `Router`, which this module has no access to (see
+    /// `new_ws_tunnel_streams`'s own doc comment).
+    pub fn ws_tunnel_mut(&mut self, stream_id: u32) -> Option<&mut crate::http::ws::WsConnection> {
+        self.streams.get_mut(&stream_id).and_then(|s| s.ws_tunnel.as_mut())
+    }
+
+    /// Every WS-tunnel stream with inbound bytes queued since the last
+    /// `take_ws_tunnel_input` call -- a caller drives each of these
+    /// through its `ws_tunnel` once per `advance()` result, the same
+    /// role `newly_ready_streams` plays for ordinary requests.
+    pub fn ws_tunnel_streams_with_input(&self) -> Vec<u32> {
+        self.streams
+            .iter()
+            .filter(|(_, s)| s.phase == StreamPhase::WsTunnel && !s.request_body.is_empty())
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Drains bytes received via DATA frames on a WS-tunnel stream
+    /// since the last call -- see `handle_data`'s `is_ws_tunnel` branch,
+    /// which appends to the same `request_body` buffer an ordinary
+    /// request's body would use, repurposed here as the not-yet-driven
+    /// WS input queue.
+    pub fn take_ws_tunnel_input(&mut self, stream_id: u32) -> Vec<u8> {
+        self.streams.get_mut(&stream_id).map(|s| std::mem::take(&mut s.request_body)).unwrap_or_default()
+    }
+
+    /// Queues bytes produced by driving a WS tunnel's `WsConnection`
+    /// (auto PONGs, close-handshake echoes, and any framed application
+    /// replies) as H2 DATA on this stream, respecting the same
+    /// per-stream/connection flow-control accounting `send_response`'s
+    /// `flush_pending` already enforces for ordinary response bodies --
+    /// see `flush_pending`'s own `StreamPhase::WsTunnel` carve-out for
+    /// why exhausting this queue doesn't set END_STREAM the way a
+    /// normal response's last chunk does.
+    pub fn queue_ws_tunnel_data(&mut self, stream_id: u32, data: Vec<u8>) -> Vec<u8> {
+        let mut out = Vec::new();
+        if data.is_empty() {
+            return out;
+        }
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            match &mut stream.pending_response {
+                PendingBody::Buffered { data: existing, .. } => existing.extend_from_slice(&data),
+                PendingBody::None => stream.pending_response = PendingBody::Buffered { data, offset: 0 },
+            }
+        }
+        self.flush_pending(stream_id, &mut out);
+        out
+    }
+
+    /// Tears down a WS tunnel once its close handshake has finished
+    /// (see `http::ws::WsConnection::advance`'s `WsEvent::Closed` /
+    /// `is_closed`) -- flushes anything still queued (the final CLOSE
+    /// frame's own bytes), sends one last empty DATA frame with
+    /// END_STREAM to end the H2 stream cleanly (RFC 8441 doesn't
+    /// mandate a specific mechanism for ending the stream once the WS
+    /// connection itself has closed; an END_STREAM DATA frame is the
+    /// natural fit since the WS CLOSE frame(s) it follows were already
+    /// carried the same way), and removes it from the stream table.
+    pub fn finish_ws_tunnel(&mut self, stream_id: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.flush_pending(stream_id, &mut out);
+        if self.streams.contains_key(&stream_id) {
+            frame::write_data(&mut out, stream_id, &[], true);
+            self.streams.remove(&stream_id);
+        }
+        out
     }
 }
 
@@ -1932,6 +2177,7 @@ mod tests {
         assert!(closed, "connection should have been closed once the accumulated header block exceeded the size limit");
     }
 
+    #[test]
     fn push_promise_from_client_is_protocol_error() {
         let mut conn = new_conn();
         let mut input = Vec::new();
@@ -2186,5 +2432,178 @@ mod tests {
         frame::write_headers(&mut request_frame, 3, &encoded, true, true);
         let result = conn.advance(&request_frame);
         assert_eq!(result.newly_ready_streams, vec![3]);
+    }
+
+    // ─── RFC 8441: WebSocket over HTTP/2 (Extended CONNECT) ──────────
+
+    /// Drives a client handshake + a single Extended CONNECT request
+    /// (`:method: CONNECT`, `:protocol: websocket`) through `conn`,
+    /// without END_STREAM -- a tunnel's response starts flowing
+    /// independent of whether the client ever ends its side, so unlike
+    /// `send_handshake_and_request` this never sets END_STREAM on the
+    /// request HEADERS.
+    fn send_handshake_and_extended_connect(conn: &mut Connection, path: &str) -> (u32, AdvanceResult) {
+        let mut client_encoder = HpackContext::new(4096);
+        let mut input = Vec::new();
+        input.extend_from_slice(CONNECTION_PREFACE);
+        frame::write_settings(&mut input, &[]);
+
+        let headers = client_encoder.encode(&[
+            field(":method", "CONNECT"),
+            field(":protocol", "websocket"),
+            field(":scheme", "http"),
+            field(":path", path),
+            field(":authority", "example.com"),
+        ]);
+        frame::write_headers(&mut input, 1, &headers, false, true);
+
+        let result = conn.advance(&input);
+        (1, result)
+    }
+
+    #[test]
+    fn connect_protocol_setting_present_only_when_enabled() {
+        let enabled = Connection::new(128, 4096).with_connect_protocol_enabled(true);
+        let disabled = Connection::new(128, 4096);
+
+        let has_connect_setting = |data: &[u8]| -> bool {
+            let (frame, _) = frame::parse_frame(data).unwrap();
+            assert_eq!(frame.header.frame_type, FrameType::Settings);
+            frame.payload.chunks_exact(6).any(|c| u16::from_be_bytes([c[0], c[1]]) == SETTINGS_ENABLE_CONNECT_PROTOCOL)
+        };
+        assert!(has_connect_setting(&enabled.initial_send()));
+        assert!(!has_connect_setting(&disabled.initial_send()));
+    }
+
+    #[test]
+    fn extended_connect_rejected_when_connect_protocol_disabled() {
+        let mut conn = new_conn(); // connect protocol not enabled
+        let (_stream_id, result) = send_handshake_and_extended_connect(&mut conn, "/ws");
+        assert!(result.new_ws_tunnel_streams.is_empty());
+        // `:protocol` is an unrecognized pseudo-header when the setting
+        // is off -- rejected the same way any other unknown
+        // pseudo-header is (RST_STREAM, not a connection-level error).
+        assert!(contains_frame_type(&result.to_send, FrameType::RstStream));
+        assert!(!result.connection_closed);
+    }
+
+    #[test]
+    fn extended_connect_websocket_is_surfaced_as_a_ws_tunnel_candidate() {
+        let mut conn = new_conn().with_connect_protocol_enabled(true);
+        let (stream_id, result) = send_handshake_and_extended_connect(&mut conn, "/ws");
+        assert_eq!(result.new_ws_tunnel_streams, vec![stream_id]);
+        assert!(
+            result.newly_ready_streams.is_empty(),
+            "a WS tunnel candidate must not also go through the ordinary request/response path"
+        );
+        assert_eq!(conn.stream_path(stream_id), Some("/ws"));
+    }
+
+    #[test]
+    fn accepting_a_ws_tunnel_sends_200_without_end_stream_and_stores_the_tunnel() {
+        let mut conn = new_conn().with_connect_protocol_enabled(true);
+        let (stream_id, _result) = send_handshake_and_extended_connect(&mut conn, "/ws");
+
+        let ws = crate::http::ws::WsConnection::new(None, 1024 * 1024);
+        let (out, buffered) = conn.accept_ws_tunnel(stream_id, ws, &[]);
+        assert!(buffered.is_empty());
+
+        let (frame, _) = frame::parse_frame(&out).unwrap();
+        assert_eq!(frame.header.frame_type, FrameType::Headers);
+        assert_eq!(
+            frame.header.flags & frame::FLAG_END_STREAM,
+            0,
+            "an accepted WS tunnel's 200 response must not end the stream"
+        );
+        assert!(conn.ws_tunnel_mut(stream_id).is_some());
+        assert_eq!(conn.streams.get(&stream_id).unwrap().phase, StreamPhase::WsTunnel);
+    }
+
+    #[test]
+    fn data_sent_before_acceptance_is_replayed_through_the_tunnel() {
+        let mut conn = new_conn().with_connect_protocol_enabled(true);
+        let (stream_id, _result) = send_handshake_and_extended_connect(&mut conn, "/ws");
+
+        // The client sends a WS frame's worth of bytes before the
+        // server has decided to accept the tunnel -- these must not be
+        // lost once acceptance happens.
+        let mut data_frame = Vec::new();
+        frame::write_data(&mut data_frame, stream_id, b"early-bytes", false);
+        let result = conn.advance(&data_frame);
+        assert!(result.newly_ready_streams.is_empty());
+
+        let ws = crate::http::ws::WsConnection::new(None, 1024 * 1024);
+        let (_out, buffered) = conn.accept_ws_tunnel(stream_id, ws, &[]);
+        assert_eq!(buffered, b"early-bytes");
+    }
+
+    #[test]
+    fn ws_tunnel_data_round_trips_through_flow_control_without_ending_the_stream() {
+        let mut conn = new_conn().with_connect_protocol_enabled(true);
+        let (stream_id, _result) = send_handshake_and_extended_connect(&mut conn, "/ws");
+        let ws = crate::http::ws::WsConnection::new(None, 1024 * 1024);
+        conn.accept_ws_tunnel(stream_id, ws, &[]);
+
+        let reply_bytes = b"pong-frame-bytes".to_vec();
+        let out = conn.queue_ws_tunnel_data(stream_id, reply_bytes.clone());
+        let (frame, consumed) = frame::parse_frame(&out).unwrap();
+        assert_eq!(frame.header.frame_type, FrameType::Data);
+        assert_eq!(frame.payload, reply_bytes.as_slice());
+        assert_eq!(
+            frame.header.flags & frame::FLAG_END_STREAM,
+            0,
+            "queued WS traffic must never end the H2 stream on its own"
+        );
+        assert_eq!(consumed, out.len());
+        assert!(conn.streams.contains_key(&stream_id), "the stream must still be open for further WS traffic");
+    }
+
+    #[test]
+    fn rejected_ws_tunnel_gets_the_unmatched_path_response_and_is_cleaned_up() {
+        let mut conn = new_conn().with_connect_protocol_enabled(true);
+        let (stream_id, _result) = send_handshake_and_extended_connect(&mut conn, "/no-such-route");
+
+        let out = conn.reject_ws_tunnel(stream_id, 404, b"Not Found\n".to_vec());
+        let (headers_frame, consumed) = frame::parse_frame(&out).unwrap();
+        assert_eq!(headers_frame.header.frame_type, FrameType::Headers);
+        let (data_frame, _) = frame::parse_frame(&out[consumed..]).unwrap();
+        assert_eq!(data_frame.payload, b"Not Found\n");
+        assert!(!conn.streams.contains_key(&stream_id), "a rejected tunnel attempt must be cleaned up immediately");
+    }
+
+    #[test]
+    fn finishing_a_ws_tunnel_sends_end_stream_and_removes_it_from_the_stream_table() {
+        let mut conn = new_conn().with_connect_protocol_enabled(true);
+        let (stream_id, _result) = send_handshake_and_extended_connect(&mut conn, "/ws");
+        let ws = crate::http::ws::WsConnection::new(None, 1024 * 1024);
+        conn.accept_ws_tunnel(stream_id, ws, &[]);
+        assert!(conn.streams.contains_key(&stream_id));
+
+        let out = conn.finish_ws_tunnel(stream_id);
+        let (frame, _) = frame::parse_frame(&out).unwrap();
+        assert_eq!(frame.header.frame_type, FrameType::Data);
+        assert_ne!(frame.header.flags & frame::FLAG_END_STREAM, 0);
+        assert!(!conn.streams.contains_key(&stream_id));
+    }
+
+    #[test]
+    fn ws_tunnel_phase_accepts_data_frames_without_triggering_the_ordinary_request_completion_path() {
+        // Every existing StreamPhase-driven DATA handler must treat
+        // WsTunnel correctly: DATA frames are accepted (not RST'd the
+        // way a Closed stream's would be) but never trigger the
+        // ordinary request-body/END_STREAM completion path, even when
+        // the frame itself carries END_STREAM.
+        let mut conn = new_conn().with_connect_protocol_enabled(true);
+        let (stream_id, _result) = send_handshake_and_extended_connect(&mut conn, "/ws");
+        let ws = crate::http::ws::WsConnection::new(None, 1024 * 1024);
+        conn.accept_ws_tunnel(stream_id, ws, &[]);
+
+        let mut data_frame = Vec::new();
+        frame::write_data(&mut data_frame, stream_id, b"ws-bytes", true);
+        let result = conn.advance(&data_frame);
+        assert!(!result.connection_closed);
+        assert!(result.newly_ready_streams.is_empty());
+        assert!(conn.streams.contains_key(&stream_id), "END_STREAM must not close a WS tunnel");
+        assert_eq!(conn.take_ws_tunnel_input(stream_id), b"ws-bytes");
     }
 }

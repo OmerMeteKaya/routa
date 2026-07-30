@@ -202,6 +202,14 @@ pub struct Http2Settings {
     pub stream_timeout: std::time::Duration,
     pub keepalive_timeout: std::time::Duration,
     pub stream_lookup: crate::core::config::H2StreamLookup,
+    /// Whether to advertise and accept RFC 8441 Extended CONNECT
+    /// (`SETTINGS_ENABLE_CONNECT_PROTOCOL`) -- piggybacks on `h2.enabled
+    /// && ws.enabled` (see `core::event_loop::EventLoopWorker::new`)
+    /// rather than its own config field, since WebSocket-over-H2 is the
+    /// same WebSocket feature tunneled over a different transport, not
+    /// a separate thing a user would want to enable independently of
+    /// either.
+    pub connect_protocol_enabled: bool,
 }
 
 impl Http2Connection {
@@ -210,7 +218,8 @@ impl Http2Connection {
         let mut inner = crate::http::h2::stream::Connection::new(local_max_concurrent_streams, settings.header_table_size)
             .with_local_settings(settings.initial_window_size, settings.max_frame_size, settings.max_header_list_size)
             .with_encoder_options(settings.huffman_encoding, settings.dynamic_table_update)
-            .with_push_enabled(settings.server_push_enabled);
+            .with_push_enabled(settings.server_push_enabled)
+            .with_connect_protocol_enabled(settings.connect_protocol_enabled);
         if settings.stream_lookup == crate::core::config::H2StreamLookup::Linear {
             inner = inner.with_linear_stream_lookup();
         }

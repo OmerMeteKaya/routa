@@ -131,7 +131,7 @@ pub struct PmdParams {
 /// offer, if present. Returns `None` if the client didn't offer it (or
 /// the header is absent) -- PMD is only ever used if both sides
 /// affirmatively want it.
-fn negotiate_pmd(ext_header: Option<&str>) -> Option<PmdParams> {
+pub fn negotiate_pmd(ext_header: Option<&str>) -> Option<PmdParams> {
     let ext_header = ext_header?;
     let offer = ext_header
         .split(',')
@@ -148,7 +148,7 @@ fn negotiate_pmd(ext_header: Option<&str>) -> Option<PmdParams> {
     Some(params)
 }
 
-fn pmd_response_extension_header(params: &PmdParams) -> String {
+pub fn pmd_response_extension_header(params: &PmdParams) -> String {
     let mut s = "permessage-deflate".to_string();
     if params.server_no_context_takeover {
         s.push_str("; server_no_context_takeover");
