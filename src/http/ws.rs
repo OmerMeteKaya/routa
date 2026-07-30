@@ -940,6 +940,14 @@ impl WsRegistry {
     pub fn is_empty(&self) -> bool {
         self.connections.is_empty()
     }
+
+    pub fn contains(&self, conn_id: u64) -> bool {
+        self.connections.contains_key(&conn_id)
+    }
+
+    pub fn ids(&self) -> Vec<u64> {
+        self.connections.keys().copied().collect()
+    }
 }
 
 fn waker_token_index(key: PollKey) -> usize {

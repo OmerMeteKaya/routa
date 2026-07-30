@@ -203,6 +203,19 @@ impl WorkerBody for EventLoopWorker {
             return;
         }
 
+        // A distinct sentinel from listener_key -- see WsRegistry::new's
+        // own doc comment on why its waker needs a key the poll loop
+        // can recognize as "drain the broadcast queue", not a real
+        // connection or the listener.
+        let ws_registry_key = PollKey::from_slab_index(usize::MAX - 1);
+        let mut ws_registry = match crate::http::ws::WsRegistry::new(poller.registry(), ws_registry_key) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "worker failed to create WS broadcast registry");
+                return;
+            }
+        };
+
         let mut connections: Slab<Connection> = Slab::new();
         let mut last_idle_sweep = Instant::now();
         let mut last_memory_check = Instant::now();
@@ -238,6 +251,10 @@ impl WorkerBody for EventLoopWorker {
                     }
                     continue;
                 }
+                if key == ws_registry_key {
+                    dispatch_ws_broadcast(&mut ws_registry, &mut connections);
+                    continue;
+                }
                 handle_connection_event(self, &mut poller, &mut connections, key, readiness);
             }
 
@@ -246,6 +263,7 @@ impl WorkerBody for EventLoopWorker {
                 reap_idle_connections(self, &mut poller, &mut connections);
                 reap_stale_h2_streams(&mut connections, self.h2_settings.stream_timeout);
                 ping_sweep_ws_connections(self, &mut poller, &mut connections);
+                sync_ws_registry(&mut ws_registry, &connections);
                 for pool in &self.server.pools {
                     for node in pool.lb.pool.nodes().iter() {
                         node.reap_idle(pool.idle_timeout);
@@ -1131,6 +1149,57 @@ fn drive_websocket(worker: &EventLoopWorker, connections: &mut Slab<Connection>,
 /// sweep) rather than reactively, since a connection that's stopped
 /// responding by definition isn't producing readiness events for this
 /// to react to otherwise.
+/// Keeps a worker's `WsRegistry` (used purely for cross-connection
+/// broadcast, see `WsRegistry`'s own doc comment) in step with which
+/// connections are actually WebSocket connections right now --
+/// registering newly-upgraded ones and dropping closed ones. Run from
+/// the same periodic sweep as ping/idle timeout checks rather than at
+/// the exact moment a connection upgrades or closes, trading a small,
+/// bounded registration delay for not needing to thread the registry
+/// through every code path that can create or close a connection.
+fn sync_ws_registry(ws_registry: &mut crate::http::ws::WsRegistry, connections: &Slab<Connection>) {
+    let live_ws_ids: std::collections::HashSet<u64> = connections
+        .iter()
+        .filter(|(_, c)| matches!(c.protocol, ConnectionProtocol::WebSocket(_)))
+        .map(|(_, c)| c.id)
+        .collect();
+    for id in ws_registry.ids() {
+        if !live_ws_ids.contains(&id) {
+            ws_registry.remove(id);
+        }
+    }
+    for &id in &live_ws_ids {
+        if !ws_registry.contains(id) {
+            ws_registry.add(id);
+        }
+    }
+}
+
+/// Drains a worker's WS broadcast queue and writes the resulting
+/// bytes to every currently-open WebSocket connection's write buffer,
+/// flushing each one immediately -- called when `ws_registry_key`
+/// reports readiness (see `WsRegistry::new`'s doc comment on its
+/// waker).
+fn dispatch_ws_broadcast(ws_registry: &mut crate::http::ws::WsRegistry, connections: &mut Slab<Connection>) {
+    let framed = ws_registry.dispatch_broadcast();
+    if framed.is_empty() {
+        return;
+    }
+    for (_, conn) in connections.iter_mut() {
+        if let ConnectionProtocol::WebSocket(ws) = &mut conn.protocol {
+            ws.write_buf.push(&framed);
+        }
+    }
+    let ws_idxs: Vec<usize> = connections
+        .iter()
+        .filter(|(_, c)| matches!(c.protocol, ConnectionProtocol::WebSocket(_)))
+        .map(|(idx, _)| idx)
+        .collect();
+    for idx in ws_idxs {
+        let _ = flush_transport(connections, idx);
+    }
+}
+
 fn ping_sweep_ws_connections(worker: &EventLoopWorker, poller: &mut MioPoller, connections: &mut Slab<Connection>) {
     if worker.ws_settings.ping_interval.is_zero() {
         return;
@@ -1620,6 +1689,43 @@ mod tests {
         let payload_len = (response[1] & 0x7f) as usize;
         let payload = &response[2..2 + payload_len];
         assert_eq!(payload, b"echo:hi", "handler's reply should have reached the real client socket, got {} bytes", n);
+    }
+
+    #[test]
+    fn broadcast_message_reaches_a_real_registered_ws_connection() {
+        let mut config = RoutaConfig::default();
+        config.ws.enabled = true;
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(free_port(), server);
+
+        let mut poller = MioPoller::new(16).unwrap();
+        let ws_registry_key = PollKey::from_slab_index(usize::MAX - 1);
+        let mut ws_registry = crate::http::ws::WsRegistry::new(poller.registry(), ws_registry_key).unwrap();
+
+        let mut connections: Slab<Connection> = Slab::new();
+        let ws = crate::core::conn::WsConnection::with_settings(None, &worker.ws_settings);
+        let (idx, mut client) = insert_test_ws_connection(&mut poller, &mut connections, ws);
+
+        sync_ws_registry(&mut ws_registry, &connections);
+        assert_eq!(ws_registry.len(), 1, "the one open WS connection should have been registered");
+
+        let sender = ws_registry.sender();
+        let msg = crate::http::ws::BroadcastMessage {
+            data: b"hello everyone".to_vec(),
+            opcode: crate::http::ws::Opcode::Text,
+        };
+        sender.send(msg).unwrap();
+
+        dispatch_ws_broadcast(&mut ws_registry, &mut connections);
+        let _ = idx;
+
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).unwrap();
+        assert!(n > 0, "the broadcast message should have reached the real client socket");
+        // A text frame's payload starts after the 2-byte header for a
+        // short (< 126 byte) unmasked server-to-client frame.
+        assert_eq!(&buf[2..n], b"hello everyone");
     }
 
     #[test]
