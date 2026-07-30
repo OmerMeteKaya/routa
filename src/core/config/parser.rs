@@ -619,9 +619,6 @@ fn parse_top_level_key(
 
         "ws_enabled" => cfg.ws.enabled = cfg_atob(val, false, ctx, lineno),
         "ws_max_connections" => cfg.ws.max_connections = cfg_atoi(val, 10_000),
-        "ws_handshake_timeout_ms" => {
-            cfg.ws.handshake_timeout_ms = cfg_duration_ms(val, 5000, ctx, lineno)
-        }
         "ws_idle_timeout_ms" => {
             cfg.ws.idle_timeout_ms = cfg_duration_ms(val, 0, ctx, lineno)
         }

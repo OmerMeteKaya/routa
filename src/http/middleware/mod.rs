@@ -28,6 +28,7 @@ pub mod cors;
 pub mod logger;
 pub mod metrics;
 pub mod ratelimit;
+pub mod response_cache;
 
 use crate::http::request::HttpRequest;
 use crate::http::response::HttpResponse;

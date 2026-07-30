@@ -109,6 +109,14 @@ impl RoutaServer {
         if config.logger_enabled {
             chain_builder = chain_builder.use_middleware(LoggerMiddleware::new(StderrSink, 0));
         }
+        if config.cache_enabled {
+            let cache_cfg = crate::http::middleware::response_cache::ResponseCacheConfig {
+                max_memory_bytes: (config.cache_memory_mb.max(0) as u64) * 1024 * 1024,
+                cache_dir: config.cache_dir.clone(),
+            };
+            chain_builder = chain_builder
+                .use_middleware(crate::http::middleware::response_cache::ResponseCacheMiddleware::new(cache_cfg));
+        }
 
         if config.acl_enabled {
             let mut acl_cfg = AclConfig::new(config.acl_default_allow);

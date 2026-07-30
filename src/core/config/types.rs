@@ -75,7 +75,6 @@ pub struct WsConfig {
     pub enabled: bool,
 
     pub max_connections: i32,      // default: 10000
-    pub handshake_timeout_ms: i32, // default: 5000
     pub idle_timeout_ms: i32,      // default: 0
 
     // Frame
@@ -104,7 +103,6 @@ impl Default for WsConfig {
         WsConfig {
             enabled: false,
             max_connections: 10_000,
-            handshake_timeout_ms: 5_000,
             idle_timeout_ms: 0,
             max_frame_size: 16 * 1024 * 1024,
             max_message_size: 64 * 1024 * 1024,
