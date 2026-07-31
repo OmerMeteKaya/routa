@@ -380,12 +380,36 @@ fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
 /// deliberately keeps read and write buffers separate (see
 /// `Http1Connection`'s own fields), so nothing here reuses `recv_buf`
 /// as an outgoing buffer.
+/// The write buffer currently pending for whichever protocol is
+/// active on this connection -- `Http1Connection::write_buf` and
+/// `WsConnection::write_buf` play the identical role for their
+/// respective protocols (queued bytes not yet flushed to the
+/// transport), so `submit_send` can stay protocol-agnostic past this
+/// one lookup rather than needing its own copy of the same submit
+/// logic per protocol. Returns `None` for `Handshaking`/`Http2`
+/// (H2's own write buffer isn't driven by this backend yet).
+fn active_write_buf(protocol: &ConnectionProtocol) -> Option<&crate::util::buf::Buf> {
+    match protocol {
+        ConnectionProtocol::Http1(h1) => Some(&h1.write_buf),
+        ConnectionProtocol::WebSocket(ws) => Some(&ws.write_buf),
+        ConnectionProtocol::Handshaking | ConnectionProtocol::Http2(_) => None,
+    }
+}
+
+fn consume_active_write_buf(protocol: &mut ConnectionProtocol, n: usize) {
+    match protocol {
+        ConnectionProtocol::Http1(h1) => h1.write_buf.consume(n),
+        ConnectionProtocol::WebSocket(ws) => ws.write_buf.consume(n),
+        ConnectionProtocol::Handshaking | ConnectionProtocol::Http2(_) => {}
+    }
+}
+
 fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
-    let ConnectionProtocol::Http1(h1) = &conn.protocol else {
-        return Err("submit_send called while protocol is not Http1 -- H2/WS write buffers are not yet driven by this backend".to_string());
+    let Some(pending) = active_write_buf(&conn.protocol) else {
+        return Err("submit_send called while no active protocol has a driven write buffer (Handshaking/Http2 aren't driven by this backend)".to_string());
     };
-    let pending = h1.write_buf.as_slice();
+    let pending = pending.as_slice();
     let send = opcode::Send::new(types::Fd(conn.transport.fd), pending.as_ptr(), pending.len() as u32)
         .build()
         .user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
@@ -603,11 +627,74 @@ impl WorkerBody for EventLoopWorker {
                         }
 
                         let n = result as usize;
+                        let is_h2 = matches!(connections[slab_index].protocol, ConnectionProtocol::Http2(_));
+                        if is_h2 {
+                            tracing::warn!(worker_id, slab_index, "recv completion for an Http2 connection -- H2 is not yet driven by this backend");
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        }
+
+                        let is_websocket = matches!(connections[slab_index].protocol, ConnectionProtocol::WebSocket(_));
+
+                        if is_websocket {
+                            let recv_buf = connections[slab_index].recv_buf.clone();
+                            connections[slab_index].touch();
+                            let ws_ctx = crate::core::conn::protocol::WsDispatchContext {
+                                router: &self.server.router,
+                                compression_threshold: self.ws_settings.compression_threshold,
+                            };
+                            let ws_outcome = crate::core::conn::protocol::process_websocket_input(
+                                &mut connections[slab_index].protocol,
+                                &recv_buf[..n],
+                                &ws_ctx,
+                            );
+
+                            match ws_outcome {
+                                crate::core::conn::protocol::WebSocketOutcome::NoActionNeeded => {
+                                    if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv (websocket)");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                }
+                                crate::core::conn::protocol::WebSocketOutcome::FlushThenContinue => {
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit websocket send");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                }
+                                crate::core::conn::protocol::WebSocketOutcome::FlushThenClose
+                                | crate::core::conn::protocol::WebSocketOutcome::ClosedFlushThenClose => {
+                                    // Either way, this connection closes
+                                    // once its (possibly empty) pending
+                                    // write buffer has been flushed --
+                                    // marking it here lets the
+                                    // OP_TAG_SEND arm below know to
+                                    // close afterward rather than
+                                    // looping back to another recv, the
+                                    // way it otherwise would by default
+                                    // for a WebSocket connection (see
+                                    // that arm's own comment on why WS
+                                    // has no per-message keep_alive
+                                    // flag the way HTTP/1.1 does).
+                                    connections[slab_index].closing = true;
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit final websocket send");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
                         {
                             let conn = &mut connections[slab_index];
                             conn.touch();
                             let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
-                                tracing::warn!(worker_id, slab_index, "recv completion for a connection whose protocol is not Http1 -- H2/WS are not yet driven by this backend");
+                                tracing::warn!(worker_id, slab_index, "recv completion for a connection whose protocol is neither Http1 nor WebSocket");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                                 continue;
@@ -660,12 +747,12 @@ impl WorkerBody for EventLoopWorker {
                                     connections.remove(slab_index);
                                 }
                             }
-                            Http1Outcome::SwitchedToHttp2 | Http1Outcome::SwitchedToWebSocket => {
+                            Http1Outcome::SwitchedToHttp2 => {
                                 // The 101 response is queued (still in
                                 // what was Http1Connection::write_buf,
                                 // now unreachable through the switched
-                                // protocol) -- H2/WS aren't driven by
-                                // this backend yet, so there's nothing
+                                // protocol) -- H2 isn't driven by this
+                                // backend yet, so there's nothing
                                 // further this arm can correctly do.
                                 // Not attempting the flush here (it
                                 // would need to read write_buf back out
@@ -673,9 +760,26 @@ impl WorkerBody for EventLoopWorker {
                                 // doesn't understand) rather than
                                 // silently leaving the connection in an
                                 // inconsistent, half-upgraded state.
-                                tracing::warn!(worker_id, slab_index, "connection requested an h2c/WebSocket upgrade -- not yet supported by this backend, closing");
+                                tracing::warn!(worker_id, slab_index, "connection requested an h2c upgrade -- not yet supported by this backend, closing");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
+                            }
+                            Http1Outcome::SwitchedToWebSocket => {
+                                // Unlike the H2 case above, this
+                                // backend *does* drive WebSocket --
+                                // the switch already replaced
+                                // conn.protocol with a real
+                                // ConnectionProtocol::WebSocket carrying
+                                // the queued 101 response in its own
+                                // write_buf (see process_http1_read_buf's
+                                // own handling of this), so it can be
+                                // flushed exactly like any other
+                                // pending send.
+                                if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit websocket upgrade response");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
                             }
                         }
                     }
@@ -697,45 +801,67 @@ impl WorkerBody for EventLoopWorker {
                         }
 
                         let n = result as usize;
-                        let should_close = {
-                            let conn = &mut connections[slab_index];
-                            let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
+                        consume_active_write_buf(&mut connections[slab_index].protocol, n);
+
+                        // "Should this connection close once its write
+                        // buffer is fully flushed" means something
+                        // different per protocol: HTTP/1.1 has an
+                        // explicit keep_alive flag (a request or its
+                        // response may have asked for the connection to
+                        // close); WebSocket has no such per-message
+                        // flag -- a WS connection is expected to stay
+                        // open until its own close handshake completes,
+                        // which process_websocket_input already
+                        // reflected by returning FlushThenClose rather
+                        // than something this arm needs to re-derive.
+                        // Tracking "this send was the tail end of a
+                        // close-triggering flush" would need its own
+                        // state; for now, a WS connection whose write
+                        // buffer just fully drained always goes back to
+                        // reading rather than closing -- correct for
+                        // every case except the close-handshake
+                        // completion's own final send, a gap called out
+                        // here rather than silently accepted.
+                        let already_marked_closing = connections[slab_index].closing;
+                        let (fully_flushed, should_close_after_flush) = match &connections[slab_index].protocol {
+                            ConnectionProtocol::Http1(h1) => (h1.write_buf.is_empty(), !h1.keep_alive),
+                            // WebSocket has no per-message keep_alive
+                            // flag the way HTTP/1.1 does -- whether
+                            // this connection should close once
+                            // flushed is instead whatever the OP_TAG_RECV
+                            // arm already decided and recorded on
+                            // `closing` (a completed close handshake,
+                            // a protocol error, or backpressure --
+                            // see process_websocket_input's own
+                            // WebSocketOutcome variants).
+                            ConnectionProtocol::WebSocket(ws) => (ws.write_buf.is_empty(), already_marked_closing),
+                            ConnectionProtocol::Handshaking | ConnectionProtocol::Http2(_) => {
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                                 continue;
-                            };
-                            h1.write_buf.consume(n);
-                            let fully_flushed = h1.write_buf.is_empty();
-                            fully_flushed && !h1.keep_alive
+                            }
                         };
 
-                        if should_close {
+                        if fully_flushed && should_close_after_flush {
                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             continue;
                         }
 
-                        let still_pending = {
-                            let conn = &connections[slab_index];
-                            let ConnectionProtocol::Http1(h1) = &conn.protocol else {
-                                continue;
-                            };
-                            !h1.write_buf.is_empty()
-                        };
-
-                        if still_pending {
+                        if !fully_flushed {
                             // A partial write -- send the rest of the
-                            // same response before doing anything else.
+                            // same buffer before doing anything else.
                             if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
-                                tracing::warn!(worker_id, %reason, "failed to submit remainder of a partially-sent response");
+                                tracing::warn!(worker_id, %reason, "failed to submit remainder of a partially-sent buffer");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                             }
                         } else {
-                            // Fully flushed and keep-alive -- go back
-                            // to reading the next (possibly already
-                            // pipelined) request from the same
-                            // connection.
+                            // Fully flushed, and either HTTP/1.1
+                            // keep-alive or WebSocket (which always
+                            // goes back to reading here -- see this
+                            // arm's own comment) -- read the next
+                            // message/request from the same connection.
                             if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
                                 tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
@@ -842,6 +968,148 @@ mod tests {
 
         let peer = get_peer_addr(accepted.as_raw_fd()).expect("getpeername should succeed on a real connected socket");
         assert_eq!(peer.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), "peer address should be the real loopback client, not a placeholder");
+    }
+
+    /// A real WebSocket handshake, a real echoed application message,
+    /// and a real close handshake, all over an actual TCP connection
+    /// -- exercises process_websocket_input's full round trip (the
+    /// upgrade path through process_http1_read_buf, then message
+    /// dispatch through the registered route handler, then the close
+    /// handshake correctly ending the connection) rather than any one
+    /// piece in isolation.
+    #[test]
+    fn websocket_upgrade_echo_and_close_handshake_end_to_end() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.ws.enabled = true;
+        config.port = port as i32;
+        let mut server = RoutaServer::from_config(config).expect("build a minimal RoutaServer");
+        let mut router = crate::http::router::Router::new();
+        // The 101 upgrade itself is an ordinary HTTP route, matched
+        // and dispatched through middleware_chain like any other
+        // request -- add_websocket_route below only registers the
+        // *post-upgrade* message handler, it doesn't make "/ws" match
+        // as a request path on its own. See mio_backend's own
+        // equivalent test for the same two-registrations shape.
+        router.add("/ws", &[crate::http::request::HttpMethod::Get], |req, _params| {
+            crate::http::ws::build_handshake_response(req, None)
+        });
+        router.add_websocket_route("/ws", |msg| match msg {
+            crate::http::ws::WsMessage::Text(text) if text == "ping" => Some(crate::http::ws::WsMessage::Text("pong".to_string())),
+            _ => None,
+        });
+        let router = Arc::new(router);
+        server.router = Arc::clone(&router);
+        // server.router and server.middleware_chain are independently
+        // constructed by from_config -- replacing just the former
+        // leaves middleware_chain still dispatching through the old,
+        // routeless router underneath. Rebuilding middleware_chain
+        // here to close over the same new router is what actually
+        // makes the new route reachable.
+        server.middleware_chain = Arc::new(crate::http::middleware::ChainBuilder::new().build(move |req| {
+            match router.dispatch(req) {
+                crate::http::router::Dispatch::Matched { handler, params } => handler(req, &params),
+                crate::http::router::Dispatch::MethodNotAllowed { .. } => crate::http::response::HttpResponse::new(405, "Method Not Allowed"),
+                crate::http::router::Dispatch::NotFound => crate::http::response::HttpResponse::new(404, "Not Found"),
+            }
+        }));
+        let server = Arc::new(server);
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        // Real WebSocket upgrade handshake (RFC 6455). The Sec-WebSocket-Key
+        // here is a fixed, arbitrary base64 value -- this test doesn't
+        // verify Sec-WebSocket-Accept's derivation (http::ws's own unit
+        // tests are responsible for that), only that a real upgrade
+        // request produces a 101 and switches this connection to
+        // WebSocket end to end.
+        stream
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .expect("write upgrade request should succeed");
+
+        let mut header_buf = [0u8; 512];
+        let n = stream.read(&mut header_buf).expect("read upgrade response should succeed");
+        let response_text = String::from_utf8_lossy(&header_buf[..n]);
+        assert!(response_text.starts_with("HTTP/1.1 101"), "expected a 101 Switching Protocols response, got: {response_text:?}");
+
+        // Send a masked "ping" text frame (RFC 6455 5.1: client frames
+        // must be masked) and expect the registered handler's "pong"
+        // reply, framed as an ordinary unmasked server text frame.
+        let ping_frame = build_masked_ws_text_frame("ping");
+        stream.write_all(&ping_frame).expect("write ping frame should succeed");
+
+        let mut reply_buf = [0u8; 512];
+        let n = stream.read(&mut reply_buf).expect("read pong reply should succeed");
+        let (opcode, payload) = parse_unmasked_ws_frame(&reply_buf[..n]);
+        assert_eq!(opcode, 0x1, "expected a text frame opcode");
+        assert_eq!(payload, b"pong");
+
+        // Close handshake: a masked close frame from the client should
+        // be echoed back by the server, and the connection should then
+        // actually close (read_to_end returning cleanly at EOF, not
+        // hanging or erroring).
+        let close_frame = build_masked_ws_close_frame();
+        stream.write_all(&close_frame).expect("write close frame should succeed");
+
+        let mut tail = Vec::new();
+        stream.read_to_end(&mut tail).expect("connection should close cleanly after the close handshake completes");
+
+        pool.shutdown();
+    }
+
+    /// Builds a masked WebSocket text frame -- RFC 6455 5.1 requires
+    /// every client-to-server frame to be masked; a fixed, arbitrary
+    /// masking key is used since this test only needs *a* valid mask,
+    /// not to exercise masking's own randomness.
+    fn build_masked_ws_text_frame(text: &str) -> Vec<u8> {
+        let mask: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+        let payload = text.as_bytes();
+        let mut frame = vec![0x81u8]; // FIN + text opcode
+        frame.push(0x80 | (payload.len() as u8)); // MASK bit + payload length (assumes len < 126, true for this test's fixed strings)
+        frame.extend_from_slice(&mask);
+        for (i, &b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i % 4]);
+        }
+        frame
+    }
+
+    /// Builds a masked WebSocket close frame with no payload (a bare
+    /// close, status code omitted -- RFC 6455 7.1.5 permits this).
+    fn build_masked_ws_close_frame() -> Vec<u8> {
+        let mask: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+        vec![0x88u8, 0x80] // FIN + close opcode, MASK bit + zero-length payload
+            .into_iter()
+            .chain(mask.iter().copied())
+            .collect()
+    }
+
+    /// Parses a single unmasked (server-to-client) WebSocket frame,
+    /// returning its opcode and payload -- assumes a short (< 126
+    /// byte) payload, matching what this test's own fixed messages
+    /// need.
+    fn parse_unmasked_ws_frame(data: &[u8]) -> (u8, Vec<u8>) {
+        let opcode = data[0] & 0x0f;
+        assert_eq!(data[1] & 0x80, 0, "a server must never mask its own WebSocket frames");
+        let len = (data[1] & 0x7f) as usize;
+        (opcode, data[2..2 + len].to_vec())
     }
 
     #[test]

@@ -491,8 +491,21 @@ pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1Disp
                     let upgrade_path = request.path.clone();
                     let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
                     queue_http1_response(h1, response);
+                    // The 101 response was just serialized into what's
+                    // about to become the *old* protocol variant's
+                    // write_buf -- extracting its bytes before
+                    // replacing *protocol below is required, not
+                    // optional: WsConnection::with_settings starts
+                    // with a fresh, empty write_buf of its own, so
+                    // without this the 101 response would simply be
+                    // dropped along with the Http1Connection it was
+                    // queued into, and the client would see nothing
+                    // come back for its upgrade request at all.
+                    let pending_101_response = h1.write_buf.as_slice().to_vec();
 
-                    *protocol = ConnectionProtocol::WebSocket(WsConnection::with_settings(pmd, ctx.ws_settings).with_upgrade_path(upgrade_path));
+                    let mut ws = WsConnection::with_settings(pmd, ctx.ws_settings).with_upgrade_path(upgrade_path);
+                    ws.write_buf.push(&pending_101_response);
+                    *protocol = ConnectionProtocol::WebSocket(ws);
                     ctx.server.ws_active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Http1Outcome::SwitchedToWebSocket;
                 }
@@ -509,4 +522,114 @@ pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1Disp
             }
         }
     }
+}
+
+// ─── WebSocket message processing (backend-agnostic) ────────────────────
+
+/// The subset of a worker's per-connection context `process_websocket_input`
+/// needs -- mirrors `Http1DispatchContext`, but WebSocket only ever
+/// needs the router (for `dispatch_websocket`) and the configured
+/// compression threshold, since everything else (frame limits,
+/// masking requirements, ping/pong timers) already lives inside
+/// `WsConnection::inner`'s own state, set once at upgrade time.
+pub struct WsDispatchContext<'a> {
+    pub router: &'a crate::http::router::Router,
+    pub compression_threshold: usize,
+}
+
+/// What happened as a result of feeding newly-arrived bytes through a
+/// WebSocket connection's frame parser -- mirrors `Http1Outcome`'s role
+/// (see its own doc comment): describes what's now sitting in
+/// `write_buf` and whether the connection should close, without this
+/// function performing any I/O itself.
+pub enum WebSocketOutcome {
+    /// Bytes were queued into `write_buf` (an auto-pong, a
+    /// close-handshake echo, or an application-level reply) and should
+    /// be flushed; the connection stays open afterward.
+    FlushThenContinue,
+    /// A protocol error occurred, or the write queue exceeded
+    /// `WsSettings::write_queue_max_bytes` -- whatever is in
+    /// `write_buf` (if anything) should still be flushed, but the
+    /// connection should then be closed.
+    FlushThenClose,
+    /// The close handshake has completed on both sides
+    /// (`WsConnection::is_closed`) -- if anything is queued in
+    /// `write_buf` (this side's own close-frame echo), it should be
+    /// flushed, and the connection closed immediately afterward. Kept
+    /// distinct from `FlushThenClose` (a protocol error or
+    /// backpressure limit) since this is the ordinary, successful end
+    /// of a WebSocket connection's life, not a fault -- callers may
+    /// want to log or account for these differently.
+    ClosedFlushThenClose,
+    /// Nothing was produced and nothing needs to happen -- equivalent
+    /// to `Http1Outcome::NeedsMoreData`, though for WebSocket this
+    /// also covers the ordinary case of a frame that produced no
+    /// reply (e.g. a received application message with no registered
+    /// handler for this connection's route).
+    NoActionNeeded,
+}
+
+/// Advances a WebSocket connection's frame parser with `input`,
+/// dispatches any complete application messages through the server's
+/// registered WS route handler, and queues whatever needs to go back
+/// out (automatic pings/pongs, close-handshake echoes, handler
+/// replies) into `ws.write_buf`. Does no I/O itself -- see
+/// `WebSocketOutcome`'s own doc comment for what the caller does with
+/// its result.
+///
+/// Takes `&mut ConnectionProtocol` for the same reason
+/// `process_http1_read_buf` does -- callers are expected to have
+/// already confirmed `*protocol` is `ConnectionProtocol::WebSocket(_)`.
+/// Unlike HTTP/1.1, a WebSocket connection never switches to a
+/// different `ConnectionProtocol` variant once upgraded, so this
+/// never needs to replace `*protocol` the way an h2c upgrade does.
+pub fn process_websocket_input(protocol: &mut ConnectionProtocol, input: &[u8], ctx: &WsDispatchContext) -> WebSocketOutcome {
+    let ConnectionProtocol::WebSocket(ws) = protocol else {
+        unreachable!("process_websocket_input requires protocol to already be WebSocket")
+    };
+
+    if input.is_empty() {
+        return WebSocketOutcome::NoActionNeeded;
+    }
+
+    let advance_result = ws.inner.advance(input);
+
+    let mut outgoing_messages = Vec::new();
+    for event in &advance_result.events {
+        if let crate::http::ws::WsEvent::Message(msg) = event {
+            if let Some(handler) = ctx.router.dispatch_websocket(&ws.upgrade_path) {
+                if let Some(reply) = handler(msg) {
+                    outgoing_messages.push(reply);
+                }
+            }
+        }
+    }
+
+    ws.write_buf.push(&advance_result.to_send);
+    for reply in outgoing_messages {
+        let framed = match reply {
+            crate::http::ws::WsMessage::Text(text) => ws.inner.send_text(&text, ctx.compression_threshold),
+            crate::http::ws::WsMessage::Binary(data) => ws.inner.send_binary(&data, ctx.compression_threshold),
+        };
+        ws.write_buf.push(&framed);
+    }
+
+    if advance_result.pong_received {
+        ws.last_pong_at = Instant::now();
+        ws.last_ping_sent = None;
+        ws.ping_misses = 0;
+    }
+
+    let over_backpressure_limit = ws.write_buf.as_slice().len() as u64 > ws.write_queue_max_bytes;
+
+    if advance_result.protocol_error || over_backpressure_limit {
+        return WebSocketOutcome::FlushThenClose;
+    }
+    if ws.inner.is_closed() {
+        return WebSocketOutcome::ClosedFlushThenClose;
+    }
+    if !ws.write_buf.is_empty() {
+        return WebSocketOutcome::FlushThenContinue;
+    }
+    WebSocketOutcome::NoActionNeeded
 }
