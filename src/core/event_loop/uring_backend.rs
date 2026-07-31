@@ -272,6 +272,49 @@ fn create_ring_and_check_support(ring_entries: u32) -> Result<IoUring, String> {
 /// disarmed it (see `IORING_CQE_F_MORE` handling below) -- unlike
 /// `Recv`/`Send`, a healthy multishot accept SQE otherwise stays armed
 /// and keeps producing completions on its own.
+/// Calls `getpeername(2)` on an accepted connection's fd and parses
+/// the result into a `SocketAddr` -- see the accept completion
+/// handler's own comment on why this synchronous call is the correct
+/// way to recover the peer address `AcceptMulti` doesn't report,
+/// rather than a limitation to route around. Supports both IPv4 and
+/// IPv6 (`bind_reuseport` prefers a dual-stack IPv6 listener -- see
+/// `net::socket`'s own doc comment -- so an accepted connection's
+/// peer address may legitimately be either family, including an
+/// IPv4-mapped IPv6 address).
+fn get_peer_addr(fd: RawFd) -> std::io::Result<std::net::SocketAddr> {
+    // sockaddr_storage is large enough to hold either sockaddr_in or
+    // sockaddr_in6 -- using the generic storage type here (rather than
+    // committing to one address family upfront) is what lets a single
+    // getpeername(2) call handle both without knowing the family in
+    // advance.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
+    let result = unsafe { libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let addr_in: libc::sockaddr_in = unsafe { std::mem::transmute_copy(&storage) };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(addr_in.sin_addr.s_addr));
+            let port = u16::from_be(addr_in.sin_port);
+            Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+        }
+        libc::AF_INET6 => {
+            let addr_in6: libc::sockaddr_in6 = unsafe { std::mem::transmute_copy(&storage) };
+            let ip = std::net::Ipv6Addr::from(addr_in6.sin6_addr.s6_addr);
+            let port = u16::from_be(addr_in6.sin6_port);
+            Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, addr_in6.sin6_flowinfo, addr_in6.sin6_scope_id)))
+        }
+        family => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("getpeername returned an unexpected address family: {family}"),
+        )),
+    }
+}
+
 fn submit_listener_accept(ring: &mut IoUring, listener_fd: RawFd) -> Result<(), String> {
     let accept_multi = opcode::AcceptMulti::new(types::Fd(listener_fd)).build().user_data(USER_DATA_ACCEPT);
     unsafe {
@@ -482,17 +525,27 @@ impl WorkerBody for EventLoopWorker {
                         }
 
                         let accepted_fd = result;
-                        // AcceptMulti doesn't report the peer's address
-                        // (see opcode::AcceptMulti's own doc comment --
-                        // "no out SockAddr is passed for the multishot
-                        // accept case"), unlike mio_backend's
-                        // listener.accept(), which gets it for free
-                        // from the accept(2) call itself. A real
-                        // remote_addr requires a follow-up
-                        // getpeername(2)-equivalent this backend
-                        // doesn't yet submit -- using a placeholder
-                        // here rather than blocking accept on it.
-                        let placeholder_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+                        // AcceptMulti deliberately doesn't report the
+                        // peer's address the way a plain accept(2)
+                        // does (see opcode::AcceptMulti's own doc
+                        // comment: with multishot, several connections
+                        // can arrive before the application processes
+                        // any one of them, so a single shared addr
+                        // buffer would risk one connection's address
+                        // being overwritten by the next before it's
+                        // read). getpeername(2) is the correct
+                        // follow-up here rather than a design gap to
+                        // work around -- it's a short, synchronous
+                        // syscall that only reads already-known kernel
+                        // state (the established connection's peer
+                        // address), no different in kind from the
+                        // handful of other synchronous, non-blocking
+                        // calls this backend already makes (e.g.
+                        // bind_reuseport itself).
+                        let remote_addr = get_peer_addr(accepted_fd).unwrap_or_else(|e| {
+                            tracing::warn!(worker_id, accepted_fd, error = %e, "getpeername failed for an accepted connection -- falling back to a placeholder address");
+                            "0.0.0.0:0".parse().unwrap()
+                        });
                         let transport = Transport { fd: accepted_fd };
 
                         let entry = connections.vacant_entry();
@@ -510,7 +563,7 @@ impl WorkerBody for EventLoopWorker {
                         generations[new_slab_index] = generations[new_slab_index].wrapping_add(1);
                         let generation = generations[new_slab_index];
 
-                        let mut conn = Connection::new(accepted_fd as u64, transport, placeholder_addr, self.recv_buf_size, generation);
+                        let mut conn = Connection::new(accepted_fd as u64, transport, remote_addr, self.recv_buf_size, generation);
                         conn.protocol = ConnectionProtocol::Http1(Http1Connection::new());
                         entry.insert(conn);
 
@@ -778,6 +831,17 @@ mod tests {
     #[test]
     fn ring_creation_and_probe_check_succeeds_on_this_host() {
         create_ring_and_check_support(256).expect("ring creation and probe check should succeed on a modern Linux host");
+    }
+
+    #[test]
+    fn get_peer_addr_reports_the_real_client_address() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let _client = StdTcpStream::connect(addr).expect("connect");
+        let (accepted, _) = listener.accept().expect("accept");
+
+        let peer = get_peer_addr(accepted.as_raw_fd()).expect("getpeername should succeed on a real connected socket");
+        assert_eq!(peer.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), "peer address should be the real loopback client, not a placeholder");
     }
 
     #[test]
