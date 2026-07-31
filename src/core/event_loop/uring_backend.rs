@@ -68,20 +68,52 @@ use crate::core::worker::{ShutdownSignal, WorkerBody};
 // (RoutaH2Config, WsConfig) rather than being the one thing in this
 // backend a config file couldn't adjust.
 
-/// A connection's `user_data` is packed as `(op_tag << 56) | slab_index`
-/// -- 56 bits is far beyond any realistic connection count, and
-/// keeping the op tag in fixed high bits (rather than, say, a separate
-/// counter) means a completion can be routed back to both "which
-/// connection" and "which operation was in flight for it" from a
-/// single u64 with no additional lookup.
+/// A connection's `user_data` is packed as
+/// `(op_tag << 56) | (generation << 32) | slab_index` -- three fields
+/// sharing one u64 so a completion can be routed back to "which
+/// connection", "which operation was in flight for it", and "is this
+/// completion even still relevant" from a single value with no
+/// additional lookup.
+///
+/// `generation` exists to close a real race: a `Recv`/`Send` SQE
+/// submitted against connection A can still be outstanding in the
+/// kernel at the moment A is removed from `connections` (peer closed,
+/// an error, keep-alive ended) -- `Slab` freely reuses A's old index
+/// for a brand new connection B afterward. Without `generation`, A's
+/// stale completion arriving late would be misread as belonging to
+/// whichever connection now occupies that same slab index -- reading
+/// or writing B's buffers on A's behalf, silently. `generation` is
+/// bumped (see `next_generation`/`WorkerState::generations`) every
+/// time a slot is reused, embedded in every SQE submitted for that
+/// connection's lifetime, and checked against the slot's *current*
+/// generation before a completion is trusted -- a mismatch means the
+/// completion belongs to whatever used to live in that slot, and is
+/// dropped rather than acted on.
 const OP_TAG_BITS: u32 = 56;
+const GENERATION_BITS: u32 = 24;
+const SLAB_INDEX_MASK: u64 = (1u64 << GENERATION_BITS) - 1;
+const GENERATION_MASK: u64 = (1u64 << (OP_TAG_BITS - GENERATION_BITS)) - 1;
+
 const OP_TAG_ACCEPT: u64 = 0;
 const OP_TAG_RECV: u64 = 1;
 const OP_TAG_SEND: u64 = 2;
 const OP_TAG_TIMEOUT: u64 = 3;
+const OP_TAG_CANCEL: u64 = 4;
 
+/// The listener accept SQE has no associated connection slot and is
+/// submitted exactly once per worker (re-armed in place, never
+/// removed and reinserted the way a connection's slab entry is), so it
+/// has no ABA risk to guard against -- generation 0 is used as a fixed
+/// placeholder rather than this backend tracking a real generation for
+/// something that was never subject to the slab-reuse race in the
+/// first place.
 const USER_DATA_ACCEPT: u64 = OP_TAG_ACCEPT << OP_TAG_BITS;
 const USER_DATA_TIMEOUT: u64 = OP_TAG_TIMEOUT << OP_TAG_BITS;
+/// Like `USER_DATA_ACCEPT`/`USER_DATA_TIMEOUT`, a fixed tag with no
+/// per-connection generation -- a cancellation completion carries no
+/// connection state itself (see its own match arm), so there's
+/// nothing for a generation to protect here.
+const USER_DATA_CANCEL: u64 = OP_TAG_CANCEL << OP_TAG_BITS;
 
 /// How long a single `submit_and_wait` call may block before the main
 /// loop is guaranteed to check `ShutdownSignal::is_set()` again --
@@ -93,14 +125,17 @@ const USER_DATA_TIMEOUT: u64 = OP_TAG_TIMEOUT << OP_TAG_BITS;
 /// re-check.
 const LOOP_TIMEOUT_MS: u64 = 200;
 
-fn make_user_data(op_tag: u64, slab_index: usize) -> u64 {
-    (op_tag << OP_TAG_BITS) | (slab_index as u64)
+fn make_user_data(op_tag: u64, generation: u32, slab_index: usize) -> u64 {
+    (op_tag << OP_TAG_BITS) | ((generation as u64 & GENERATION_MASK) << GENERATION_BITS) | (slab_index as u64 & SLAB_INDEX_MASK)
 }
 
-fn split_user_data(user_data: u64) -> (u64, usize) {
+/// Returns `(op_tag, generation, slab_index)` -- the inverse of
+/// `make_user_data`.
+fn split_user_data(user_data: u64) -> (u64, u32, usize) {
     let op_tag = user_data >> OP_TAG_BITS;
-    let slab_index = (user_data & ((1u64 << OP_TAG_BITS) - 1)) as usize;
-    (op_tag, slab_index)
+    let generation = ((user_data >> GENERATION_BITS) & GENERATION_MASK) as u32;
+    let slab_index = (user_data & SLAB_INDEX_MASK) as usize;
+    (op_tag, generation, slab_index)
 }
 
 pub struct EventLoopWorker {
@@ -277,7 +312,7 @@ fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
     let conn = &mut connections[slab_index];
     let recv = opcode::Recv::new(types::Fd(conn.transport.fd), conn.recv_buf.as_mut_ptr(), conn.recv_buf.len() as u32)
         .build()
-        .user_data(make_user_data(OP_TAG_RECV, slab_index));
+        .user_data(make_user_data(OP_TAG_RECV, conn.generation, slab_index));
     unsafe {
         ring.submission()
             .push(&recv)
@@ -310,13 +345,52 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
     let pending = h1.write_buf.as_slice();
     let send = opcode::Send::new(types::Fd(conn.transport.fd), pending.as_ptr(), pending.len() as u32)
         .build()
-        .user_data(make_user_data(OP_TAG_SEND, slab_index));
+        .user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
     unsafe {
         ring.submission()
             .push(&send)
             .map_err(|_| "failed to push send SQE -- submission queue unexpectedly full".to_string())?;
     }
     Ok(())
+}
+
+/// Submits an `AsyncCancel` SQE targeting every outstanding SQE tagged
+/// with `target_user_data` -- used when a connection is about to be
+/// removed from `connections` to ask the kernel to cancel whichever
+/// `Recv`/`Send` is still in flight for it, rather than leaving that
+/// SQE to complete on its own against a slab slot that may already
+/// hold a different connection by then. The cancellation's own
+/// completion (tagged `OP_TAG_CANCEL`) is handled separately and
+/// carries no connection state to act on -- see its own match arm.
+fn submit_cancel(ring: &mut IoUring, target_user_data: u64) -> Result<(), String> {
+    let cancel = opcode::AsyncCancel::new(target_user_data).build().user_data(USER_DATA_CANCEL);
+    unsafe {
+        ring.submission()
+            .push(&cancel)
+            .map_err(|_| "failed to push cancel SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    Ok(())
+}
+
+/// Cancels whatever `Recv`/`Send` SQE is currently outstanding for
+/// `slab_index`'s connection (if any -- `Connection` doesn't track
+/// which operation, if either, is in flight, so this conservatively
+/// submits cancellations for both possible tags; cancelling a tag with
+/// nothing outstanding is a harmless no-op, see `AsyncCancel`'s own
+/// semantics) before it's removed from `connections`. Called from
+/// every path that removes a connection, so a stale completion for it
+/// never has the chance to arrive after the slot's been reused -- the
+/// `generation` check in the main loop is this backend's second,
+/// independent line of defense against that same race (see
+/// `make_user_data`'s own doc comment), not a substitute for actually
+/// asking the kernel to stop the operation.
+fn cancel_outstanding_operations(ring: &mut IoUring, generation: u32, slab_index: usize) {
+    for op_tag in [OP_TAG_RECV, OP_TAG_SEND] {
+        let target = make_user_data(op_tag, generation, slab_index);
+        if let Err(reason) = submit_cancel(ring, target) {
+            tracing::warn!(%reason, "failed to submit cancellation for an outstanding operation");
+        }
+    }
 }
 
 impl WorkerBody for EventLoopWorker {
@@ -350,6 +424,14 @@ impl WorkerBody for EventLoopWorker {
         }
 
         let mut connections: Slab<Connection> = Slab::new();
+        // Parallel to `connections`: `generations[i]` is the
+        // generation currently valid for slab index `i`, bumped every
+        // time that slot is reused for a new connection -- see
+        // `make_user_data`'s own doc comment for the race this closes.
+        // Grown lazily alongside `connections` rather than
+        // pre-sized, since slab indices are handed out in whatever
+        // order `Slab::vacant_entry` picks.
+        let mut generations: Vec<u32> = Vec::new();
 
         loop {
             if shutdown.is_set() {
@@ -382,7 +464,7 @@ impl WorkerBody for EventLoopWorker {
             let mut multishot_accept_disarmed = false;
 
             for (user_data, result, flags) in completions {
-                let (op_tag, slab_index) = split_user_data(user_data);
+                let (op_tag, completion_generation, slab_index) = split_user_data(user_data);
 
                 match op_tag {
                     OP_TAG_ACCEPT => {
@@ -412,15 +494,29 @@ impl WorkerBody for EventLoopWorker {
                         // here rather than blocking accept on it.
                         let placeholder_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
                         let transport = Transport { fd: accepted_fd };
-                        let mut conn = Connection::new(accepted_fd as u64, transport, placeholder_addr, self.recv_buf_size);
-                        conn.protocol = ConnectionProtocol::Http1(Http1Connection::new());
 
                         let entry = connections.vacant_entry();
                         let new_slab_index = entry.key();
+                        if new_slab_index >= generations.len() {
+                            generations.resize(new_slab_index + 1, 0);
+                        }
+                        // Bump this slot's generation before it's
+                        // handed to a new connection -- any SQE tagged
+                        // with the *previous* generation (from whatever
+                        // used to occupy this slot) that completes
+                        // late is now guaranteed to mismatch and be
+                        // dropped rather than mistaken for this new
+                        // connection's own I/O.
+                        generations[new_slab_index] = generations[new_slab_index].wrapping_add(1);
+                        let generation = generations[new_slab_index];
+
+                        let mut conn = Connection::new(accepted_fd as u64, transport, placeholder_addr, self.recv_buf_size, generation);
+                        conn.protocol = ConnectionProtocol::Http1(Http1Connection::new());
                         entry.insert(conn);
 
                         if let Err(reason) = submit_recv(&mut ring, &mut connections, new_slab_index) {
                             tracing::warn!(worker_id, %reason, "failed to submit initial recv for accepted connection");
+                            cancel_outstanding_operations(&mut ring, generation, new_slab_index);
                             connections.remove(new_slab_index);
                         }
 
@@ -437,10 +533,18 @@ impl WorkerBody for EventLoopWorker {
                         if !connections.contains(slab_index) {
                             continue; // connection already closed by the time this completion arrived
                         }
+                        if connections[slab_index].generation != completion_generation {
+                            // Stale completion from whatever used to
+                            // occupy this slot -- see make_user_data's
+                            // own doc comment. The current occupant's
+                            // own Recv is unaffected; nothing to do.
+                            continue;
+                        }
                         if result <= 0 {
                             // 0 means the peer closed (EOF); negative
                             // is a real error -- either way, this
                             // connection is done.
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             continue;
                         }
@@ -451,6 +555,7 @@ impl WorkerBody for EventLoopWorker {
                             conn.touch();
                             let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
                                 tracing::warn!(worker_id, slab_index, "recv completion for a connection whose protocol is not Http1 -- H2/WS are not yet driven by this backend");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                                 continue;
                             };
@@ -484,6 +589,7 @@ impl WorkerBody for EventLoopWorker {
                             Http1Outcome::NeedsMoreData => {
                                 if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
                                     tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
                                 }
                             }
@@ -497,6 +603,7 @@ impl WorkerBody for EventLoopWorker {
                                 // its own comment.
                                 if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
                                     tracing::warn!(worker_id, %reason, "failed to submit response send");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
                                 }
                             }
@@ -514,6 +621,7 @@ impl WorkerBody for EventLoopWorker {
                                 // silently leaving the connection in an
                                 // inconsistent, half-upgraded state.
                                 tracing::warn!(worker_id, slab_index, "connection requested an h2c/WebSocket upgrade -- not yet supported by this backend, closing");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                             }
                         }
@@ -523,7 +631,14 @@ impl WorkerBody for EventLoopWorker {
                         if !connections.contains(slab_index) {
                             continue;
                         }
+                        if connections[slab_index].generation != completion_generation {
+                            // Stale completion from whatever used to
+                            // occupy this slot -- see make_user_data's
+                            // own doc comment.
+                            continue;
+                        }
                         if result < 0 {
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             continue;
                         }
@@ -532,6 +647,7 @@ impl WorkerBody for EventLoopWorker {
                         let should_close = {
                             let conn = &mut connections[slab_index];
                             let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                                 continue;
                             };
@@ -541,6 +657,7 @@ impl WorkerBody for EventLoopWorker {
                         };
 
                         if should_close {
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             continue;
                         }
@@ -558,6 +675,7 @@ impl WorkerBody for EventLoopWorker {
                             // same response before doing anything else.
                             if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
                                 tracing::warn!(worker_id, %reason, "failed to submit remainder of a partially-sent response");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                             }
                         } else {
@@ -567,9 +685,24 @@ impl WorkerBody for EventLoopWorker {
                             // connection.
                             if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
                                 tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                             }
                         }
+                    }
+
+                    OP_TAG_CANCEL => {
+                        // Nothing to act on -- the cancellation
+                        // completion carries no connection state, and
+                        // whichever connection its target belonged to
+                        // has already been (or is being) removed by
+                        // the caller that submitted this cancel; see
+                        // cancel_outstanding_operations's own doc
+                        // comment. A negative result here (e.g.
+                        // -ENOENT, meaning there was nothing to cancel
+                        // in the first place -- an expected, harmless
+                        // outcome per AsyncCancel's own semantics) is
+                        // not logged as a warning for that reason.
                     }
 
                     OP_TAG_TIMEOUT => {
@@ -621,11 +754,25 @@ mod tests {
     #[test]
     fn user_data_packing_round_trips() {
         for slab_index in [0usize, 1, 42, 1_000_000] {
-            for op_tag in [OP_TAG_ACCEPT, OP_TAG_RECV, OP_TAG_SEND] {
-                let packed = make_user_data(op_tag, slab_index);
-                assert_eq!(split_user_data(packed), (op_tag, slab_index));
+            for generation in [0u32, 1, 255, 1_000_000] {
+                for op_tag in [OP_TAG_ACCEPT, OP_TAG_RECV, OP_TAG_SEND, OP_TAG_TIMEOUT, OP_TAG_CANCEL] {
+                    let packed = make_user_data(op_tag, generation, slab_index);
+                    assert_eq!(split_user_data(packed), (op_tag, generation, slab_index));
+                }
             }
         }
+    }
+
+    #[test]
+    fn different_generations_produce_different_user_data_for_the_same_slot() {
+        // The exact property make_user_data exists to provide: two
+        // completions for the same op tag and slab index, but
+        // different generations, must be distinguishable -- this is
+        // what lets the main loop recognize a stale completion from a
+        // slot's previous occupant.
+        let gen1 = make_user_data(OP_TAG_RECV, 1, 5);
+        let gen2 = make_user_data(OP_TAG_RECV, 2, 5);
+        assert_ne!(gen1, gen2);
     }
 
     #[test]

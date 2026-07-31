@@ -87,10 +87,19 @@ pub struct Connection {
     /// io_uring SQE's buffer does (see `core::event_loop::uring_backend`'s
     /// own doc comment on buffer ownership).
     pub recv_buf: Vec<u8>,
+    /// This slot's current generation, embedded in every SQE's
+    /// `user_data` for as long as this connection occupies it -- see
+    /// `core::event_loop::uring_backend`'s `make_user_data` for the
+    /// ABA-style race this guards against. Set by the caller managing
+    /// this connection's `Slab` slot (see `EventLoopWorker`'s own
+    /// per-slot generation counters), not derived from anything this
+    /// type tracks on its own -- `Connection` has no notion of "which
+    /// slot" it occupies, only the backend driving it does.
+    pub generation: u32,
 }
 
 impl Connection {
-    pub fn new(id: ConnId, transport: Transport, remote_addr: SocketAddr, recv_buf_size: usize) -> Self {
+    pub fn new(id: ConnId, transport: Transport, remote_addr: SocketAddr, recv_buf_size: usize, generation: u32) -> Self {
         let now = Instant::now();
         Connection {
             id,
@@ -101,6 +110,7 @@ impl Connection {
             last_active_at: now,
             closing: false,
             recv_buf: vec![0u8; recv_buf_size],
+            generation,
         }
     }
 
@@ -131,7 +141,7 @@ mod tests {
     fn plain_connection_reports_not_tls() {
         let (fd, addr) = accept_one_connection();
         let transport = Transport { fd };
-        let conn = Connection::new(1, transport, addr, 4096);
+        let conn = Connection::new(1, transport, addr, 4096, 0);
         assert!(!conn.is_tls());
         assert!(conn.transport.alpn_protocol().is_none());
         assert!(matches!(conn.protocol, ConnectionProtocol::Handshaking));
@@ -142,7 +152,7 @@ mod tests {
     fn touch_updates_last_active_at() {
         let (fd, addr) = accept_one_connection();
         let transport = Transport { fd };
-        let mut conn = Connection::new(1, transport, addr, 4096);
+        let mut conn = Connection::new(1, transport, addr, 4096, 0);
         let before = conn.last_active_at;
         std::thread::sleep(std::time::Duration::from_millis(5));
         conn.touch();
