@@ -38,6 +38,24 @@ pub fn validate(cfg: &RoutaConfig) -> Vec<ValidationError> {
         errors.push(err(format!("invalid n_workers: {} (must be 1-256)", cfg.n_workers)));
     }
 
+    if !(8..=4096).contains(&cfg.io_uring.ring_entries) {
+        errors.push(err(format!(
+            "invalid io_uring_ring_entries: {} (must be 8-4096)",
+            cfg.io_uring.ring_entries
+        )));
+    } else if !(cfg.io_uring.ring_entries as u32).is_power_of_two() {
+        errors.push(err(format!(
+            "invalid io_uring_ring_entries: {} (must be a power of two -- io_uring's submission/completion rings require it)",
+            cfg.io_uring.ring_entries
+        )));
+    }
+    if cfg.io_uring.recv_buf_size < 512 {
+        errors.push(err(format!(
+            "invalid io_uring_recv_buf_size: {} (must be at least 512 bytes)",
+            cfg.io_uring.recv_buf_size
+        )));
+    }
+
     if cfg.tls_enabled {
         if cfg.tls_cert.is_empty() || cfg.tls_key.is_empty() {
             errors.push(err("tls_enabled is set but tls_cert/tls_key are not both provided".to_string()));

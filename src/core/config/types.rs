@@ -120,6 +120,39 @@ impl Default for WsConfig {
     }
 }
 
+// ─── io_uring backend config ────────────────────────────────────────────
+
+/// Tuning for the io_uring backend -- meaningless when the `io_uring`
+/// Cargo feature isn't compiled in (the mio/epoll backend has no
+/// equivalent knobs, since it has no ring or per-connection fixed
+/// buffer to size), but parsed unconditionally regardless of which
+/// backend a given build selects: a config file shouldn't need to
+/// change depending on how the binary it's feeding was compiled, and
+/// `tests/config_wiring.rs`'s wiring check runs against every field
+/// here whether or not `io_uring` is enabled for that particular test
+/// run.
+#[derive(Debug, Clone)]
+pub struct RoutaIoUringConfig {
+    /// Submission/completion queue depth for each worker's ring.
+    /// Higher values tolerate more simultaneously in-flight
+    /// operations (accepts, reads, writes all queued at once) before
+    /// a submission fails with "queue full" -- default: 256.
+    pub ring_entries: i32,
+    /// Per-connection fixed recv buffer size in bytes -- default:
+    /// 16384, matching the chunk size `mio_backend`'s own transport
+    /// reads use.
+    pub recv_buf_size: i64,
+}
+
+impl Default for RoutaIoUringConfig {
+    fn default() -> Self {
+        RoutaIoUringConfig {
+            ring_entries: 256,
+            recv_buf_size: 16_384,
+        }
+    }
+}
+
 // ─── File cache sub-enums ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -402,6 +435,11 @@ pub struct RoutaConfig {
     // WebSocket
     pub ws: WsConfig,
 
+    // io_uring backend tuning -- see RoutaIoUringConfig's own doc
+    // comment for why this is parsed regardless of which backend a
+    // given build selects
+    pub io_uring: RoutaIoUringConfig,
+
     // Socket buffer sizes (0 = OS default)
     pub socket_recv_buf_size: i32,
     pub socket_send_buf_size: i32,
@@ -504,6 +542,7 @@ impl Default for RoutaConfig {
             file_cache_watch: FileCacheWatch::default(),
             h2: RoutaH2Config::default(),
             ws: WsConfig::default(),
+            io_uring: RoutaIoUringConfig::default(),
             socket_recv_buf_size: 0,
             socket_send_buf_size: 0,
             cpu_affinity_enabled: false,

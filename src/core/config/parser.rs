@@ -617,6 +617,11 @@ fn parse_top_level_key(
         }
         "numa_aware_enabled" => cfg.numa_aware_enabled = cfg_atob(val, false, ctx, lineno),
 
+        "io_uring_ring_entries" => cfg.io_uring.ring_entries = cfg_atoi(val, 256),
+        "io_uring_recv_buf_size" => {
+            cfg.io_uring.recv_buf_size = cfg_size_bytes(val, 16_384, ctx, lineno)
+        }
+
         "ws_enabled" => cfg.ws.enabled = cfg_atob(val, false, ctx, lineno),
         "ws_max_connections" => cfg.ws.max_connections = cfg_atoi(val, 10_000),
         "ws_idle_timeout_ms" => {

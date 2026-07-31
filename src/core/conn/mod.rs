@@ -28,6 +28,6 @@ mod mio_conn;
 pub use mio_conn::*;
 
 #[cfg(feature = "io_uring")]
-mod uring_conn;
+pub(crate) mod uring_conn;
 #[cfg(feature = "io_uring")]
 pub use uring_conn::*;

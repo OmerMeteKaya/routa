@@ -79,10 +79,18 @@ pub struct Connection {
     /// fatal I/O error, or the server initiating a graceful drain) --
     /// checked before scheduling any further I/O on it.
     pub closing: bool,
+    /// Fixed-size recv buffer a `Recv` SQE reads into -- a backend-specific
+    /// detail `mio_conn::Connection` has no equivalent of, since mio's
+    /// synchronous `read()` only ever needs a transient stack buffer,
+    /// never one that has to stay at a stable address across an
+    /// outstanding operation the way a submitted-but-not-yet-completed
+    /// io_uring SQE's buffer does (see `core::event_loop::uring_backend`'s
+    /// own doc comment on buffer ownership).
+    pub recv_buf: Vec<u8>,
 }
 
 impl Connection {
-    pub fn new(id: ConnId, transport: Transport, remote_addr: SocketAddr) -> Self {
+    pub fn new(id: ConnId, transport: Transport, remote_addr: SocketAddr, recv_buf_size: usize) -> Self {
         let now = Instant::now();
         Connection {
             id,
@@ -92,6 +100,7 @@ impl Connection {
             created_at: now,
             last_active_at: now,
             closing: false,
+            recv_buf: vec![0u8; recv_buf_size],
         }
     }
 
@@ -122,17 +131,18 @@ mod tests {
     fn plain_connection_reports_not_tls() {
         let (fd, addr) = accept_one_connection();
         let transport = Transport { fd };
-        let conn = Connection::new(1, transport, addr);
+        let conn = Connection::new(1, transport, addr, 4096);
         assert!(!conn.is_tls());
         assert!(conn.transport.alpn_protocol().is_none());
         assert!(matches!(conn.protocol, ConnectionProtocol::Handshaking));
+        assert_eq!(conn.recv_buf.len(), 4096);
     }
 
     #[test]
     fn touch_updates_last_active_at() {
         let (fd, addr) = accept_one_connection();
         let transport = Transport { fd };
-        let mut conn = Connection::new(1, transport, addr);
+        let mut conn = Connection::new(1, transport, addr, 4096);
         let before = conn.last_active_at;
         std::thread::sleep(std::time::Duration::from_millis(5));
         conn.touch();

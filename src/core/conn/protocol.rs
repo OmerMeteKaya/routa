@@ -236,3 +236,277 @@ impl WsConnection {
         }
     }
 }
+
+// ─── HTTP/1.1 request processing (backend-agnostic) ─────────────────────
+
+/// What the caller needs to do next after `process_http1_read_buf`
+/// advances an `Http1Connection`'s state as far as it currently can.
+/// None of these variants involve this module doing any I/O itself --
+/// see this module's own doc comment -- they only describe what's now
+/// sitting in `write_buf` (or which protocol the connection just
+/// switched to) so each backend can drive its own transport
+/// accordingly (a synchronous write for `mio_backend`, a `Send` SQE
+/// submission for `uring_backend`).
+pub enum Http1Outcome {
+    /// No complete request is available yet -- nothing was queued into
+    /// `write_buf`, no I/O is needed, just wait for more bytes to
+    /// arrive and call this again.
+    NeedsMoreData,
+    /// A response is queued in `write_buf`; once the caller has
+    /// flushed it, this connection should be closed (a malformed
+    /// request, or a request whose response set `Connection: close`).
+    FlushThenClose,
+    /// A response is queued in `write_buf`; once the caller has
+    /// flushed it, driving this connection should continue normally --
+    /// `read_buf` may already hold a further pipelined request.
+    FlushThenContinue,
+    /// The connection has just switched to
+    /// `ConnectionProtocol::Http2` (an h2c upgrade) -- the `101`
+    /// response is already queued in what was `Http1Connection::write_buf`
+    /// and must be flushed to the transport before the caller drives
+    /// any `Http2` state at all, since the switch already replaced
+    /// this connection's `protocol` by the time this returns.
+    SwitchedToHttp2,
+    /// The connection has just switched to
+    /// `ConnectionProtocol::WebSocket` -- same flush-before-anything-else
+    /// requirement as `SwitchedToHttp2` above.
+    SwitchedToWebSocket,
+}
+
+/// Reads `Sec-WebSocket-Extensions` back off the handshake response
+/// (rather than the original request) so the negotiated parameters
+/// this connection actually uses match exactly what was sent to the
+/// client -- see `http::middleware`'s WS upgrade handler (wherever
+/// that's registered) for where the response's own PMD negotiation
+/// happens.
+fn negotiate_pmd_from_response(response: &crate::http::response::HttpResponse, compression_level: u32) -> Option<crate::http::ws::PmdContext> {
+    let ext = response.get_header("Sec-WebSocket-Extensions")?;
+    if !ext.contains("permessage-deflate") {
+        return None;
+    }
+    let params = crate::http::ws::PmdParams {
+        server_no_context_takeover: ext.contains("server_no_context_takeover"),
+        client_no_context_takeover: ext.contains("client_no_context_takeover"),
+    };
+    Some(crate::http::ws::PmdContext::with_compression_level(params, compression_level))
+}
+
+/// Serializes `response` into `h1.write_buf` (headers plus body, or
+/// just headers with the body deferred to `PendingFileSend` if it was
+/// file-backed). Only the file-body deferral shape (`PendingFileSend`)
+/// is backend-agnostic here -- actually sending that file's bytes is
+/// transport-specific and left to each backend's own flush logic.
+fn queue_http1_response(h1: &mut Http1Connection, mut response: crate::http::response::HttpResponse) {
+    let file_body = response.file_body.take();
+
+    let mut serialized = crate::util::buf::Buf::new();
+    response.serialize(&mut serialized); // body is empty when file_body was Some, so this only writes headers
+    h1.write_buf.push(serialized.as_slice());
+
+    if let Some(fb) = file_body {
+        h1.pending_file = Some(PendingFileSend {
+            file: fb.file,
+            offset: fb.offset,
+            remaining: fb.len,
+        });
+    }
+}
+
+/// The subset of a worker's per-connection context `process_http1_read_buf`
+/// needs -- computed once per worker (see each backend's own setup,
+/// mirroring `Http2Settings`/`WsSettings`) rather than threaded through
+/// as a long parameter list. Deliberately excludes anything
+/// transport-specific (no poller, no fd, no ring): this function's
+/// whole point is not needing to know which backend is calling it.
+pub struct Http1DispatchContext<'a> {
+    pub server: &'a crate::core::server::RoutaServer,
+    pub max_request_size: usize,
+    pub h2_settings: &'a Http2Settings,
+    pub ws_settings: &'a WsSettings,
+    pub h2c_upgrade_enabled: bool,
+    pub ws_enabled: bool,
+    pub ws_max_connections: usize,
+    pub ws_permessage_deflate: bool,
+    pub remote_addr: std::net::IpAddr,
+}
+
+/// Advances an HTTP/1.1 connection's state as far as the bytes
+/// currently sitting in its `read_buf` allow: parses as many complete
+/// requests as are available, dispatches each through the server's
+/// middleware chain, and queues the serialized response(s) into
+/// `write_buf` -- switching `*protocol` to `Http2` or `WebSocket`
+/// in-place if a request warranted it (h2c upgrade, or an accepted
+/// WebSocket `Upgrade`). Does no I/O itself -- see `Http1Outcome`'s own
+/// doc comment for what the caller does with its result.
+///
+/// Takes `&mut ConnectionProtocol` rather than `&mut Http1Connection`
+/// directly because an h2c upgrade needs to replace the variant itself
+/// partway through (the same thing mio_backend's original drive_http1
+/// did in place) -- callers are expected to have already confirmed
+/// `*protocol` is `ConnectionProtocol::Http1(_)` before calling this,
+/// the same precondition `drive_http1` always had.
+pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1DispatchContext) -> Http1Outcome {
+    loop {
+        let (parse_outcome, _request_started_at) = {
+            let ConnectionProtocol::Http1(h1) = protocol else {
+                unreachable!("process_http1_read_buf requires protocol to already be Http1")
+            };
+            (crate::http::request::parse(&h1.read_buf, ctx.max_request_size), h1.request_started_at)
+        };
+
+        match parse_outcome {
+            crate::http::request::ParseOutcome::Incomplete => return Http1Outcome::NeedsMoreData,
+
+            crate::http::request::ParseOutcome::NeedsContinue { method, path, headers } => {
+                let already_sent = {
+                    let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                    h1.continue_sent
+                };
+                if !already_sent {
+                    let probe_request = crate::http::request::HttpRequest {
+                        method,
+                        remote_addr: Some(ctx.remote_addr),
+                        path: path.clone(),
+                        query: None,
+                        query_params: Vec::new(),
+                        version_major: 1,
+                        version_minor: 1,
+                        headers: headers.clone(),
+                        body: Vec::new(),
+                        keep_alive: true,
+                        trailers: Vec::new(),
+                    };
+                    let route_exists = !matches!(
+                        ctx.server.router.dispatch(&probe_request),
+                        crate::http::router::Dispatch::NotFound | crate::http::router::Dispatch::MethodNotAllowed { .. }
+                    );
+                    let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                    if route_exists {
+                        h1.write_buf.push(b"HTTP/1.1 100 Continue");
+                        h1.write_buf.push(&[13, 10, 13, 10]);
+                        h1.continue_sent = true;
+                        // NeedsContinue is reported again on every
+                        // call until the body finishes arriving -- the
+                        // 100 Continue above only needs to be queued
+                        // once (continue_sent guards that), and no
+                        // response is complete yet, so this isn't a
+                        // flush point: wait for more data exactly like
+                        // the Incomplete case.
+                        return Http1Outcome::NeedsMoreData;
+                    } else {
+                        let mut resp = ctx.server.middleware_chain.execute(&probe_request);
+                        resp.set_header("Connection", "close");
+                        queue_http1_response(h1, resp);
+                        return Http1Outcome::FlushThenClose;
+                    }
+                }
+                return Http1Outcome::NeedsMoreData;
+            }
+
+            crate::http::request::ParseOutcome::Invalid(_) => {
+                let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                let mut resp = crate::http::response::HttpResponse::new(400, "Bad Request");
+                resp.set_header("Connection", "close");
+                queue_http1_response(h1, resp);
+                return Http1Outcome::FlushThenClose;
+            }
+
+            crate::http::request::ParseOutcome::Complete { mut request, consumed } => {
+                request.remote_addr = Some(ctx.remote_addr);
+
+                {
+                    let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                    h1.read_buf.consume(consumed);
+                    h1.request_started_at = None;
+                    h1.continue_sent = false;
+                }
+
+                if ctx.h2c_upgrade_enabled && crate::http::h2::is_h2c_upgrade_request(&request) {
+                    let settings_payload = crate::http::h2::decode_http2_settings_header(&request).unwrap_or_default();
+                    let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                    let mut resp = crate::http::response::HttpResponse::new(101, "Switching Protocols");
+                    resp.set_header("Connection", "Upgrade");
+                    resp.set_header("Upgrade", "h2c");
+                    queue_http1_response(h1, resp);
+
+                    let mut h2 = Http2Connection::new(ctx.h2_settings);
+                    h2.inner.assume_preface_received();
+                    h2.inner.apply_upgrade_settings(&settings_payload);
+                    h2.write_buf.push(&h2.inner.initial_send());
+                    *protocol = ConnectionProtocol::Http2(h2);
+                    return Http1Outcome::SwitchedToHttp2;
+                }
+
+                let is_upgrade = crate::http::ws::is_upgrade_request(&request);
+                let request_body_len = request.body.len();
+                let method_str = format!("{:?}", request.method).to_uppercase();
+                let route = request.path.clone();
+                ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).inc();
+                let dispatch_start = std::time::Instant::now();
+                let response = ctx.server.middleware_chain.execute(&request);
+                let duration_secs = dispatch_start.elapsed().as_secs_f64();
+                ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
+                ctx.server.metrics.record_request(
+                    &method_str,
+                    &route,
+                    response.status,
+                    duration_secs,
+                    request_body_len,
+                    response.body().len(),
+                );
+
+                let mut response = response;
+                if !response.early_hints.is_empty() {
+                    let mut early_hints_response = String::from("HTTP/1.1 103 Early Hints\r\n");
+                    for (name, value) in &response.early_hints {
+                        early_hints_response.push_str(name);
+                        early_hints_response.push_str(": ");
+                        early_hints_response.push_str(value);
+                        early_hints_response.push_str("\r\n");
+                    }
+                    early_hints_response.push_str("\r\n");
+                    let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                    h1.write_buf.push(early_hints_response.as_bytes());
+                }
+                if request.method == crate::http::request::HttpMethod::Head {
+                    response.strip_body_for_head();
+                }
+
+                if is_upgrade && response.status == 101 {
+                    let over_capacity = ctx.server.ws_active_connections.load(std::sync::atomic::Ordering::Relaxed) >= ctx.ws_max_connections;
+                    if !ctx.ws_enabled || over_capacity {
+                        let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                        let mut resp = crate::http::response::HttpResponse::new(503, "Service Unavailable");
+                        resp.set_header("Connection", "close");
+                        resp.set_body(b"WebSocket unavailable\n".to_vec());
+                        queue_http1_response(h1, resp);
+                        return Http1Outcome::FlushThenClose;
+                    }
+
+                    let pmd = if ctx.ws_permessage_deflate {
+                        negotiate_pmd_from_response(&response, ctx.ws_settings.compression_level)
+                    } else {
+                        None
+                    };
+                    let upgrade_path = request.path.clone();
+                    let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                    queue_http1_response(h1, response);
+
+                    *protocol = ConnectionProtocol::WebSocket(WsConnection::with_settings(pmd, ctx.ws_settings).with_upgrade_path(upgrade_path));
+                    ctx.server.ws_active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Http1Outcome::SwitchedToWebSocket;
+                }
+
+                let keep_alive = request.keep_alive && response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
+                let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
+                queue_http1_response(h1, response);
+                h1.keep_alive = keep_alive;
+
+                if !keep_alive {
+                    return Http1Outcome::FlushThenClose;
+                }
+                return Http1Outcome::FlushThenContinue;
+            }
+        }
+    }
+}
