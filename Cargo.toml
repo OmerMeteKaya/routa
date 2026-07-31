@@ -3,6 +3,14 @@ name = "routa"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Opt-in, Linux-only completion-based I/O backend, selected at compile
+# time as a full alternative to the default mio/epoll backend -- see
+# core::event_loop and core::conn module docs. Never enabled together
+# with the default backend in the same binary.
+io_uring = ["dep:io-uring"]
+
 [dependencies]
 mio = { version = "1", features = ["os-poll", "net"] }
 rustls = "0.23"
@@ -29,6 +37,7 @@ tracing-appender = "0.2"
 signal-hook = "0.3"
 libc = "0.2"
 brotli = "6"
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 rcgen = "0.14"
