@@ -535,10 +535,26 @@ fn webpki_roots_certs() -> impl Iterator<Item = rustls::pki_types::TrustAnchor<'
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) fn generate_test_identity(
+    hostname: &str,
+) -> (
+    CertificateDer<'static>,
+    PrivateKeyDer<'static>,
+    CertificateDer<'static>,
+) {
     use rcgen::{generate_simple_self_signed, CertifiedKey as RcgenCertifiedKey};
     use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let RcgenCertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(vec![hostname.to_string()]).expect("generate cert");
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+    let trust_anchor_der = cert_der.clone();
+    (cert_der, key_der, trust_anchor_der)
+}
+
+mod tests {
+    use super::*;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -549,20 +565,6 @@ mod tests {
     /// suitable for adding directly to a `RootCertStore` (since it's
     /// self-signed, the certificate itself doubles as its own trust
     /// anchor).
-    fn generate_test_identity(
-        hostname: &str,
-    ) -> (
-        CertificateDer<'static>,
-        PrivateKeyDer<'static>,
-        CertificateDer<'static>,
-    ) {
-        let RcgenCertifiedKey { cert, signing_key } =
-            generate_simple_self_signed(vec![hostname.to_string()]).expect("generate cert");
-        let cert_der = CertificateDer::from(cert.der().to_vec());
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
-        let trust_anchor_der = cert_der.clone();
-        (cert_der, key_der, trust_anchor_der)
-    }
 
     #[test]
     fn server_context_builds_and_creates_connection() {
@@ -874,5 +876,134 @@ mod tests {
         // above).
         let conn = ctx.new_server_connection();
         assert!(conn.is_ok());
+    }
+}
+
+// ─── In-memory TLS transport (for completion-based I/O backends) ────────
+
+/// A fake transport for `TlsConnection::advance_io`, backed entirely
+/// by in-memory buffers rather than a real socket -- lets a
+/// completion-based I/O backend (io_uring, where reading and writing
+/// are separate submit/completion steps rather than a single
+/// synchronous call) drive rustls's handshake and record-layer state
+/// machine without rustls itself needing to know anything changed.
+///
+/// `advance_io`'s only requirement of its `socket` parameter is that
+/// it implements `Read`/`Write` -- rustls's own `read_tls`/`write_tls`
+/// treat it as an opaque source/sink for encrypted bytes, with no
+/// assumption that it's a real, kernel-backed socket. That's what
+/// makes this possible: the caller (a completion-based backend) fills
+/// `incoming` with whatever ciphertext a real `Recv` completion just
+/// delivered, calls `advance_io` with this as the "socket", and then
+/// submits `outgoing`'s accumulated bytes as a real `Send` SQE --
+/// `MemoryTlsIo` itself never touches a file descriptor.
+pub struct MemoryTlsIo {
+    /// Encrypted bytes received from the peer, not yet consumed by
+    /// `read_tls`. The caller pushes newly-arrived ciphertext here
+    /// before calling `advance_io`.
+    pub incoming: crate::util::buf::Buf,
+    /// Encrypted bytes rustls has produced (handshake messages, or
+    /// application data queued via `write_plaintext`) and is ready to
+    /// send. The caller drains this after `advance_io` returns, to
+    /// submit as a real `Send`.
+    pub outgoing: crate::util::buf::Buf,
+}
+
+impl MemoryTlsIo {
+    pub fn new() -> Self {
+        MemoryTlsIo {
+            incoming: crate::util::buf::Buf::new(),
+            outgoing: crate::util::buf::Buf::new(),
+        }
+    }
+}
+
+impl Default for MemoryTlsIo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Read for MemoryTlsIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.incoming.as_slice();
+        if available.is_empty() {
+            // Mirrors a real non-blocking socket's EAGAIN -- rustls's
+            // own read_tls (and everything in advance_io built on top
+            // of it) already treats WouldBlock as "nothing more to do
+            // this pass", the same meaning it has for a real socket
+            // with nothing currently available.
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "no more buffered ciphertext available"));
+        }
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.incoming.consume(n);
+        Ok(n)
+    }
+}
+
+impl Write for MemoryTlsIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.outgoing.push(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(()) // nothing buffered beyond `outgoing` itself, which the caller drains directly
+    }
+}
+
+#[cfg(test)]
+mod memory_tls_io_tests {
+    use super::*;
+
+    /// A full TLS handshake between a real `TlsConnection::new_server`
+    /// and a real `TlsConnection::new_client`, driven entirely through
+    /// two `MemoryTlsIo` instances passed to `advance_io` -- no real
+    /// socket anywhere. Proves the completion-based backend's intended
+    /// usage pattern (fill `incoming`, call `advance_io`, drain
+    /// `outgoing`, hand those bytes to the peer) actually completes a
+    /// real handshake, before any of it is wired into a real io_uring
+    /// submit/completion loop.
+    #[test]
+    fn full_handshake_completes_through_purely_in_memory_transports() {
+        let (cert_der, key_der, trust_anchor_der) = generate_test_identity("localhost");
+        let ctx = TlsContext::builder_from_der(vec![cert_der], key_der)
+            .expect("build context")
+            .build()
+            .expect("finish building context");
+
+        let mut server = TlsConnection::new_server(&ctx).expect("create server connection");
+        let mut root_store = RootCertStore::empty();
+        root_store.add(trust_anchor_der).expect("add test cert to root store");
+        let mut client = TlsConnection::new_client_with_roots("localhost", vec![], root_store).expect("create client connection");
+
+        let mut server_io = MemoryTlsIo::new();
+        let mut client_io = MemoryTlsIo::new();
+
+        // Ping-pong advance_io on both sides, shuttling each side's
+        // outgoing bytes into the other's incoming buffer, until
+        // neither side has anything left to do -- the same shape a
+        // real completion-based event loop's accept/recv/send cycle
+        // would follow, just without any real fd in between.
+        for _ in 0..20 {
+            let _ = client.advance_io(&mut client_io);
+            let _ = server.advance_io(&mut server_io);
+
+            let client_out = client_io.outgoing.as_slice().to_vec();
+            client_io.outgoing.reset();
+            server_io.incoming.push(&client_out);
+
+            let server_out = server_io.outgoing.as_slice().to_vec();
+            server_io.outgoing.reset();
+            client_io.incoming.push(&server_out);
+
+            if !client.is_handshaking() && !server.is_handshaking() && client_out.is_empty() && server_out.is_empty() {
+                break;
+            }
+        }
+
+        assert!(!client.is_handshaking(), "client handshake should have completed");
+        assert!(!server.is_handshaking(), "server handshake should have completed");
     }
 }

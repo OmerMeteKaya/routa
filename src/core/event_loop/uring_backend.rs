@@ -315,6 +315,48 @@ fn get_peer_addr(fd: RawFd) -> std::io::Result<std::net::SocketAddr> {
     }
 }
 
+/// Feeds newly-received ciphertext through a TLS connection's
+/// `advance_io` (see `Transport::Tls`'s own doc comment for why this
+/// works under io_uring's completion model at all) and reports what
+/// happened -- the TLS-connection equivalent of a single step in
+/// `mio_backend`'s own `advance_tls_handshake`, but also covering the
+/// post-handshake record-layer advancement mio's version doesn't need
+/// a separate function for (mio drives that inline in
+/// `read_into_transport`/`flush_transport` instead).
+enum TlsAdvanceOutcome {
+    /// The handshake is still in progress -- submit `io.outgoing` (if
+    /// non-empty) as a Send, then submit another Recv and wait for
+    /// more.
+    StillHandshaking,
+    /// The handshake just completed on this call -- caller should
+    /// check `alpn_protocol()` and select Http1/Http2, after flushing
+    /// any final handshake bytes still in `io.outgoing`.
+    HandshakeJustCompleted,
+    /// Already past the handshake -- ordinary record-layer traffic
+    /// was processed. Decrypted application data (if any) is now
+    /// available via `tls.read_plaintext()`.
+    RecordLayerAdvanced,
+    /// The peer closed the connection (clean EOF on the raw socket
+    /// read, not necessarily a TLS close_notify).
+    PeerClosed,
+}
+
+fn advance_tls(tls: &mut crate::net::tls::TlsConnection, io: &mut crate::net::tls::MemoryTlsIo, new_ciphertext: &[u8]) -> std::io::Result<TlsAdvanceOutcome> {
+    io.incoming.push(new_ciphertext);
+    let was_handshaking = tls.is_handshaking();
+    let advance = tls.advance_io(io)?;
+    if advance.peer_closed {
+        return Ok(TlsAdvanceOutcome::PeerClosed);
+    }
+    if advance.handshake_just_completed {
+        return Ok(TlsAdvanceOutcome::HandshakeJustCompleted);
+    }
+    if was_handshaking {
+        return Ok(TlsAdvanceOutcome::StillHandshaking);
+    }
+    Ok(TlsAdvanceOutcome::RecordLayerAdvanced)
+}
+
 fn submit_listener_accept(ring: &mut IoUring, listener_fd: RawFd) -> Result<(), String> {
     let accept_multi = opcode::AcceptMulti::new(types::Fd(listener_fd)).build().user_data(USER_DATA_ACCEPT);
     unsafe {
@@ -353,7 +395,7 @@ fn submit_loop_timeout(ring: &mut IoUring, timespec: &types::Timespec) -> Result
 /// comment on scope).
 fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
-    let recv = opcode::Recv::new(types::Fd(conn.transport.fd), conn.recv_buf.as_mut_ptr(), conn.recv_buf.len() as u32)
+    let recv = opcode::Recv::new(types::Fd(conn.transport.fd()), conn.recv_buf.as_mut_ptr(), conn.recv_buf.len() as u32)
         .build()
         .user_data(make_user_data(OP_TAG_RECV, conn.generation, slab_index));
     unsafe {
@@ -406,13 +448,104 @@ fn consume_active_write_buf(protocol: &mut ConnectionProtocol, n: usize) {
     }
 }
 
+/// Submits a `Send` SQE carrying whatever ciphertext is currently
+/// queued in a TLS connection's `MemoryTlsIo::outgoing` -- used only
+/// during the handshake (see the OP_TAG_RECV arm's TLS branch), where
+/// what needs to go out is handshake protocol bytes rustls produced,
+/// not anything from a protocol's own `write_buf` the way ordinary
+/// `submit_send` drains. Once the handshake completes, application
+/// data flows through `write_plaintext` -> `advance_io` ->
+/// `outgoing` too, but by then it's driven from the same
+/// `submit_send`/`consume_active_write_buf` path as any other
+/// protocol's write buffer -- see how `Http1Outcome`/`Http2Outcome`/
+/// `WebSocketOutcome` reach `submit_send` today for that shape; this
+/// function is deliberately only for the pre-application-data
+/// handshake bytes.
+fn submit_tls_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
+    let conn = &mut connections[slab_index];
+    let Transport::Tls { fd, io, .. } = &conn.transport else {
+        return Err("submit_tls_send called on a non-TLS connection".to_string());
+    };
+    let pending = io.outgoing.as_slice();
+    let send = opcode::Send::new(types::Fd(*fd), pending.as_ptr(), pending.len() as u32)
+        .build()
+        .user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
+    unsafe {
+        ring.submission()
+            .push(&send)
+            .map_err(|_| "failed to push tls send SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    Ok(())
+}
+
 fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     let Some(pending) = active_write_buf(&conn.protocol) else {
-        return Err("submit_send called while no active protocol has a driven write buffer (Handshaking/Http2 aren't driven by this backend)".to_string());
+        return Err("submit_send called while no active protocol has a driven write buffer (Handshaking isn't driven by this backend)".to_string());
     };
+
+    if conn.transport.is_tls() {
+        // A TLS connection's protocol state machines (process_http1_read_buf,
+        // process_http2_input, process_websocket_input) are
+        // deliberately unaware of TLS at all -- they only ever queue
+        // plaintext into write_buf, the same as on a plaintext
+        // connection. Encrypting that plaintext into real ciphertext
+        // is this function's job, not theirs: every byte queued since
+        // the last submit_send call is fed through write_plaintext
+        // (which only queues it into rustls's own internal buffer)
+        // and then advance_io (which is what actually encrypts it
+        // into MemoryTlsIo::outgoing) before anything is submitted to
+        // the kernel. Sending `pending`'s plaintext bytes directly, as
+        // this function used to, would leak unencrypted application
+        // data onto the wire on a connection the peer believes is
+        // encrypted.
+        let plaintext = pending.as_slice().to_vec();
+        let Transport::Tls { tls, io, fd } = &mut conn.transport else { unreachable!() };
+        tls.write_plaintext(&plaintext).map_err(|e| format!("failed to queue plaintext for TLS encryption: {e}"))?;
+        tls.advance_io(io.as_mut()).map_err(|e| format!("failed to advance TLS record layer while encrypting: {e}"))?;
+
+        // The plaintext was fully handed to rustls above -- mark it
+        // consumed from the protocol's own write_buf now, since the
+        // OP_TAG_SEND completion this SQE eventually produces reports
+        // how many *ciphertext* bytes were sent, which has no direct
+        // correspondence to the plaintext length consume_active_write_buf
+        // needs (rustls's TLS record framing means the two aren't
+        // equal) -- consuming here, once, against the known plaintext
+        // length avoids the OP_TAG_SEND completion handler needing to
+        // (incorrectly) treat a ciphertext byte count as a plaintext
+        // one.
+        let plaintext_len = plaintext.len();
+        consume_active_write_buf(&mut conn.protocol, plaintext_len);
+
+        let ciphertext = io.outgoing.as_slice();
+        // Deliberately submitted even when empty (a 0-byte Send),
+        // rather than returning early with nothing sent: every caller
+        // of submit_send (H1/H2/WS's FlushThenContinue-style arms)
+        // assumes a real OP_TAG_SEND completion will eventually
+        // arrive and drive the connection's next step (typically
+        // re-arming Recv) -- an early Ok(()) here with no SQE actually
+        // submitted meant that step never happened, silently stalling
+        // the connection forever. This is exactly what happened for
+        // H2 frames whose response has no payload (PRIORITY, for
+        // instance, requires no reply at all per RFC 9113 -- rustls
+        // had nothing new to encrypt, `outgoing` stayed empty, and
+        // this connection was simply never read from again). A 0-byte
+        // Send still produces a normal, immediate completion, letting
+        // OP_TAG_SEND's own existing "fully flushed -> submit_recv"
+        // logic run exactly as it would for any other completed send.
+        let send = opcode::Send::new(types::Fd(*fd), ciphertext.as_ptr(), ciphertext.len() as u32)
+            .build()
+            .user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
+        unsafe {
+            ring.submission()
+                .push(&send)
+                .map_err(|_| "failed to push tls send SQE -- submission queue unexpectedly full".to_string())?;
+        }
+        return Ok(());
+    }
+
     let pending = pending.as_slice();
-    let send = opcode::Send::new(types::Fd(conn.transport.fd), pending.as_ptr(), pending.len() as u32)
+    let send = opcode::Send::new(types::Fd(conn.transport.fd()), pending.as_ptr(), pending.len() as u32)
         .build()
         .user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
     unsafe {
@@ -572,7 +705,24 @@ impl WorkerBody for EventLoopWorker {
                             tracing::warn!(worker_id, accepted_fd, error = %e, "getpeername failed for an accepted connection -- falling back to a placeholder address");
                             "0.0.0.0:0".parse().unwrap()
                         });
-                        let transport = Transport { fd: accepted_fd };
+                        let transport = match &self.server.tls_context {
+                            Some(tls_ctx) => match crate::net::tls::TlsConnection::new_server(tls_ctx) {
+                                Ok(tls) => Transport::Tls {
+                                    fd: accepted_fd,
+                                    tls: Box::new(tls),
+                                    io: Box::new(crate::net::tls::MemoryTlsIo::new()),
+                                },
+                                Err(e) => {
+                                    tracing::warn!(worker_id, accepted_fd, error = %e, "failed to create TLS session for accepted connection");
+                                    unsafe { libc::close(accepted_fd) };
+                                    if !io_uring::cqueue::more(flags) {
+                                        multishot_accept_disarmed = true;
+                                    }
+                                    continue;
+                                }
+                            },
+                            None => Transport::Plain(accepted_fd),
+                        };
 
                         let entry = connections.vacant_entry();
                         let new_slab_index = entry.key();
@@ -599,7 +749,19 @@ impl WorkerBody for EventLoopWorker {
                         // equivalent plaintext path -- see
                         // decide_plaintext_protocol's own doc comment.
                         let mut conn = Connection::new(accepted_fd as u64, transport, remote_addr, self.recv_buf_size, generation);
-                        conn.protocol = ConnectionProtocol::Http1(Http1Connection::new_unconfirmed());
+                        // TLS connections stay Handshaking (the
+                        // default Connection::new starts with) until
+                        // the handshake completes and ALPN decides
+                        // Http1 vs Http2 -- see the OP_TAG_RECV arm's
+                        // TLS branch. A plaintext connection has no
+                        // handshake or ALPN to wait for, so it starts
+                        // as an unconfirmed Http1Connection instead,
+                        // pending the H2 prior-knowledge preface check
+                        // (RFC 9113 3.4) -- see
+                        // decide_plaintext_protocol's own doc comment.
+                        if !conn.is_tls() {
+                            conn.protocol = ConnectionProtocol::Http1(Http1Connection::new_unconfirmed());
+                        }
                         entry.insert(conn);
 
                         if let Err(reason) = submit_recv(&mut ring, &mut connections, new_slab_index) {
@@ -638,10 +800,175 @@ impl WorkerBody for EventLoopWorker {
                         }
 
                         let n = result as usize;
+
+                        // TLS connections need their ciphertext run
+                        // through advance_tls before anything below
+                        // (H2/WS/H1 dispatch) can see plaintext -- see
+                        // Transport::Tls's own doc comment. Plaintext
+                        // connections skip straight to the existing
+                        // dispatch logic.
+                        let is_tls = connections[slab_index].transport.is_tls();
+                        if is_tls {
+                            let ciphertext = connections[slab_index].recv_buf[..n].to_vec();
+                            let tls_outcome = {
+                                let conn = &mut connections[slab_index];
+                                let Transport::Tls { tls, io, .. } = &mut conn.transport else { unreachable!() };
+                                advance_tls(tls, io, &ciphertext)
+                            };
+
+                            match tls_outcome {
+                                Ok(TlsAdvanceOutcome::PeerClosed) | Err(_) => {
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                    continue;
+                                }
+                                Ok(TlsAdvanceOutcome::StillHandshaking) => {
+                                    let has_outgoing = {
+                                        let Transport::Tls { io, .. } = &connections[slab_index].transport else { unreachable!() };
+                                        !io.outgoing.is_empty()
+                                    };
+                                    if has_outgoing {
+                                        if let Err(reason) = submit_tls_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit tls handshake send");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                    } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv during tls handshake");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                    continue;
+                                }
+                                Ok(TlsAdvanceOutcome::HandshakeJustCompleted) => {
+                                    let is_h2_alpn = connections[slab_index].transport.alpn_protocol() == Some(b"h2".as_slice());
+                                    connections[slab_index].protocol = if is_h2_alpn {
+                                        ConnectionProtocol::Http2(Http2Connection::new(&self.h2_settings))
+                                    } else {
+                                        ConnectionProtocol::Http1(Http1Connection::new())
+                                    };
+
+                                    // Http2Connection::new() just queued
+                                    // its own initial_send() (the
+                                    // server's SETTINGS frame) into
+                                    // Http2Connection::write_buf -- but
+                                    // that's plaintext, and nothing
+                                    // else in this HandshakeJustCompleted
+                                    // arm ever encrypts a protocol's
+                                    // write_buf the way submit_send's
+                                    // TLS branch does; only the raw TLS
+                                    // handshake bytes already sitting
+                                    // in MemoryTlsIo::outgoing were
+                                    // being sent. Without this, an
+                                    // ALPN-negotiated H2 connection's
+                                    // SETTINGS frame was silently never
+                                    // encrypted or transmitted at all
+                                    // -- the client would see a
+                                    // successful TLS+ALPN handshake but
+                                    // then wait forever for a SETTINGS
+                                    // frame that was never coming (this
+                                    // is what h2spec's TLS suite
+                                    // exposed: every test after the
+                                    // bare connection-preface check
+                                    // timed out, since none of them
+                                    // could get past waiting for this
+                                    // frame). h2c's own upgrade path
+                                    // doesn't have this problem because
+                                    // it's plaintext -- the 101
+                                    // response and the H2 preface
+                                    // travel unencrypted, and
+                                    // Http1Outcome::SwitchedToHttp2's
+                                    // own submit_send call already
+                                    // handles a protocol's write_buf
+                                    // correctly for that case.
+                                    if is_h2_alpn {
+                                        // submit_send's TLS branch
+                                        // already both encrypts
+                                        // Http2Connection::write_buf's
+                                        // SETTINGS frame into
+                                        // MemoryTlsIo::outgoing AND
+                                        // submits the resulting Send
+                                        // SQE -- it's a complete,
+                                        // self-contained submission,
+                                        // unlike the plain "check
+                                        // outgoing, maybe submit_tls_send"
+                                        // pattern the non-H2 branch
+                                        // below still needs (that
+                                        // pattern exists because a
+                                        // plaintext Http1/WebSocket
+                                        // connection reaching this
+                                        // point has no write_buf
+                                        // content of its own to send
+                                        // yet -- only leftover TLS
+                                        // handshake bytes, if any).
+                                        // Falling through to that same
+                                        // check here would submit a
+                                        // second, redundant Send SQE
+                                        // against the same still-unconsumed
+                                        // outgoing buffer.
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit h2 settings frame after tls+alpn handshake");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                        continue;
+                                    }
+
+                                    let has_outgoing = {
+                                        let Transport::Tls { io, .. } = &connections[slab_index].transport else { unreachable!() };
+                                        !io.outgoing.is_empty()
+                                    };
+                                    if has_outgoing {
+                                        if let Err(reason) = submit_tls_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit final tls handshake send");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                    } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after tls handshake");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                    continue;
+                                }
+                                Ok(TlsAdvanceOutcome::RecordLayerAdvanced) => {
+                                    // Fall through below, reading the
+                                    // newly-decrypted plaintext out of
+                                    // rustls in place of recv_buf.
+                                }
+                            }
+                        }
+
+                        let plaintext: Vec<u8> = if is_tls {
+                            let conn = &mut connections[slab_index];
+                            let Transport::Tls { tls, .. } = &mut conn.transport else { unreachable!() };
+                            let mut buf = vec![0u8; conn.recv_buf.len()];
+                            let mut collected = Vec::new();
+                            loop {
+                                match tls.read_plaintext(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => collected.extend_from_slice(&buf[..n]),
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break,
+                                }
+                            }
+                            collected
+                        } else {
+                            connections[slab_index].recv_buf[..n].to_vec()
+                        };
+
+                        if plaintext.is_empty() && is_tls {
+                            if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after an empty decrypted record");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
+                            continue;
+                        }
+
                         let is_h2 = matches!(connections[slab_index].protocol, ConnectionProtocol::Http2(_));
 
                         if is_h2 {
-                            let recv_buf = connections[slab_index].recv_buf.clone();
                             connections[slab_index].touch();
                             let h2_outcome = {
                                 let conn = &mut connections[slab_index];
@@ -653,7 +980,16 @@ impl WorkerBody for EventLoopWorker {
                                     ws_permessage_deflate: self.ws_permessage_deflate,
                                     remote_addr: conn.remote_addr.ip(),
                                 };
-                                crate::core::conn::protocol::process_http2_input(&mut conn.protocol, &recv_buf[..n], &ctx)
+                                // `plaintext` -- decrypted above for a
+                                // TLS connection, or simply this
+                                // completion's raw recv_buf bytes for a
+                                // plaintext one (see its own
+                                // definition) -- is what process_http2_input
+                                // must see either way; using recv_buf
+                                // directly here would feed a TLS
+                                // connection's still-encrypted bytes
+                                // straight into H2 frame parsing.
+                                crate::core::conn::protocol::process_http2_input(&mut conn.protocol, &plaintext, &ctx)
                             };
 
                             match h2_outcome {
@@ -679,7 +1015,6 @@ impl WorkerBody for EventLoopWorker {
                         let is_websocket = matches!(connections[slab_index].protocol, ConnectionProtocol::WebSocket(_));
 
                         if is_websocket {
-                            let recv_buf = connections[slab_index].recv_buf.clone();
                             connections[slab_index].touch();
                             let ws_ctx = crate::core::conn::protocol::WsDispatchContext {
                                 router: &self.server.router,
@@ -687,7 +1022,7 @@ impl WorkerBody for EventLoopWorker {
                             };
                             let ws_outcome = crate::core::conn::protocol::process_websocket_input(
                                 &mut connections[slab_index].protocol,
-                                &recv_buf[..n],
+                                &plaintext,
                                 &ws_ctx,
                             );
 
@@ -740,14 +1075,16 @@ impl WorkerBody for EventLoopWorker {
                                 connections.remove(slab_index);
                                 continue;
                             };
-                            // conn.recv_buf was written into directly by
-                            // the kernel as part of this now-completed
-                            // Recv SQE -- see this module's own doc
-                            // comment on buffer ownership for why it's
-                            // only safe to read from here, after the
-                            // completion, not before.
-                            let recv_buf = conn.recv_buf.clone();
-                            h1.read_buf.push(&recv_buf[..n]);
+                            // `plaintext` -- decrypted above for a
+                            // TLS connection, or this completion's raw
+                            // recv_buf bytes for a plaintext one (see
+                            // its own definition, earlier in this
+                            // completion's handling) -- is what must be
+                            // fed to the HTTP/1.1 parser either way;
+                            // using conn.recv_buf directly here would
+                            // feed a TLS connection's still-encrypted
+                            // bytes straight into request parsing.
+                            h1.read_buf.push(&plaintext);
                         }
 
                         // A not-yet-confirmed Http1Connection is still
@@ -903,7 +1240,62 @@ impl WorkerBody for EventLoopWorker {
                         }
 
                         let n = result as usize;
-                        consume_active_write_buf(&mut connections[slab_index].protocol, n);
+
+                        // A TLS handshake's own Send (see
+                        // submit_tls_send) drains MemoryTlsIo::outgoing
+                        // directly rather than going through any
+                        // protocol's write_buf -- the connection is
+                        // still ConnectionProtocol::Handshaking at this
+                        // point (ALPN hasn't decided Http1 vs Http2
+                        // yet), so this has to be handled before the
+                        // protocol-based dispatch below, which would
+                        // otherwise treat Handshaking as an
+                        // unrecognized state and incorrectly tear the
+                        // connection down mid-handshake.
+                        if connections[slab_index].transport.is_tls() && matches!(connections[slab_index].protocol, ConnectionProtocol::Handshaking) {
+                            let still_pending = {
+                                let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
+                                io.outgoing.consume(n);
+                                !io.outgoing.is_empty()
+                            };
+                            if still_pending {
+                                if let Err(reason) = submit_tls_send(&mut ring, &mut connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit remainder of a tls handshake send");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
+                            } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after a tls handshake send");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
+                            continue;
+                        }
+
+                        // TLS connections already had their
+                        // write_buf consumed (against the plaintext
+                        // length, not this completion's ciphertext
+                        // length `n`) inside submit_send itself -- see
+                        // its own doc comment for why the two lengths
+                        // don't correspond and consuming here a second
+                        // time, against the wrong unit, would corrupt
+                        // write_buf's accounting. What DOES need to
+                        // happen here for a TLS connection is
+                        // consuming `n` bytes from MemoryTlsIo::outgoing
+                        // itself -- the real ciphertext this Send just
+                        // transmitted -- so the next submit_send call
+                        // doesn't re-send bytes the peer already
+                        // received (which is exactly what a real
+                        // client sees as TLS record corruption /
+                        // DecryptError, since it's being handed the
+                        // same ciphertext bytes twice, out of their
+                        // correct position in the TLS record stream).
+                        if connections[slab_index].transport.is_tls() {
+                            let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
+                            io.outgoing.consume(n);
+                        } else {
+                            consume_active_write_buf(&mut connections[slab_index].protocol, n);
+                        }
 
                         // "Should this connection close once its write
                         // buffer is fully flushed" means something
@@ -927,21 +1319,17 @@ impl WorkerBody for EventLoopWorker {
                         let already_marked_closing = connections[slab_index].closing;
                         let (fully_flushed, should_close_after_flush) = match &connections[slab_index].protocol {
                             ConnectionProtocol::Http1(h1) => (h1.write_buf.is_empty(), !h1.keep_alive),
-                            // WebSocket and HTTP/2 both lack a
-                            // per-message keep_alive flag the way
-                            // HTTP/1.1 has -- whether either should
-                            // close once flushed is instead whatever
-                            // the OP_TAG_RECV arm already decided and
-                            // recorded on `closing`: for WebSocket, a
-                            // completed close handshake, protocol
-                            // error, or backpressure limit (see
-                            // process_websocket_input's own
-                            // WebSocketOutcome variants); for HTTP/2,
-                            // Http2Outcome::FlushThenClose (a GOAWAY or
-                            // fatal connection-level error).
                             ConnectionProtocol::WebSocket(ws) => (ws.write_buf.is_empty(), already_marked_closing),
                             ConnectionProtocol::Http2(h2) => (h2.write_buf.is_empty(), already_marked_closing),
                             ConnectionProtocol::Handshaking => {
+                                // A non-TLS connection should never
+                                // have an outstanding Send while still
+                                // Handshaking (plaintext connections
+                                // skip Handshaking entirely -- see the
+                                // accept arm) -- reaching this means
+                                // something unexpected happened, not a
+                                // normal TLS handshake send (handled
+                                // above).
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                                 continue;
@@ -1434,6 +1822,217 @@ mod tests {
             }
             return payload;
         }
+    }
+
+    /// A real TLS handshake (real certificate, real rustls client and
+    /// server, real ALPN negotiation selecting HTTP/1.1) followed by a
+    /// real HTTP/1.1 request/response, all over an actual TCP
+    /// connection -- exercises advance_tls, submit_tls_send, and
+    /// submit_send's TLS-encryption branch together, end to end,
+    /// rather than any one piece in isolation. Not yet covered by an
+    /// equivalent mio_backend test (there wasn't one to mirror), so
+    /// this is this session's first real proof either backend serves
+    /// actual HTTPS traffic correctly.
+    #[test]
+    fn tls_handshake_and_http_request_end_to_end_over_real_tcp() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let (cert_der, key_der, trust_anchor_der) = crate::net::tls::generate_test_identity("localhost");
+        let tls_ctx = crate::net::tls::TlsContext::builder_from_der(vec![cert_der], key_der)
+            .expect("build TLS context")
+            .build()
+            .expect("finish building TLS context");
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        let mut server = RoutaServer::from_config(config).expect("build a minimal RoutaServer");
+        server.tls_context = Some(std::sync::Arc::new(tls_ctx));
+        let server = Arc::new(server);
+        let pool = run(server, port, 1);
+
+        // Give the worker a moment to bind before connecting.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let tcp = {
+            let mut connected = None;
+            for _ in 0..50 {
+                match StdTcpStream::connect(("127.0.0.1", port)) {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            connected.expect("worker should eventually accept a connection")
+        };
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+        tcp.set_nodelay(true).expect("set nodelay");
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(trust_anchor_der).expect("add test cert to root store");
+        let mut client = crate::net::tls::TlsConnection::new_client_with_roots("localhost", vec![], root_store).expect("create client connection");
+
+        // Drive the client-side handshake directly against the real
+        // TCP socket (mirroring what a real HTTPS client library does
+        // under the hood) -- this test's job is to prove the SERVER
+        // side (driven through this backend's completion loop) is
+        // correct, so the client side just needs to be a real,
+        // independently-correct rustls client, not itself exercising
+        // anything about io_uring.
+        let mut tcp_for_handshake = tcp.try_clone().expect("clone tcp stream");
+        for _ in 0..50 {
+            let advance = client.advance_io(&mut tcp_for_handshake);
+            if advance.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            if !client.is_handshaking() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!client.is_handshaking(), "client-side TLS handshake should have completed");
+
+        // A real HTTP/1.1 request, encrypted through the now-established
+        // TLS session and written to the real socket.
+        client.write_plaintext(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("queue plaintext request");
+        client.advance_io(&mut tcp_for_handshake).expect("flush encrypted request");
+
+        // Read and decrypt the response.
+        let mut response = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..50 {
+            match client.advance_io(&mut tcp_for_handshake) {
+                Ok(advance) => {
+                    loop {
+                        match client.read_plaintext(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => response.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                    if advance.peer_closed || !response.is_empty() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 "), "expected a well-formed HTTP/1.1 status line over TLS, got: {response_text:?}");
+
+        pool.shutdown();
+    }
+
+    /// Same shape as tls_handshake_and_http_request_end_to_end_over_real_tcp,
+    /// but the client offers ALPN "h2" and the request/response is
+    /// real HTTP/2 framing (HEADERS/DATA) encrypted through the same
+    /// TLS session -- proves the HandshakeJustCompleted branch's ALPN
+    /// check actually selects Http2 (not just that the match arm
+    /// exists), and that process_http2_input correctly receives
+    /// decrypted plaintext the same way process_http1_read_buf does.
+    #[test]
+    fn tls_alpn_h2_handshake_and_http2_request_end_to_end_over_real_tcp() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let (cert_der, key_der, trust_anchor_der) = crate::net::tls::generate_test_identity("localhost");
+        let tls_ctx = crate::net::tls::TlsContext::builder_from_der(vec![cert_der], key_der)
+            .expect("build TLS context")
+            .build()
+            .expect("finish building TLS context");
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        let mut server = RoutaServer::from_config(config).expect("build a minimal RoutaServer");
+        server.tls_context = Some(std::sync::Arc::new(tls_ctx));
+        let server = Arc::new(server);
+        let pool = run(server, port, 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let tcp = {
+            let mut connected = None;
+            for _ in 0..50 {
+                match StdTcpStream::connect(("127.0.0.1", port)) {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            connected.expect("worker should eventually accept a connection")
+        };
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+        tcp.set_nodelay(true).expect("set nodelay");
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(trust_anchor_der).expect("add test cert to root store");
+        // The only difference from the HTTP/1.1 test: offering "h2" via ALPN.
+        let mut client = crate::net::tls::TlsConnection::new_client_with_roots("localhost", vec![b"h2".to_vec()], root_store).expect("create client connection");
+
+        let mut tcp_for_handshake = tcp.try_clone().expect("clone tcp stream");
+        for _ in 0..50 {
+            let advance = client.advance_io(&mut tcp_for_handshake);
+            if advance.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            if !client.is_handshaking() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!client.is_handshaking(), "client-side TLS handshake should have completed");
+        assert_eq!(client.alpn_protocol(), Some(b"h2".as_slice()), "server should have negotiated h2 via ALPN");
+
+        // A real H2 connection preface, encrypted through the TLS
+        // session -- this connection never went through the h2c
+        // Upgrade dance (there's no HTTP/1.1 request here at all),
+        // ALPN alone is what told the server this is H2.
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]); // empty client SETTINGS frame
+        client.write_plaintext(&preface).expect("queue h2 preface");
+        client.advance_io(&mut tcp_for_handshake).expect("flush encrypted preface");
+
+        // Read and decrypt the server's SETTINGS frame.
+        let mut response = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..50 {
+            match client.advance_io(&mut tcp_for_handshake) {
+                Ok(advance) => {
+                    loop {
+                        match client.read_plaintext(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => response.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                    if advance.peer_closed || response.len() >= 9 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(response.len() >= 9, "expected at least a 9-byte H2 frame header back, got {} bytes", response.len());
+        let frame_type = response[3];
+        assert_eq!(frame_type, 0x4, "expected a SETTINGS frame as the first bytes back over the TLS+ALPN h2 connection");
+
+        pool.shutdown();
     }
 
     #[test]

@@ -30,25 +30,49 @@ use crate::core::conn::protocol::ConnectionProtocol;
 /// dependency on each other (see this module's own doc comment).
 pub type ConnId = u64;
 
-/// The transport a connection is speaking over. Plain TCP only -- see
-/// this module's own doc comment for why TLS isn't a variant here yet.
-/// Carries the raw fd directly rather than any higher-level socket
-/// type: every actual read/write/accept goes through this backend's
-/// own submission-queue plumbing (not yet implemented -- see
-/// `core::event_loop::uring_backend`), never a direct syscall against
-/// this fd the way `mio_conn::Transport`'s `Read`/`Write` impls call
-/// straight through to `mio::net::TcpStream`.
-pub struct Transport {
-    pub fd: RawFd,
+/// The transport a connection is speaking over: plain TCP, or TCP with
+/// TLS driven through `net::tls::MemoryTlsIo` (see its own doc comment
+/// for why rustls -- built on synchronous `Read`/`Write` -- can still
+/// be driven correctly under io_uring's completion-based model: the
+/// `Read`/`Write` it needs are satisfied by in-memory buffers rather
+/// than the real fd, and this backend's own submit/completion loop is
+/// what shuttles bytes between those buffers and real `Recv`/`Send`
+/// SQEs). Carries the raw fd directly (not a higher-level socket type)
+/// either way: every actual read/write/accept goes through this
+/// backend's own submission-queue plumbing, never a direct syscall
+/// against this fd the way `mio_conn::Transport`'s `Read`/`Write`
+/// impls call straight through to `mio::net::TcpStream`.
+pub enum Transport {
+    Plain(RawFd),
+    Tls {
+        fd: RawFd,
+        tls: Box<crate::net::tls::TlsConnection>,
+        /// The in-memory buffers `tls`'s `advance_io` reads from and
+        /// writes to -- see `net::tls::MemoryTlsIo`'s own doc comment.
+        /// `io.incoming` is filled from real `Recv` completions before
+        /// each `advance_io` call; `io.outgoing` is drained into a
+        /// real `Send` SQE after.
+        io: Box<crate::net::tls::MemoryTlsIo>,
+    },
 }
 
 impl Transport {
+    pub fn fd(&self) -> RawFd {
+        match self {
+            Transport::Plain(fd) => *fd,
+            Transport::Tls { fd, .. } => *fd,
+        }
+    }
+
     pub fn is_tls(&self) -> bool {
-        false // no TLS variant exists yet -- see this module's own doc comment
+        matches!(self, Transport::Tls { .. })
     }
 
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        None // meaningless without TLS
+        match self {
+            Transport::Plain(_) => None,
+            Transport::Tls { tls, .. } => tls.alpn_protocol(),
+        }
     }
 }
 
@@ -58,8 +82,11 @@ impl Drop for Transport {
         // own Drop impl would do -- this type deliberately doesn't
         // wrap one (see its own doc comment), so closing the fd is
         // this struct's responsibility rather than an inner value's.
+        // Both variants own exactly one real fd regardless of whether
+        // TLS is layered on top -- MemoryTlsIo owns no fd of its own
+        // to also close.
         unsafe {
-            libc::close(self.fd);
+            libc::close(self.fd());
         }
     }
 }
@@ -140,7 +167,7 @@ mod tests {
     #[test]
     fn plain_connection_reports_not_tls() {
         let (fd, addr) = accept_one_connection();
-        let transport = Transport { fd };
+        let transport = Transport::Plain(fd);
         let conn = Connection::new(1, transport, addr, 4096, 0);
         assert!(!conn.is_tls());
         assert!(conn.transport.alpn_protocol().is_none());
@@ -151,7 +178,7 @@ mod tests {
     #[test]
     fn touch_updates_last_active_at() {
         let (fd, addr) = accept_one_connection();
-        let transport = Transport { fd };
+        let transport = Transport::Plain(fd);
         let mut conn = Connection::new(1, transport, addr, 4096, 0);
         let before = conn.last_active_at;
         std::thread::sleep(std::time::Duration::from_millis(5));
