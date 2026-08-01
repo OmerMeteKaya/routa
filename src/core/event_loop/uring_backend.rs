@@ -56,7 +56,7 @@ use std::sync::Arc;
 use io_uring::{opcode, types, IoUring, Probe};
 use slab::Slab;
 
-use crate::core::conn::protocol::{ConnectionProtocol, Http1Connection, Http1DispatchContext, Http1Outcome};
+use crate::core::conn::protocol::{ConnectionProtocol, Http1Connection, Http1DispatchContext, Http1Outcome, Http2Connection};
 use crate::core::conn::uring_conn::{Connection, Transport};
 use crate::core::server::RoutaServer;
 use crate::core::worker::{ShutdownSignal, WorkerBody};
@@ -392,7 +392,8 @@ fn active_write_buf(protocol: &ConnectionProtocol) -> Option<&crate::util::buf::
     match protocol {
         ConnectionProtocol::Http1(h1) => Some(&h1.write_buf),
         ConnectionProtocol::WebSocket(ws) => Some(&ws.write_buf),
-        ConnectionProtocol::Handshaking | ConnectionProtocol::Http2(_) => None,
+        ConnectionProtocol::Http2(h2) => Some(&h2.write_buf),
+        ConnectionProtocol::Handshaking => None,
     }
 }
 
@@ -400,7 +401,8 @@ fn consume_active_write_buf(protocol: &mut ConnectionProtocol, n: usize) {
     match protocol {
         ConnectionProtocol::Http1(h1) => h1.write_buf.consume(n),
         ConnectionProtocol::WebSocket(ws) => ws.write_buf.consume(n),
-        ConnectionProtocol::Handshaking | ConnectionProtocol::Http2(_) => {}
+        ConnectionProtocol::Http2(h2) => h2.write_buf.consume(n),
+        ConnectionProtocol::Handshaking => {}
     }
 }
 
@@ -587,8 +589,17 @@ impl WorkerBody for EventLoopWorker {
                         generations[new_slab_index] = generations[new_slab_index].wrapping_add(1);
                         let generation = generations[new_slab_index];
 
+                        // Starts as an unconfirmed Http1Connection --
+                        // this backend doesn't yet have TLS/ALPN (see
+                        // conn::uring_conn's own doc comment), so
+                        // every accepted connection is plaintext and
+                        // must be checked against the H2 connection
+                        // preface (RFC 9113 3.4) before being treated
+                        // as HTTP/1.1, exactly like mio_backend's own
+                        // equivalent plaintext path -- see
+                        // decide_plaintext_protocol's own doc comment.
                         let mut conn = Connection::new(accepted_fd as u64, transport, remote_addr, self.recv_buf_size, generation);
-                        conn.protocol = ConnectionProtocol::Http1(Http1Connection::new());
+                        conn.protocol = ConnectionProtocol::Http1(Http1Connection::new_unconfirmed());
                         entry.insert(conn);
 
                         if let Err(reason) = submit_recv(&mut ring, &mut connections, new_slab_index) {
@@ -628,10 +639,40 @@ impl WorkerBody for EventLoopWorker {
 
                         let n = result as usize;
                         let is_h2 = matches!(connections[slab_index].protocol, ConnectionProtocol::Http2(_));
+
                         if is_h2 {
-                            tracing::warn!(worker_id, slab_index, "recv completion for an Http2 connection -- H2 is not yet driven by this backend");
-                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                            connections.remove(slab_index);
+                            let recv_buf = connections[slab_index].recv_buf.clone();
+                            connections[slab_index].touch();
+                            let h2_outcome = {
+                                let conn = &mut connections[slab_index];
+                                let ctx = crate::core::conn::protocol::Http2DispatchContext {
+                                    server: &self.server,
+                                    ws_settings: &self.ws_settings,
+                                    ws_enabled: self.ws_enabled,
+                                    ws_max_connections: self.ws_max_connections,
+                                    ws_permessage_deflate: self.ws_permessage_deflate,
+                                    remote_addr: conn.remote_addr.ip(),
+                                };
+                                crate::core::conn::protocol::process_http2_input(&mut conn.protocol, &recv_buf[..n], &ctx)
+                            };
+
+                            match h2_outcome {
+                                crate::core::conn::protocol::Http2Outcome::FlushThenContinue => {
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit http2 send");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                }
+                                crate::core::conn::protocol::Http2Outcome::FlushThenClose => {
+                                    connections[slab_index].closing = true;
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit final http2 send");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                }
+                            }
                             continue;
                         }
 
@@ -709,6 +750,68 @@ impl WorkerBody for EventLoopWorker {
                             h1.read_buf.push(&recv_buf[..n]);
                         }
 
+                        // A not-yet-confirmed Http1Connection is still
+                        // deciding whether this connection is really
+                        // HTTP/1.1 or prior-knowledge H2 (RFC 9113
+                        // 3.4) -- see conn::uring_conn's own doc
+                        // comment on why every connection here starts
+                        // this way (no TLS/ALPN yet to decide
+                        // unambiguously up front the way mio_backend's
+                        // TLS path can). Resolved here, before
+                        // process_http1_read_buf ever sees these
+                        // bytes as HTTP/1.1 -- mirrors mio_backend's
+                        // own equivalent check.
+                        let needs_protocol_decision = matches!(&connections[slab_index].protocol, ConnectionProtocol::Http1(h1) if !h1.protocol_confirmed);
+                        if needs_protocol_decision {
+                            let decision = {
+                                let ConnectionProtocol::Http1(h1) = &connections[slab_index].protocol else { unreachable!() };
+                                crate::core::conn::protocol::decide_plaintext_protocol(h1.read_buf.as_slice())
+                            };
+                            match decision {
+                                crate::core::conn::protocol::PlaintextProtocolDecision::NeedMoreData => {
+                                    if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv while deciding plaintext protocol");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                    continue;
+                                }
+                                crate::core::conn::protocol::PlaintextProtocolDecision::Http1 => {
+                                    let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                    h1.protocol_confirmed = true;
+                                }
+                                crate::core::conn::protocol::PlaintextProtocolDecision::Http2PriorKnowledge => {
+                                    let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                    h1.read_buf.consume(crate::core::conn::protocol::H2_CONNECTION_PREFACE.len());
+                                    let leftover = h1.read_buf.as_slice().to_vec();
+                                    let mut h2 = Http2Connection::new(&self.h2_settings);
+                                    h2.inner.assume_preface_received();
+                                    connections[slab_index].protocol = ConnectionProtocol::Http2(h2);
+                                    if !leftover.is_empty() {
+                                        let ConnectionProtocol::Http2(h2) = &mut connections[slab_index].protocol else { unreachable!() };
+                                        let advance_result = h2.inner.advance(&leftover);
+                                        h2.write_buf.push(&advance_result.to_send);
+                                    }
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit h2 prior-knowledge initial settings");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                    continue;
+                                }
+                                crate::core::conn::protocol::PlaintextProtocolDecision::InvalidH2Preface => {
+                                    // RFC 9113 3.4 permits omitting a
+                                    // GOAWAY when the peer clearly
+                                    // isn't speaking H2 -- mirrors
+                                    // mio_backend's own equivalent
+                                    // handling.
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                    continue;
+                                }
+                            }
+                        }
+
                         let outcome = {
                             let conn = &mut connections[slab_index];
                             let ctx = Http1DispatchContext {
@@ -748,21 +851,20 @@ impl WorkerBody for EventLoopWorker {
                                 }
                             }
                             Http1Outcome::SwitchedToHttp2 => {
-                                // The 101 response is queued (still in
-                                // what was Http1Connection::write_buf,
-                                // now unreachable through the switched
-                                // protocol) -- H2 isn't driven by this
-                                // backend yet, so there's nothing
-                                // further this arm can correctly do.
-                                // Not attempting the flush here (it
-                                // would need to read write_buf back out
-                                // of a protocol variant submit_send
-                                // doesn't understand) rather than
-                                // silently leaving the connection in an
-                                // inconsistent, half-upgraded state.
-                                tracing::warn!(worker_id, slab_index, "connection requested an h2c upgrade -- not yet supported by this backend, closing");
-                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                connections.remove(slab_index);
+                                // The switch already replaced
+                                // conn.protocol with a real
+                                // ConnectionProtocol::Http2 carrying
+                                // the queued 101 response ahead of the
+                                // H2 connection preface's own
+                                // initial_send() in its write_buf (see
+                                // process_http1_read_buf's h2c handling),
+                                // so it can be flushed exactly like any
+                                // other pending send.
+                                if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit h2c upgrade response");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
                             }
                             Http1Outcome::SwitchedToWebSocket => {
                                 // Unlike the H2 case above, this
@@ -825,17 +927,21 @@ impl WorkerBody for EventLoopWorker {
                         let already_marked_closing = connections[slab_index].closing;
                         let (fully_flushed, should_close_after_flush) = match &connections[slab_index].protocol {
                             ConnectionProtocol::Http1(h1) => (h1.write_buf.is_empty(), !h1.keep_alive),
-                            // WebSocket has no per-message keep_alive
-                            // flag the way HTTP/1.1 does -- whether
-                            // this connection should close once
-                            // flushed is instead whatever the OP_TAG_RECV
-                            // arm already decided and recorded on
-                            // `closing` (a completed close handshake,
-                            // a protocol error, or backpressure --
-                            // see process_websocket_input's own
-                            // WebSocketOutcome variants).
+                            // WebSocket and HTTP/2 both lack a
+                            // per-message keep_alive flag the way
+                            // HTTP/1.1 has -- whether either should
+                            // close once flushed is instead whatever
+                            // the OP_TAG_RECV arm already decided and
+                            // recorded on `closing`: for WebSocket, a
+                            // completed close handshake, protocol
+                            // error, or backpressure limit (see
+                            // process_websocket_input's own
+                            // WebSocketOutcome variants); for HTTP/2,
+                            // Http2Outcome::FlushThenClose (a GOAWAY or
+                            // fatal connection-level error).
                             ConnectionProtocol::WebSocket(ws) => (ws.write_buf.is_empty(), already_marked_closing),
-                            ConnectionProtocol::Handshaking | ConnectionProtocol::Http2(_) => {
+                            ConnectionProtocol::Http2(h2) => (h2.write_buf.is_empty(), already_marked_closing),
+                            ConnectionProtocol::Handshaking => {
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                                 continue;
@@ -1110,6 +1216,224 @@ mod tests {
         assert_eq!(data[1] & 0x80, 0, "a server must never mask its own WebSocket frames");
         let len = (data[1] & 0x7f) as usize;
         (opcode, data[2..2 + len].to_vec())
+    }
+
+    /// A real h2c upgrade (HTTP/1.1 Upgrade: h2c), followed by a real
+    /// H2 connection preface, over an actual TCP connection -- proves
+    /// the 101 response and the H2 preface's own initial SETTINGS both
+    /// reach the client in the right order (see
+    /// process_http1_read_buf's h2c handling for the bug this guards
+    /// against: the 101 response being silently dropped when it was
+    /// left behind in the old Http1Connection's write_buf instead of
+    /// carried over to the new Http2Connection's).
+    #[test]
+    fn h2c_upgrade_reaches_a_real_client_in_correct_frame_order() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        // An empty HTTP2-Settings value base64url-decodes to zero
+        // bytes -- a validly-shaped (empty) SETTINGS payload, same
+        // convention mio_backend's own equivalent test uses.
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: \r\n\r\n";
+        stream.write_all(request.as_bytes()).expect("write upgrade request should succeed");
+
+        // Read the raw response bytes first (rather than parsing
+        // line-by-line right away) so a failure here shows exactly
+        // what came back, instead of a generic UTF-8 decode error with
+        // no visibility into the actual bytes.
+        let mut raw_response = [0u8; 512];
+        let n = stream.read(&mut raw_response).expect("read upgrade response should succeed");
+        eprintln!("DEBUG: raw response ({n} bytes): {:?}", String::from_utf8_lossy(&raw_response[..n]));
+        eprintln!("DEBUG: raw response bytes: {:?}", &raw_response[..n]);
+
+        let mut reader = std::io::BufReader::new(&raw_response[..n]);
+        let mut status_line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut status_line).expect("read status line should succeed");
+        assert!(status_line.starts_with("HTTP/1.1 101"), "expected 101 Switching Protocols, got: {status_line:?}");
+        loop {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line).expect("read header line should succeed");
+            if line == "\r\n" {
+                break;
+            }
+        }
+
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]); // an empty client SETTINGS frame
+        stream.write_all(&preface).expect("write h2 preface should succeed");
+
+        let mut response_header = [0u8; 9];
+        std::io::Read::read_exact(&mut reader, &mut response_header).expect("read the first H2 frame header should succeed");
+        let frame_type = response_header[3];
+        assert_eq!(frame_type, 0x4, "expected a SETTINGS frame as the first bytes back over the upgraded connection");
+
+        pool.shutdown();
+    }
+
+    /// A real RFC 8441 Extended CONNECT WebSocket-over-H2 tunnel, end
+    /// to end over an actual TCP connection: h2c upgrade, the server's
+    /// SETTINGS advertising SETTINGS_ENABLE_CONNECT_PROTOCOL, an
+    /// Extended CONNECT request accepted with a 200, a WS frame sent
+    /// as H2 DATA, and the registered handler's reply coming back the
+    /// same way. Exercises process_http2_input's WS-tunnel handling
+    /// (new_ws_tunnel_streams / ws_tunnel_streams_with_input) through
+    /// this backend's real accept/recv/send cycle, not just the shared
+    /// protocol.rs logic in isolation.
+    #[test]
+    fn websocket_over_h2_tunnel_end_to_end() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        config.ws.enabled = true;
+        config.port = port as i32;
+        let mut server = RoutaServer::from_config(config).expect("build a minimal RoutaServer");
+        let mut router = crate::http::router::Router::new();
+        router.add_websocket_route("/ws", |msg| match msg {
+            crate::http::ws::WsMessage::Text(text) if text == "ping" => Some(crate::http::ws::WsMessage::Text("pong".to_string())),
+            _ => None,
+        });
+        server.router = Arc::new(router);
+        let server = Arc::new(server);
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        // h2c upgrade dance -- same as h2c_upgrade_reaches_a_real_client_in_correct_frame_order.
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: \r\n\r\n";
+        stream.write_all(request.as_bytes()).expect("write upgrade request should succeed");
+
+        let mut header_buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).expect("read response byte should succeed");
+            header_buf.push(byte[0]);
+            if header_buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let status_text = String::from_utf8_lossy(&header_buf);
+        assert!(status_text.starts_with("HTTP/1.1 101"), "expected 101 Switching Protocols, got: {status_text:?}");
+
+        // assume_preface_received means the client's own connection
+        // preface is just its (empty) SETTINGS frame -- no literal
+        // "PRI * HTTP/2.0..." string is expected on this connection.
+        stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).expect("write client settings frame should succeed");
+
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+        let (frame_type, _flags, settings_payload) = read_one_h2_frame(&mut reader);
+        assert_eq!(frame_type, 0x4, "expected a SETTINGS frame");
+        let has_connect_setting = settings_payload.chunks_exact(6).any(|c| u16::from_be_bytes([c[0], c[1]]) == 0x8);
+        assert!(has_connect_setting, "server must advertise SETTINGS_ENABLE_CONNECT_PROTOCOL");
+
+        // A real Extended CONNECT request for the registered WS route.
+        let mut client_encoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let hf = |name: &str, value: &str| crate::http::h2::hpack::HeaderField {
+            name: name.to_string(),
+            value: value.to_string(),
+        };
+        let header_block = client_encoder.encode(&[
+            hf(":method", "CONNECT"),
+            hf(":protocol", "websocket"),
+            hf(":scheme", "http"),
+            hf(":path", "/ws"),
+            hf(":authority", "localhost"),
+        ]);
+        let mut headers_frame = Vec::new();
+        crate::http::h2::frame::write_headers(&mut headers_frame, 1, &header_block, false, true);
+        stream.write_all(&headers_frame).expect("write extended connect request should succeed");
+
+        let mut server_decoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let (status, end_stream) = read_h2_status_headers(&mut reader, &mut server_decoder);
+        assert_eq!(status, "200");
+        assert!(!end_stream, "an accepted WS tunnel's 200 response must not end the stream");
+
+        // A real WebSocket TEXT frame, sent as H2 DATA on the tunnel.
+        let ws_frame = build_masked_ws_text_frame("ping");
+        let mut data_frame = Vec::new();
+        crate::http::h2::frame::write_data(&mut data_frame, 1, &ws_frame, false);
+        stream.write_all(&data_frame).expect("write ws data frame should succeed");
+
+        let reply_payload = read_h2_data_payload(&mut reader);
+        let (opcode, payload) = parse_unmasked_ws_frame(&reply_payload);
+        assert_eq!(opcode, 0x1, "expected a text frame");
+        assert_eq!(payload, b"pong");
+
+        pool.shutdown();
+    }
+
+    /// Reads exactly one H2 frame (header + payload) off `reader`.
+    fn read_one_h2_frame(reader: &mut impl std::io::BufRead) -> (u8, u8, Vec<u8>) {
+        let mut header = [0u8; 9];
+        std::io::Read::read_exact(reader, &mut header).expect("read frame header should succeed");
+        let len = ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+        let frame_type = header[3];
+        let flags = header[4];
+        let mut payload = vec![0u8; len];
+        std::io::Read::read_exact(reader, &mut payload).expect("read frame payload should succeed");
+        (frame_type, flags, payload)
+    }
+
+    /// Reads frames until a HEADERS frame (type `0x1`) arrives,
+    /// skipping anything else -- returns the decoded `:status` value
+    /// and whether END_STREAM was set.
+    fn read_h2_status_headers(reader: &mut impl std::io::BufRead, decoder: &mut crate::http::h2::hpack::HpackContext) -> (String, bool) {
+        loop {
+            let (frame_type, flags, payload) = read_one_h2_frame(reader);
+            if frame_type != 0x1 {
+                continue;
+            }
+            let fields = decoder.decode(&payload).expect("decode headers should succeed");
+            let status = fields.iter().find(|h| h.name == ":status").expect("a :status pseudo-header should be present").value.clone();
+            return (status, flags & 0x1 != 0);
+        }
+    }
+
+    /// Reads frames until a DATA frame (type `0x0`) arrives, skipping
+    /// anything else -- returns its payload.
+    fn read_h2_data_payload(reader: &mut impl std::io::BufRead) -> Vec<u8> {
+        loop {
+            let (frame_type, _flags, payload) = read_one_h2_frame(reader);
+            if frame_type != 0x0 {
+                continue;
+            }
+            return payload;
+        }
     }
 
     #[test]

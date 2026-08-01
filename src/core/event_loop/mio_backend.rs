@@ -354,7 +354,7 @@ fn handle_connection_event(
 ) {
     let idx = key.slab_index();
     if !connections.contains(idx) {
-        return; // stale event for an already-removed connection
+            return; // stale event for an already-removed connection
     }
 
     connections[idx].touch();
@@ -377,25 +377,116 @@ fn handle_connection_event(
         }
     }
 
-    if matches!(connections[idx].protocol, ConnectionProtocol::Handshaking) {
-        if let Transport::Tls { tls, .. } = &connections[idx].transport {
-            worker.server.metrics.connection.tls_handshakes_total.with_label_values(&["success"]).inc();
-            let duration_secs = connections[idx].created_at.elapsed().as_secs_f64();
-            let tls_version = tls.protocol_version_label();
-            worker.server.metrics.connection.tls_handshake_duration_seconds.with_label_values(&[tls_version]).observe(duration_secs);
-        }
-        let is_h2 = matches!(&connections[idx].transport, Transport::Tls { tls, .. } if tls.alpn_protocol() == Some(b"h2".as_slice()));
-        connections[idx].protocol = if is_h2 {
-            worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http2"]).inc();
-            ConnectionProtocol::Http2(Http2Connection::new(&worker.h2_settings))
-        } else {
-            worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http1"]).inc();
-            ConnectionProtocol::Http1(Http1Connection::new())
-        };
+    let still_deciding_protocol = matches!(connections[idx].protocol, ConnectionProtocol::Handshaking)
+       || matches!(&connections[idx].protocol, ConnectionProtocol::Http1(h1) if !h1.protocol_confirmed);
+    if still_deciding_protocol {
+       if connections[idx].is_tls() {
+          if let Transport::Tls { tls, .. } = &connections[idx].transport {
+             worker.server.metrics.connection.tls_handshakes_total.with_label_values(&["success"]).inc();
+             let duration_secs = connections[idx].created_at.elapsed().as_secs_f64();
+             let tls_version = tls.protocol_version_label();
+             worker.server.metrics.connection.tls_handshake_duration_seconds.with_label_values(&[tls_version]).observe(duration_secs);
+          }
+          let is_h2 = matches!(&connections[idx].transport, Transport::Tls { tls, .. } if tls.alpn_protocol() == Some(b"h2".as_slice()));
+          connections[idx].protocol = if is_h2 {
+             worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http2"]).inc();
+             ConnectionProtocol::Http2(Http2Connection::new(&worker.h2_settings))
+          } else {
+             worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http1"]).inc();
+             ConnectionProtocol::Http1(Http1Connection::new())
+          };
+       } else {
+          // A plaintext connection has no ALPN to consult -- reads
+          // whatever's available and checks it against the H2
+          // connection preface (RFC 9113 3.4) before committing to
+          // HTTP/1.1, so a prior-knowledge H2 client (h2spec's
+          // default test mode, and any HTTP/2 client that skips the
+          // h2c Upgrade dance) is recognized rather than having its
+          // preface bytes misparsed as a malformed HTTP/1.1 request
+          // line. Reuses a scratch Http1Connection purely as a place
+          // to accumulate these bytes across calls until enough have
+          // arrived to decide -- if the decision comes back Http1,
+          // this same buffer becomes that connection's real
+          // read_buf, so nothing already read is lost or re-read.
+          if !matches!(connections[idx].protocol, ConnectionProtocol::Http1(_)) {
+             connections[idx].protocol = ConnectionProtocol::Http1(Http1Connection::new_unconfirmed());
+          }
+          if read_into_transport(connections, idx, |conn| {
+             let ConnectionProtocol::Http1(h1) = &mut conn.protocol else { unreachable!() };
+             &mut h1.read_buf
+          })
+          .is_err()
+          {
+             close_connection(worker, poller, connections, idx);
+             return;
+          }
+          let decision = {
+             let ConnectionProtocol::Http1(h1) = &connections[idx].protocol else { unreachable!() };
+             crate::core::conn::protocol::decide_plaintext_protocol(h1.read_buf.as_slice())
+          };
+          match decision {
+             crate::core::conn::protocol::PlaintextProtocolDecision::NeedMoreData => return, // wait for the next readiness event
+             crate::core::conn::protocol::PlaintextProtocolDecision::Http1 => {
+                worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http1"]).inc();
+                let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else { unreachable!() };
+                h1.protocol_confirmed = true;
+             }
+             crate::core::conn::protocol::PlaintextProtocolDecision::InvalidH2Preface => {
+                // RFC 9113 3.4: a client that starts the H2 connection
+                // preface but sends something other than the exact 24
+                // expected bytes has committed to prior-knowledge H2,
+                // badly -- this must be rejected as a connection error
+                // (PROTOCOL_ERROR), not silently reinterpreted as
+                // HTTP/1.1 the way a genuinely unrelated malformed
+                // request would be.
+                const PROTOCOL_ERROR: u32 = 0x1;
+                let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else { unreachable!() };
+                let mut goaway = Vec::new();
+                crate::http::h2::frame::write_goaway(&mut goaway, 0, PROTOCOL_ERROR);
+                h1.write_buf.push(&goaway);
+                connections[idx].closing = true;
+                // Best-effort flush -- if it fails, close_connection
+                // below still runs and tears the connection down
+                // either way, same as every other error path in this
+                // function.
+                let _ = flush_transport(connections, idx);
+                close_connection(worker, poller, connections, idx);
+                return;
+             }
+             crate::core::conn::protocol::PlaintextProtocolDecision::Http2PriorKnowledge => {
+                worker.server.metrics.connection.protocol_selected_total.with_label_values(&["http2"]).inc();
+                let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else { unreachable!() };
+                // Consume exactly the preface's own bytes -- any
+                // further bytes already read past it (a client's own
+                // initial SETTINGS frame, pipelined immediately after
+                // the preface) are real H2 protocol data and must be
+                // handed to the new Http2Connection's own advance(),
+                // not discarded.
+                h1.read_buf.consume(crate::core::conn::protocol::H2_CONNECTION_PREFACE.len());
+                let leftover = h1.read_buf.as_slice().to_vec();
+                let mut h2 = Http2Connection::new(&worker.h2_settings);
+                h2.inner.assume_preface_received();
+                connections[idx].protocol = ConnectionProtocol::Http2(h2);
+                if !leftover.is_empty() {
+                   let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else { unreachable!() };
+                   let advance_result = h2.inner.advance(&leftover);
+                   h2.write_buf.push(&advance_result.to_send);
+                   // Only the connection-preface bytes themselves were
+                   // consumed above -- any newly-ready streams or WS
+                   // tunnels this leftover data produced are handled by
+                   // drive_http2's own next pass over this connection
+                   // (triggered by this function falling through to
+                   // the normal protocol-dispatch match below), not
+                   // re-implemented here.
+                }
+             }
+          }
+       }
     }
 
+
     let result = match &mut connections[idx].protocol {
-        ConnectionProtocol::Handshaking => Ok(()), // TLS handshake still in progress (plaintext connections never linger here)
+        ConnectionProtocol::Handshaking => Ok(()), // TLS handshake in progress, or a plaintext connection still waiting for enough bytes to decide HTTP/1.1 vs. H2 prior-knowledge (see the block above)
         ConnectionProtocol::Http1(_) => drive_http1(worker, connections, idx),
         ConnectionProtocol::Http2(_) => drive_http2(worker, connections, idx),
         ConnectionProtocol::WebSocket(_) => drive_websocket(worker, connections, idx),
@@ -557,11 +648,9 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                     resp.set_header("Upgrade", "h2c");
                     queue_http1_response(connections, idx, resp);
                     flush_transport(connections, idx)?;
-
                     let mut h2 = crate::core::conn::Http2Connection::new(&worker.h2_settings);
                     h2.inner.assume_preface_received();
                     h2.inner.apply_upgrade_settings(&settings_payload);
-                    h2.write_buf.push(&h2.inner.initial_send());
                     connections[idx].protocol = ConnectionProtocol::Http2(h2);
                     return drive_http2(worker, connections, idx);
                 }

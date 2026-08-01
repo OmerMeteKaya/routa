@@ -392,6 +392,18 @@ pub struct Connection {
     /// stream), so `dispatch_frame` checks this before routing
     /// anything except CONTINUATION while it's set.
     expecting_continuation_for: Option<u32>,
+    /// Bytes handed to `advance()` that don't yet form a complete
+    /// frame (a frame header split across two reads, or a frame whose
+    /// payload hasn't fully arrived) -- carried over to the next
+    /// `advance()` call rather than discarded, the same way
+    /// `http::ws::WsConnection::advance()`'s own `read_buf` already
+    /// does. Without this, a caller whose I/O backend happens to
+    /// deliver a frame's header and payload as two separate reads
+    /// (a real possibility over any real network, not just a
+    /// contrived test) would have `process_frames` silently drop the
+    /// incomplete tail on one call and see nothing arrive to complete
+    /// it on the next, since nothing preserved it in between.
+    pending_frame_buf: Vec<u8>,
 }
 
 impl Connection {
@@ -422,6 +434,7 @@ impl Connection {
             error: false,
             last_stream_id_processed: 0,
             expecting_continuation_for: None,
+            pending_frame_buf: Vec::new(),
         }
     }
 
@@ -653,8 +666,19 @@ impl Connection {
         result
     }
 
-    fn process_frames(&mut self, mut data: &[u8], result: &mut AdvanceResult) {
+    /// Appends `data` to `pending_frame_buf` and processes as many
+    /// complete frames out of it as are available, draining each one
+    /// as it's consumed -- any trailing bytes that don't yet form a
+    /// complete frame stay in `pending_frame_buf` for the next
+    /// `advance()` call to pick up, mirroring
+    /// `http::ws::WsConnection::advance()`'s own `read_buf` handling
+    /// (see `pending_frame_buf`'s own doc comment for why this
+    /// matters).
+    fn process_frames(&mut self, data: &[u8], result: &mut AdvanceResult) {
+        self.pending_frame_buf.extend_from_slice(data);
+        let mut consumed_total = 0;
         loop {
+            let remaining = &self.pending_frame_buf[consumed_total..];
             // Check the frame header's declared length against our
             // own advertised SETTINGS_MAX_FRAME_SIZE as soon as the
             // 9-byte header itself is available -- deliberately
@@ -666,7 +690,7 @@ impl Connection {
             // testing this exact boundary), so waiting for the "full"
             // frame first would mean waiting forever instead of
             // erroring immediately per RFC 9113 4.2.
-            let Some(header) = frame::FrameHeader::parse(data) else {
+            let Some(header) = frame::FrameHeader::parse(remaining) else {
                 break; // not even a full header yet -- wait for more data
             };
             if header.length > self.local_max_frame_size {
@@ -674,17 +698,30 @@ impl Connection {
                 break;
             }
 
-            let Some((frame, consumed)) = frame::parse_frame(data) else {
+            let Some((_, consumed)) = frame::parse_frame(remaining) else {
                 break; // header fits the limit, but payload hasn't fully arrived yet
             };
 
+            // parse_frame's returned Frame<'_> borrows from `remaining`
+            // (itself borrowed from `self.pending_frame_buf`), which
+            // would conflict with dispatch_frame's need for `&mut
+            // self` -- copying just this one complete frame's bytes
+            // out first breaks that borrow before dispatch_frame is
+            // called, at the cost of one copy per frame (the common
+            // case -- a frame that arrived whole in a single `data`
+            // call -- pays this once; it was never free to begin with,
+            // since the original code's own `data = &data[consumed..]`
+            // already implied re-scanning from a new position).
+            let frame_bytes = self.pending_frame_buf[consumed_total..consumed_total + consumed].to_vec();
+            let (frame, _) = frame::parse_frame(&frame_bytes).expect("frame_bytes was already confirmed complete by the check above");
+
             self.dispatch_frame(&frame, result);
+            consumed_total += consumed;
             if self.error {
                 break;
             }
-
-            data = &data[consumed..];
         }
+        self.pending_frame_buf.drain(..consumed_total);
     }
 
     fn dispatch_frame(&mut self, frame: &Frame<'_>, result: &mut AdvanceResult) {
@@ -701,7 +738,7 @@ impl Connection {
             FrameType::Ping => self.handle_ping(frame, result),
             FrameType::WindowUpdate => self.handle_window_update(frame, result),
             FrameType::RstStream => self.handle_rst_stream(frame, result),
-            FrameType::GoAway => self.handle_goaway(frame),
+            FrameType::GoAway => self.handle_goaway(frame, result),
             FrameType::Headers => self.handle_headers(frame, result),
             FrameType::Continuation => self.handle_continuation(frame, result),
             FrameType::Data => self.handle_data(frame, result),
@@ -934,13 +971,30 @@ impl Connection {
         // see this function's own doc comment.
     }
 
-    fn handle_goaway(&mut self, frame: &Frame<'_>) {
-        // Peer is telling us it's shutting down and won't process
-        // streams above the id in this frame -- no response required;
-        // record that the connection is going away so a caller
-        // stops initiating anything new on it.
+    fn handle_goaway(&mut self, frame: &Frame<'_>, result: &mut AdvanceResult) {
+        // RFC 9113 6.8: GOAWAY is always sent on the whole connection
+        // (stream 0) -- a peer sending one with a nonzero stream
+        // identifier has violated the frame format itself, a
+        // connection error distinct from the ordinary "peer is
+        // shutting down" case below.
+        if frame.header.stream_id != CONNECTION_STREAM_ID {
+            return self.conn_error(H2Error::ProtocolError, result);
+        }
+        // An ordinary, well-formed GOAWAY (any error code, including
+        // an unrecognized one -- RFC 9113 6.8 requires treating an
+        // unknown code as an ordinary shutdown notice, not a fault):
+        // the peer is telling us it's shutting down and won't process
+        // streams above the id in this frame, but the connection
+        // itself stays usable for whatever's already in flight (this
+        // side may still receive responses to streams the peer
+        // already accepted, and the peer may still send other frames,
+        // e.g. a PING, until it actually closes the TCP connection on
+        // its own). Deliberately does *not* set connection_closed or
+        // self.error the way a real protocol violation does --
+        // receiving a valid GOAWAY isn't a fault this side detected,
+        // and prematurely closing here would tear down a connection
+        // the peer hasn't actually finished with yet.
         let _ = frame;
-        self.error = true;
     }
 }
 

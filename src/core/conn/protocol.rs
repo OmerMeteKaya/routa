@@ -45,6 +45,20 @@ pub struct Http1Connection {
     pub read_buf: Buf,
     pub write_buf: Buf,
     pub keep_alive: bool,
+    /// `false` while this connection is still a plaintext connection
+    /// accumulating bytes to check against the H2 connection preface
+    /// (see `decide_plaintext_protocol`) -- `Http1Connection` is reused
+    /// as scratch storage for that check itself (rather than adding a
+    /// separate buffer to `Connection`), so this flag is what tells a
+    /// backend's protocol-selection code whether a `ConnectionProtocol::Http1`
+    /// it's looking at genuinely means "confirmed HTTP/1.1" or "still
+    /// deciding" -- `NeedMoreData` must not be mistaken for the
+    /// former, or the preface check silently never runs again on a
+    /// later call. Always `true` for a TLS connection (ALPN already
+    /// decided unambiguously, see each backend's own handshake
+    /// handling) and for a plaintext connection once
+    /// `decide_plaintext_protocol` has actually returned `Http1`.
+    pub protocol_confirmed: bool,
     /// Set when request parsing begins, cleared when the response is
     /// fully written -- `None` means no request is currently in
     /// flight, used to enforce `request_timeout_ms`.
@@ -84,6 +98,19 @@ impl Http1Connection {
             pending_file: None,
             continue_sent: false,
             request_started_at: None,
+            protocol_confirmed: true,
+        }
+    }
+
+    /// A scratch `Http1Connection` for accumulating a plaintext
+    /// connection's not-yet-classified bytes -- see
+    /// `protocol_confirmed`'s own doc comment. Only ever used as an
+    /// intermediate state before `decide_plaintext_protocol` resolves
+    /// it one way or the other.
+    pub fn new_unconfirmed() -> Self {
+        Http1Connection {
+            protocol_confirmed: false,
+            ..Self::new()
         }
     }
 }
@@ -234,6 +261,123 @@ impl WsConnection {
             ping_misses: 0,
             upgrade_path: String::new(),
         }
+    }
+}
+
+/// The literal client connection preface RFC 9113 3.4 defines --
+/// exactly 24 bytes, sent by a client that already knows (without an
+/// HTTP/1.1 Upgrade negotiation) that it's speaking directly to an H2
+/// server. h2spec's default test mode -- and any HTTP/2 client that
+/// isn't going through the h2c Upgrade dance -- connects this way,
+/// distinct from (and in addition to) the h2c Upgrade path
+/// `process_http1_read_buf` already handles.
+pub const H2_CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Checks whether `buf` (a connection's accumulated but not-yet-parsed
+/// bytes) begins with the literal H2 connection preface -- see
+/// `H2_CONNECTION_PREFACE`'s own doc comment. Only ever meaningful to
+/// check on a connection still in `ConnectionProtocol::Handshaking`,
+/// before anything has committed to treating its bytes as HTTP/1.1;
+/// once even a single byte has been fed to `http::request::parse` as
+/// part of that protocol, this check no longer applies.
+pub fn starts_with_h2_connection_preface(buf: &[u8]) -> bool {
+    buf.len() >= H2_CONNECTION_PREFACE.len() && &buf[..H2_CONNECTION_PREFACE.len()] == H2_CONNECTION_PREFACE
+}
+
+/// What a plaintext connection still in `ConnectionProtocol::Handshaking`
+/// should become, given the bytes accumulated on it so far -- called
+/// once enough bytes have arrived to decide, rather than committing to
+/// HTTP/1.1 immediately the way a connection would if this check
+/// didn't exist. Only meaningful for plaintext connections: a TLS
+/// connection's protocol is already decided by ALPN (see each
+/// backend's own handshake-completion handling) before any
+/// application data is available to check this way at all.
+pub enum PlaintextProtocolDecision {
+    /// Not enough bytes yet to tell -- keep accumulating and call this
+    /// again once more arrive.
+    NeedMoreData,
+    /// The H2 connection preface was found -- this connection is
+    /// prior-knowledge HTTP/2 (RFC 9113 3.4), never HTTP/1.1 at all.
+    Http2PriorKnowledge,
+    /// No H2 preface within the bytes seen so far, and what's arrived
+    /// never matched a prefix of it either -- ordinary HTTP/1.1 (the
+    /// caller should hand these bytes to `Http1Connection::read_buf`
+    /// and proceed with `process_http1_read_buf` as usual).
+    Http1,
+    /// What's arrived so far matched a genuine prefix of the H2
+    /// connection preface (at minimum, starts with the literal `"PRI"`
+    /// that no ordinary HTTP/1.1 request line begins with -- no valid
+    /// method starts that way) but then diverged from it before the
+    /// full 24 bytes matched -- a malformed attempt at prior-knowledge
+    /// H2, not a real HTTP/1.1 request that happens to start
+    /// similarly. RFC 9113 3.4 requires treating this as a connection
+    /// error (PROTOCOL_ERROR), not silently reinterpreting it as
+    /// HTTP/1.1 -- h2spec's own "sends invalid connection preface"
+    /// test case exists specifically to check this.
+    InvalidH2Preface,
+}
+
+/// Decides `buf`'s protocol per `PlaintextProtocolDecision`'s own doc
+/// comment. Deliberately waits for a full `H2_CONNECTION_PREFACE`
+/// worth of bytes before concluding `Http1` -- a partial prefix that
+/// matches the preface so far (e.g. just `b"PRI "`) is genuinely
+/// ambiguous and must not be misread as an HTTP/1.1 request line this
+/// early.
+pub fn decide_plaintext_protocol(buf: &[u8]) -> PlaintextProtocolDecision {
+    // The shortest unambiguous marker that a client is genuinely
+    // attempting prior-knowledge H2 rather than an HTTP/1.1 request
+    // that merely happens to start similarly: no HTTP method is or
+    // ever will be named "PRI" (RFC 9110 9.1 registers methods as
+    // all-uppercase tokens followed by a space and a request-target --
+    // "PRI * HTTP/2.0" itself deliberately reuses that shape so a
+    // preface sent to an HTTP/1.1-only server is at least harmless).
+    // Checking against this fixed 3-byte marker first, before the
+    // full-prefix comparison below, means "PRI" alone is already
+    // enough to commit to treating any further divergence as a
+    // malformed H2 attempt rather than plain HTTP/1.1 -- exactly the
+    // distinction RFC 9113 3.4 and h2spec's "sends invalid connection
+    // preface" test case both depend on.
+    const PRI_MARKER: &[u8] = b"PRI";
+
+    if buf.len() < H2_CONNECTION_PREFACE.len() {
+        // Not enough bytes yet to know for certain either way -- but
+        // only genuinely still ambiguous if what HAS arrived is a
+        // prefix consistent with the full preface (including, in
+        // particular, being consistent with "PRI" for however many of
+        // those first 3 bytes have arrived so far -- a partial buffer
+        // shorter than 3 bytes is still fully consistent with "PRI",
+        // it just hasn't arrived yet). A byte that already disagrees
+        // with the preface at its own position -- including within
+        // the first 3 bytes -- means this can only be HTTP/1.1.
+        if buf.iter().zip(H2_CONNECTION_PREFACE.iter()).all(|(a, b)| a == b) {
+            return PlaintextProtocolDecision::NeedMoreData;
+        }
+        // Diverged from the preface already -- but only treat this as
+        // a malformed H2 attempt (InvalidH2Preface) rather than
+        // ordinary HTTP/1.1 if enough bytes have arrived to know the
+        // divergence happened at or after the "PRI" marker itself
+        // (RFC 9110 9.1: no HTTP method is or ever will be named
+        // "PRI", so once those 3 bytes are confirmed, any further
+        // mismatch is a broken H2 attempt, not a real request line).
+        // If the divergence is within the first 3 bytes, it's
+        // unambiguously not even attempting "PRI" -- ordinary
+        // HTTP/1.1.
+        let diverged_within_first_three = buf.len() < PRI_MARKER.len()
+            || buf[..PRI_MARKER.len()] != *PRI_MARKER;
+        if diverged_within_first_three {
+            return PlaintextProtocolDecision::Http1;
+        }
+        return PlaintextProtocolDecision::InvalidH2Preface;
+    }
+
+    if starts_with_h2_connection_preface(buf) {
+        return PlaintextProtocolDecision::Http2PriorKnowledge;
+    }
+    let starts_with_pri_marker = &buf[..PRI_MARKER.len()] == PRI_MARKER;
+    if starts_with_pri_marker {
+        PlaintextProtocolDecision::InvalidH2Preface
+    } else {
+        PlaintextProtocolDecision::Http1
     }
 }
 
@@ -428,11 +572,34 @@ pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1Disp
                     resp.set_header("Connection", "Upgrade");
                     resp.set_header("Upgrade", "h2c");
                     queue_http1_response(h1, resp);
+                    // As with the WebSocket upgrade path above, the 101
+                    // response was just serialized into what's about
+                    // to become the *old* protocol variant's write_buf
+                    // -- extracting its bytes before replacing
+                    // *protocol is required, since Http2Connection::new
+                    // starts with its own write_buf containing only
+                    // the H2 connection preface's initial_send(), not
+                    // this response.
+                    let pending_101_response = h1.write_buf.as_slice().to_vec();
 
+                    // Http2Connection::new already queues the H2
+                    // connection preface's own initial_send() into its
+                    // fresh write_buf -- the 101 response must precede
+                    // that on the wire (the client is still expecting
+                    // an HTTP/1.1-shaped response to its Upgrade
+                    // request before it starts reading H2 frames), so
+                    // it's built as a separate buffer here and placed
+                    // in front of what new() already produced, rather
+                    // than appending after it (which would send the H2
+                    // preface first) or calling initial_send() again
+                    // (which would send it twice).
                     let mut h2 = Http2Connection::new(ctx.h2_settings);
                     h2.inner.assume_preface_received();
                     h2.inner.apply_upgrade_settings(&settings_payload);
-                    h2.write_buf.push(&h2.inner.initial_send());
+                    let mut write_buf_with_101_first = crate::util::buf::Buf::new();
+                    write_buf_with_101_first.push(&pending_101_response);
+                    write_buf_with_101_first.push(h2.write_buf.as_slice());
+                    h2.write_buf = write_buf_with_101_first;
                     *protocol = ConnectionProtocol::Http2(h2);
                     return Http1Outcome::SwitchedToHttp2;
                 }
@@ -632,4 +799,360 @@ pub fn process_websocket_input(protocol: &mut ConnectionProtocol, input: &[u8], 
         return WebSocketOutcome::FlushThenContinue;
     }
     WebSocketOutcome::NoActionNeeded
+}
+
+// ─── HTTP/2 request/stream processing (backend-agnostic) ────────────────
+
+/// The subset of a worker's per-connection context `process_http2_input`
+/// needs -- mirrors `Http1DispatchContext`'s role for HTTP/1.1.
+pub struct Http2DispatchContext<'a> {
+    pub server: &'a crate::core::server::RoutaServer,
+    pub ws_settings: &'a WsSettings,
+    pub ws_enabled: bool,
+    pub ws_max_connections: usize,
+    pub ws_permessage_deflate: bool,
+    pub remote_addr: std::net::IpAddr,
+}
+
+/// What happened as a result of advancing an HTTP/2 connection's state
+/// machine with newly-arrived bytes -- mirrors `Http1Outcome`'s role
+/// (see its own doc comment). Unlike HTTP/1.1, H2 never switches
+/// `ConnectionProtocol` variants (there's no analogous upgrade path
+/// once a connection is already speaking H2), so this only ever
+/// describes whether to keep going or close.
+pub enum Http2Outcome {
+    /// Bytes are queued in `Http2Connection::write_buf` (stream
+    /// responses, WS-tunnel DATA frames, or protocol-level frames like
+    /// SETTINGS acks) and should be flushed; the connection stays open
+    /// afterward.
+    FlushThenContinue,
+    /// The H2 connection itself has ended (a GOAWAY was sent/received,
+    /// or a fatal connection-level error occurred) -- whatever is
+    /// queued in `write_buf` should still be flushed, then the
+    /// connection closed.
+    FlushThenClose,
+}
+
+/// Builds an `HttpRequest` from an H2 stream's decoded pseudo-headers
+/// plus regular headers -- the inverse of how `net::h2_client` builds
+/// the pseudo-header list on the sending side. Returns `None` if the
+/// required pseudo-headers are missing (already validated once by
+/// `http::h2::stream::Connection::finish_header_block`, so this should
+/// never actually happen for a stream that reached
+/// `newly_ready_streams` -- defensive rather than load-bearing).
+fn build_request_from_h2_headers(
+    headers: &[crate::http::h2::hpack::HeaderField],
+    body: &[u8],
+    trailers: &[crate::http::h2::hpack::HeaderField],
+    remote_ip: std::net::IpAddr,
+) -> Option<crate::http::request::HttpRequest> {
+    let method_str = headers.iter().find(|h| h.name == ":method")?.value.as_str();
+    let method = match method_str {
+        "GET" => crate::http::request::HttpMethod::Get,
+        "POST" => crate::http::request::HttpMethod::Post,
+        "PUT" => crate::http::request::HttpMethod::Put,
+        "DELETE" => crate::http::request::HttpMethod::Delete,
+        "HEAD" => crate::http::request::HttpMethod::Head,
+        "PATCH" => crate::http::request::HttpMethod::Patch,
+        "OPTIONS" => crate::http::request::HttpMethod::Options,
+        "TRACE" => crate::http::request::HttpMethod::Trace,
+        "CONNECT" => crate::http::request::HttpMethod::Connect,
+        _ => return None,
+    };
+    let raw_path = headers.iter().find(|h| h.name == ":path")?.value.clone();
+    let (path, query) = match raw_path.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (raw_path, None),
+    };
+    let query_params = query
+        .as_deref()
+        .map(|q| {
+            q.split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let regular_headers = headers
+        .iter()
+        .filter(|h| !h.name.starts_with(':'))
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
+
+    Some(crate::http::request::HttpRequest {
+        method,
+        remote_addr: Some(remote_ip),
+        path,
+        query,
+        query_params,
+        version_major: 2,
+        version_minor: 0,
+        headers: regular_headers,
+        body: body.to_vec(),
+        keep_alive: true, // meaningless for H2 (multiplexed streams, no per-request Connection semantics) -- true is the harmless default
+        trailers: trailers.iter().map(|h| (h.name.clone(), h.value.clone())).collect(),
+    })
+}
+
+/// Splits an `HttpResponse` into the pieces `http::h2::stream::Connection::send_response`
+/// needs (status separately from headers, since H2 sends `:status` as
+/// its own pseudo-header rather than a regular one).
+fn split_response_for_h2(response: crate::http::response::HttpResponse) -> (u16, Vec<crate::http::h2::hpack::HeaderField>, Vec<u8>) {
+    let status = response.status;
+    let body = response.body().to_vec();
+    let headers = response
+        .headers()
+        .map(|(name, value)| crate::http::h2::hpack::HeaderField {
+            name: name.to_string(),
+            value: value.to_string(),
+        })
+        .collect();
+    (status, headers, body)
+}
+
+/// Feeds newly-arrived bytes on a WS-tunnel H2 stream through its
+/// `WsConnection`, dispatches any resulting application messages to
+/// the same `Router::dispatch_websocket` handler the HTTP/1.1 upgrade
+/// path uses, and queues whatever needs to go back out (auto
+/// PONGs/close-echoes plus any framed reply) as H2 DATA on the same
+/// stream. Tears the tunnel down (`finish_ws_tunnel`, decrementing
+/// `ws_active_connections`) once the WebSocket connection's own close
+/// handshake has completed on both sides.
+fn process_ws_tunnel_input(h2: &mut Http2Connection, ws_active_connections: &std::sync::atomic::AtomicUsize, ws_settings: &WsSettings, router: &crate::http::router::Router, stream_id: u32, input: Vec<u8>) {
+    if input.is_empty() {
+        return;
+    }
+    let path = h2.inner.stream_path(stream_id).map(|p| p.to_string());
+
+    let Some(ws) = h2.inner.ws_tunnel_mut(stream_id) else {
+        return;
+    };
+    let advance_result = ws.advance(&input);
+    let is_closed = ws.is_closed();
+
+    // Each received application message is looked up against the
+    // registered WS routes and handed to whatever matched -- same
+    // "unanswered, not torn down" behavior as `process_websocket_input`
+    // for a tunnel with no matching handler (there always is one here,
+    // since new-tunnel handling already rejected any path without a
+    // match before ever calling `accept_ws_tunnel`, but the lookup is
+    // repeated per-message rather than cached for the same reason
+    // `process_websocket_input` repeats it: a request-scoped router
+    // lookup is already cheap).
+    let mut outgoing = advance_result.to_send;
+    for event in &advance_result.events {
+        if let crate::http::ws::WsEvent::Message(msg) = event {
+            let Some(path) = &path else { continue };
+            let reply = router.dispatch_websocket(path).and_then(|handler| handler(msg));
+            if let Some(reply) = reply {
+                let Some(ws) = h2.inner.ws_tunnel_mut(stream_id) else {
+                    continue;
+                };
+                let framed = match reply {
+                    crate::http::ws::WsMessage::Text(text) => ws.send_text(&text, ws_settings.compression_threshold),
+                    crate::http::ws::WsMessage::Binary(data) => ws.send_binary(&data, ws_settings.compression_threshold),
+                };
+                outgoing.extend(framed);
+            }
+        }
+    }
+
+    let out = h2.inner.queue_ws_tunnel_data(stream_id, outgoing);
+    h2.write_buf.push(&out);
+
+    if is_closed {
+        let out = h2.inner.finish_ws_tunnel(stream_id);
+        h2.write_buf.push(&out);
+        ws_active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Advances an HTTP/2 connection's state as far as `incoming`'s bytes
+/// allow: parses frames, dispatches every newly-ready stream's request
+/// through the server's middleware chain, handles RFC 8441 Extended
+/// CONNECT (WebSocket-over-H2) tunnel setup/teardown/message
+/// forwarding, and queues every response back onto `Http2Connection::write_buf`.
+/// Does no I/O itself -- see `Http2Outcome`'s own doc comment for what
+/// the caller does with its result.
+///
+/// Takes `&mut ConnectionProtocol` for the same reason
+/// `process_http1_read_buf` does -- callers are expected to have
+/// already confirmed `*protocol` is `ConnectionProtocol::Http2(_)`.
+pub fn process_http2_input(protocol: &mut ConnectionProtocol, incoming: &[u8], ctx: &Http2DispatchContext) -> Http2Outcome {
+    let ConnectionProtocol::Http2(h2) = protocol else {
+        unreachable!("process_http2_input requires protocol to already be Http2")
+    };
+
+    let advance_result = h2.inner.advance(incoming);
+    h2.write_buf.push(&advance_result.to_send);
+
+    for stream_id in advance_result.newly_ready_streams {
+        let request = h2
+            .inner
+            .take_request(stream_id)
+            .and_then(|(headers, body, trailers)| build_request_from_h2_headers(headers, body, trailers, ctx.remote_addr));
+
+        let Some(request) = request else {
+            let out = h2.inner.send_response(stream_id, 400, &[], b"Bad Request\n".to_vec());
+            h2.write_buf.push(&out);
+            continue;
+        };
+
+        let method_str = format!("{:?}", request.method).to_uppercase();
+        let route = request.path.clone();
+        let request_body_len = request.body.len();
+        ctx.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).inc();
+        let dispatch_start = std::time::Instant::now();
+        let response = ctx.server.middleware_chain.execute(&request);
+        let duration_secs = dispatch_start.elapsed().as_secs_f64();
+        ctx.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).dec();
+        ctx.server.metrics.record_request(&method_str, &route, response.status, duration_secs, request_body_len, response.body().len());
+        let early_hints: Vec<crate::http::h2::hpack::HeaderField> = response
+            .early_hints
+            .iter()
+            .map(|(name, value)| crate::http::h2::hpack::HeaderField { name: name.clone(), value: value.clone() })
+            .collect();
+        let (status, headers, body) = split_response_for_h2(response);
+
+        if !early_hints.is_empty() {
+            let hints_out = h2.inner.send_informational_response(stream_id, 103, &early_hints);
+            h2.write_buf.push(&hints_out);
+        }
+        let out = h2.inner.send_response(stream_id, status, &headers, body);
+        h2.write_buf.push(&out);
+    }
+
+    for stream_id in advance_result.new_ws_tunnel_streams {
+        let path = h2.inner.stream_path(stream_id).map(|p| p.to_string());
+        let Some(path) = path else { continue };
+        let route_matched = ctx.server.router.dispatch_websocket(&path).is_some();
+        let over_capacity = ctx.server.ws_active_connections.load(std::sync::atomic::Ordering::Relaxed) >= ctx.ws_max_connections;
+
+        if !route_matched {
+            let out = h2.inner.reject_ws_tunnel(stream_id, 404, b"Not Found\n".to_vec());
+            h2.write_buf.push(&out);
+            continue;
+        }
+        if !ctx.ws_enabled || over_capacity {
+            let out = h2.inner.reject_ws_tunnel(stream_id, 503, b"WebSocket unavailable\n".to_vec());
+            h2.write_buf.push(&out);
+            continue;
+        }
+
+        let pmd = if ctx.ws_permessage_deflate {
+            let ext_header = h2.inner.stream_header(stream_id, "sec-websocket-extensions");
+            crate::http::ws::negotiate_pmd(ext_header)
+        } else {
+            None
+        };
+        let accept_headers: Vec<crate::http::h2::hpack::HeaderField> = pmd
+            .as_ref()
+            .map(|params| {
+                vec![crate::http::h2::hpack::HeaderField {
+                    name: "sec-websocket-extensions".to_string(),
+                    value: crate::http::ws::pmd_response_extension_header(params),
+                }]
+            })
+            .unwrap_or_default();
+        let pmd_context = pmd.map(|params| crate::http::ws::PmdContext::with_compression_level(params, ctx.ws_settings.compression_level));
+        let ws_tunnel = crate::http::ws::WsConnection::with_read_buf_capacity(
+            pmd_context,
+            ctx.ws_settings.max_message_size as usize,
+            ctx.ws_settings.max_frame_size,
+            ctx.ws_settings.require_masking,
+            ctx.ws_settings.read_buf_size,
+        );
+        let (out, buffered_input) = h2.inner.accept_ws_tunnel(stream_id, ws_tunnel, &accept_headers);
+        h2.write_buf.push(&out);
+        ctx.server.ws_active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !buffered_input.is_empty() {
+            process_ws_tunnel_input(h2, &ctx.server.ws_active_connections, ctx.ws_settings, &ctx.server.router, stream_id, buffered_input);
+        }
+    }
+
+    let ws_tunnel_streams_with_input = h2.inner.ws_tunnel_streams_with_input();
+    for stream_id in ws_tunnel_streams_with_input {
+        let input = h2.inner.take_ws_tunnel_input(stream_id);
+        process_ws_tunnel_input(h2, &ctx.server.ws_active_connections, ctx.ws_settings, &ctx.server.router, stream_id, input);
+    }
+
+    if advance_result.connection_closed {
+        Http2Outcome::FlushThenClose
+    } else {
+        Http2Outcome::FlushThenContinue
+    }
+}
+
+#[cfg(test)]
+mod plaintext_protocol_decision_tests {
+    use super::*;
+
+    #[test]
+    fn empty_buffer_needs_more_data_not_an_early_http1_decision() {
+        // The exact bug found via h2spec: an empty buffer (nothing
+        // read yet) must never be decided as Http1 just because it's
+        // shorter than the "PRI" marker -- it's still fully
+        // consistent with a preface that hasn't arrived yet.
+        assert!(matches!(decide_plaintext_protocol(b""), PlaintextProtocolDecision::NeedMoreData));
+    }
+
+    #[test]
+    fn partial_pri_prefix_needs_more_data() {
+        assert!(matches!(decide_plaintext_protocol(b"P"), PlaintextProtocolDecision::NeedMoreData));
+        assert!(matches!(decide_plaintext_protocol(b"PR"), PlaintextProtocolDecision::NeedMoreData));
+        assert!(matches!(decide_plaintext_protocol(b"PRI"), PlaintextProtocolDecision::NeedMoreData));
+        assert!(matches!(decide_plaintext_protocol(b"PRI "), PlaintextProtocolDecision::NeedMoreData));
+    }
+
+    #[test]
+    fn ordinary_http1_request_line_is_recognized_immediately() {
+        assert!(matches!(decide_plaintext_protocol(b"GET / HTTP/1.1\r\n"), PlaintextProtocolDecision::Http1));
+        assert!(matches!(decide_plaintext_protocol(b"G"), PlaintextProtocolDecision::Http1));
+        assert!(matches!(decide_plaintext_protocol(b"P"), PlaintextProtocolDecision::NeedMoreData)); // "PUT" also starts with P -- ambiguous with "PRI" until more arrives
+        assert!(matches!(decide_plaintext_protocol(b"PU"), PlaintextProtocolDecision::Http1)); // "PU" already disagrees with "PR"
+    }
+
+    #[test]
+    fn full_valid_preface_is_recognized() {
+        assert!(matches!(decide_plaintext_protocol(H2_CONNECTION_PREFACE), PlaintextProtocolDecision::Http2PriorKnowledge));
+    }
+
+    #[test]
+    fn full_valid_preface_with_trailing_data_is_recognized() {
+        let mut buf = H2_CONNECTION_PREFACE.to_vec();
+        buf.extend_from_slice(b"extra data past the preface");
+        assert!(matches!(decide_plaintext_protocol(&buf), PlaintextProtocolDecision::Http2PriorKnowledge));
+    }
+
+    #[test]
+    fn malformed_preface_attempt_is_invalid_not_http1() {
+        // Starts with "PRI" (committing to an H2 attempt) but diverges
+        // before the full 24-byte preface.
+        assert!(matches!(decide_plaintext_protocol(b"PRI * HTTP/1.1\r\n\r\n"), PlaintextProtocolDecision::InvalidH2Preface));
+    }
+
+    #[test]
+    fn malformed_preface_attempt_detected_incrementally() {
+        // Byte-by-byte, feeding one more byte at a time until the
+        // divergence point is reached -- must stay NeedMoreData right
+        // up until the point of divergence, then immediately report
+        // InvalidH2Preface, never Http1.
+        let malformed = b"PRI * HTTP/1.1\r\n\r\n"; // diverges from the real preface's "HTTP/2.0" at the '1' (real preface has '2' there), 0-indexed position 11, i.e. the divergence is already present at len 12
+        for len in 1..=malformed.len() {
+            let prefix = &malformed[..len];
+            let decision = decide_plaintext_protocol(prefix);
+            if len < 12 {
+                assert!(
+                    matches!(decision, PlaintextProtocolDecision::NeedMoreData),
+                    "expected NeedMoreData at len={len}, prefix={prefix:?}"
+                );
+            } else {
+                assert!(
+                    matches!(decision, PlaintextProtocolDecision::InvalidH2Preface),
+                    "expected InvalidH2Preface at len={len}, prefix={prefix:?}"
+                );
+            }
+        }
+    }
 }
