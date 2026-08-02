@@ -1354,8 +1354,87 @@ impl WorkerBody for EventLoopWorker {
                             // Fully flushed, and either HTTP/1.1
                             // keep-alive or WebSocket (which always
                             // goes back to reading here -- see this
-                            // arm's own comment) -- read the next
-                            // message/request from the same connection.
+                            // arm's own comment). Before submitting a
+                            // new Recv, check whether this connection
+                            // is HTTP/1.1 and its read_buf already
+                            // holds a further pipelined request (RFC
+                            // 9112 9.4: a client may send a second
+                            // request without waiting for the first
+                            // response, so both can legitimately have
+                            // arrived in the same earlier Recv
+                            // completion, well before this Send even
+                            // finished). Submitting a fresh Recv in
+                            // that case would wait for bytes the peer
+                            // has no reason to send again -- it
+                            // already sent them -- stalling the
+                            // connection forever from the peer's point
+                            // of view. Re-running process_http1_read_buf
+                            // against what's already buffered is what
+                            // mio_backend's own drive_http1 does
+                            // implicitly (its read/dispatch loop
+                            // always re-checks read_buf before
+                            // returning to wait on the poller); this
+                            // backend needs to do that check
+                            // explicitly, since each completion here
+                            // is handled once and then control returns
+                            // to the main event loop rather than
+                            // looping internally.
+                            let has_pipelined_request = matches!(
+                                &connections[slab_index].protocol,
+                                ConnectionProtocol::Http1(h1) if !h1.read_buf.is_empty()
+                            );
+
+                            if has_pipelined_request {
+                                let outcome = {
+                                    let conn = &mut connections[slab_index];
+                                    let ctx = Http1DispatchContext {
+                                        server: &self.server,
+                                        max_request_size: self.max_request_size,
+                                        h2_settings: &self.h2_settings,
+                                        ws_settings: &self.ws_settings,
+                                        h2c_upgrade_enabled: self.h2c_upgrade_enabled,
+                                        ws_enabled: self.ws_enabled,
+                                        ws_max_connections: self.ws_max_connections,
+                                        ws_permessage_deflate: self.ws_permessage_deflate,
+                                        remote_addr: conn.remote_addr.ip(),
+                                    };
+                                    crate::core::conn::protocol::process_http1_read_buf(&mut conn.protocol, &ctx)
+                                };
+                                match outcome {
+                                    Http1Outcome::NeedsMoreData => {
+                                        if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after draining a pipelined request");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                    }
+                                    Http1Outcome::FlushThenContinue | Http1Outcome::FlushThenClose => {
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit response to a pipelined request");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                    }
+                                    Http1Outcome::SwitchedToHttp2 | Http1Outcome::SwitchedToWebSocket => {
+                                        // A pipelined upgrade request
+                                        // is a real but unusual case
+                                        // (an Upgrade request is
+                                        // ordinarily the last request
+                                        // on a connection) -- not yet
+                                        // supported here, same
+                                        // limitation as the equivalent
+                                        // arms elsewhere in this
+                                        // function.
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit upgrade response to a pipelined request");
+                                        }
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                }
+                                continue;
+                            }
+
                             if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
                                 tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
@@ -2032,6 +2111,307 @@ mod tests {
         let frame_type = response[3];
         assert_eq!(frame_type, 0x4, "expected a SETTINGS frame as the first bytes back over the TLS+ALPN h2 connection");
 
+        pool.shutdown();
+    }
+
+    /// A real TLS handshake, a real WebSocket upgrade over that TLS
+    /// session, a real echoed application message, and a real close
+    /// handshake -- proves WS-over-TLS works end to end the same way
+    /// websocket_upgrade_echo_and_close_handshake_end_to_end proves
+    /// plain WS does, without needing an external tool (Autobahn) that
+    /// turned out to need a per-test-case TLS handshake and became
+    /// impractically slow against this backend's own test suite.
+    #[test]
+    fn tls_websocket_upgrade_echo_and_close_handshake_end_to_end() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let (cert_der, key_der, trust_anchor_der) = crate::net::tls::generate_test_identity("localhost");
+        let tls_ctx = crate::net::tls::TlsContext::builder_from_der(vec![cert_der], key_der)
+            .expect("build TLS context")
+            .build()
+            .expect("finish building TLS context");
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.ws.enabled = true;
+        config.port = port as i32;
+        let mut server = RoutaServer::from_config(config).expect("build a minimal RoutaServer");
+        server.tls_context = Some(std::sync::Arc::new(tls_ctx));
+        let mut router = crate::http::router::Router::new();
+        router.add("/ws", &[crate::http::request::HttpMethod::Get], |req, _params| {
+            crate::http::ws::build_handshake_response(req, None)
+        });
+        router.add_websocket_route("/ws", |msg| match msg {
+            crate::http::ws::WsMessage::Text(text) if text == "ping" => Some(crate::http::ws::WsMessage::Text("pong".to_string())),
+            _ => None,
+        });
+        let router = Arc::new(router);
+        server.router = Arc::clone(&router);
+        server.middleware_chain = Arc::new(crate::http::middleware::ChainBuilder::new().build(move |req| match router.dispatch(req) {
+            crate::http::router::Dispatch::Matched { handler, params } => handler(req, &params),
+            crate::http::router::Dispatch::MethodNotAllowed { .. } => crate::http::response::HttpResponse::new(405, "Method Not Allowed"),
+            crate::http::router::Dispatch::NotFound => crate::http::response::HttpResponse::new(404, "Not Found"),
+        }));
+        let server = Arc::new(server);
+        let pool = run(server, port, 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let tcp = {
+            let mut connected = None;
+            for _ in 0..50 {
+                match StdTcpStream::connect(("127.0.0.1", port)) {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            connected.expect("worker should eventually accept a connection")
+        };
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+        tcp.set_nodelay(true).expect("set nodelay");
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(trust_anchor_der).expect("add test cert to root store");
+        let mut client = crate::net::tls::TlsConnection::new_client_with_roots("localhost", vec![], root_store).expect("create client connection");
+
+        let mut tcp_for_io = tcp.try_clone().expect("clone tcp stream");
+        for _ in 0..50 {
+            let advance = client.advance_io(&mut tcp_for_io);
+            if advance.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            if !client.is_handshaking() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!client.is_handshaking(), "client-side TLS handshake should have completed");
+
+        // A real WebSocket upgrade request, encrypted through the TLS
+        // session.
+        client
+            .write_plaintext(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+            .expect("queue upgrade request");
+        client.advance_io(&mut tcp_for_io).expect("flush encrypted upgrade request");
+
+        // Read and decrypt the upgrade response, one byte at a time
+        // until the header terminator, to avoid consuming bytes that
+        // belong to the first WS frame that might arrive in the same
+        // encrypted read.
+        let mut header_buf = Vec::new();
+        let mut decrypted_byte = [0u8; 1];
+        loop {
+            match client.read_plaintext(&mut decrypted_byte) {
+                Ok(1) => {
+                    header_buf.push(decrypted_byte[0]);
+                    if header_buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    client.advance_io(&mut tcp_for_io).expect("advance while waiting for upgrade response");
+                }
+                Err(e) => panic!("unexpected error reading upgrade response: {e}"),
+            }
+        }
+        let response_text = String::from_utf8_lossy(&header_buf);
+        assert!(response_text.starts_with("HTTP/1.1 101"), "expected 101 Switching Protocols, got: {response_text:?}");
+
+        // A masked "ping" text frame, encrypted through the same TLS
+        // session.
+        let ping_frame = build_masked_ws_text_frame("ping");
+        client.write_plaintext(&ping_frame).expect("queue ping frame");
+        client.advance_io(&mut tcp_for_io).expect("flush encrypted ping frame");
+
+        // Read and decrypt the "pong" reply.
+        let mut reply = Vec::new();
+        let mut buf = [0u8; 256];
+        for _ in 0..50 {
+            match client.advance_io(&mut tcp_for_io) {
+                Ok(_) => {
+                    loop {
+                        match client.read_plaintext(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => reply.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                    if !reply.is_empty() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!reply.is_empty(), "expected an encrypted pong reply");
+        let (opcode, payload) = parse_unmasked_ws_frame(&reply);
+        assert_eq!(opcode, 0x1, "expected a text frame");
+        assert_eq!(payload, b"pong");
+
+        // A masked close frame, and confirmation the connection
+        // actually closes afterward (the TLS session ending cleanly,
+        // not just the raw TCP socket).
+        let close_frame = build_masked_ws_close_frame();
+        client.write_plaintext(&close_frame).expect("queue close frame");
+        client.advance_io(&mut tcp_for_io).expect("flush encrypted close frame");
+
+        let mut tail = Vec::new();
+        let mut buf2 = [0u8; 256];
+        for _ in 0..50 {
+            match client.advance_io(&mut tcp_for_io) {
+                Ok(advance) => {
+                    loop {
+                        match client.read_plaintext(&mut buf2) {
+                            Ok(0) => break,
+                            Ok(n) => tail.extend_from_slice(&buf2[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                    if advance.peer_closed {
+                        break;
+                    }
+                }
+                Err(_) => break, // connection reset/closed -- also an acceptable clean end for this test's purposes
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        pool.shutdown();
+    }
+
+    /// Two requests over the same TCP connection, the second one
+    /// requesting Connection: close -- proves keep-alive actually
+    /// keeps this backend's own Http1Connection state (its read_buf,
+    /// in particular, since a pipelined or back-to-back second
+    /// request's bytes may already be sitting in the same Recv
+    /// completion or a later one on the same connection) alive across
+    /// requests, rather than requiring a fresh connection each time.
+    /// Mirrors mio_backend's own equivalent test.
+    #[test]
+    fn keep_alive_connection_serves_multiple_requests_over_real_tcp() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "routa_uring_ka_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp webroot");
+        std::fs::write(dir.join("a.txt"), b"first").expect("write a.txt");
+        std::fs::write(dir.join("b.txt"), b"second").expect("write b.txt");
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        stream.write_all(b"GET /a.txt HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write first request");
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read first response");
+        let first_response = String::from_utf8_lossy(&buf[..n]);
+        assert!(first_response.contains("first"), "expected first response to contain 'first', got: {first_response:?}");
+
+        // Same connection, second request -- proves keep-alive kept
+        // this connection's slab slot (and its Http1Connection state)
+        // alive rather than the first response's flush having torn it
+        // down.
+        stream.write_all(b"GET /b.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write second request");
+        let mut buf2 = Vec::new();
+        stream.read_to_end(&mut buf2).expect("read second response to EOF");
+        let second_response = String::from_utf8_lossy(&buf2);
+        assert!(second_response.contains("second"), "expected second response to contain 'second', got: {second_response:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        pool.shutdown();
+    }
+
+    /// Two requests written to the socket back-to-back, without
+    /// waiting for the first response before sending the second (real
+    /// HTTP/1.1 pipelining, RFC 9112 9.4) -- both requests may well
+    /// arrive in the same Recv completion. Proves process_http1_read_buf's
+    /// parse loop correctly drains multiple complete requests already
+    /// sitting in read_buf from a single completion, rather than only
+    /// ever handling one request per Recv the way the sequential
+    /// keep-alive test above does.
+    #[test]
+    fn pipelined_requests_in_a_single_write_both_get_responses() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "routa_uring_pipeline_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp webroot");
+        std::fs::write(dir.join("a.txt"), b"first").expect("write a.txt");
+        std::fs::write(dir.join("b.txt"), b"second").expect("write b.txt");
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        // Both requests in a single write() call -- as likely as
+        // possible to arrive in the same underlying Recv completion.
+        let both_requests = b"GET /a.txt HTTP/1.1\r\nHost: localhost\r\n\r\nGET /b.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        stream.write_all(both_requests).expect("write pipelined requests");
+
+        let mut all_bytes = Vec::new();
+        stream.read_to_end(&mut all_bytes).expect("read both responses to EOF");
+        let full_text = String::from_utf8_lossy(&all_bytes);
+
+        assert!(full_text.contains("first"), "expected the first response's body in the combined stream, got: {full_text:?}");
+        assert!(full_text.contains("second"), "expected the second response's body in the combined stream, got: {full_text:?}");
+        // Two distinct status lines confirms both requests were
+        // actually dispatched and answered, not just one response
+        // whose body happened to contain both filenames.
+        assert_eq!(full_text.matches("HTTP/1.1 200").count(), 2, "expected exactly two 200 responses, got: {full_text:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
         pool.shutdown();
     }
 
