@@ -60,6 +60,21 @@ pub struct HttpResponse {
     /// sent; a route handler populates this the same way it populates
     /// any other header.
     pub early_hints: Vec<(String, String)>,
+    /// Set instead of a real status/body when this response should be
+    /// obtained by proxying the original request to an upstream
+    /// server, rather than this response itself being sent to the
+    /// client -- see `crate::core::proxy::ProxyPending`'s own doc
+    /// comment. `status`/`reason`/`body` on a response with this set
+    /// are meaningless placeholders (`HttpResponse::new`'s own
+    /// defaults, never actually inspected); a backend checks this
+    /// field before treating any of the rest of the response as real.
+    /// Kept as an opaque `Option` here (rather than, say, an enum
+    /// replacing `status`/`body` outright) so route-dispatch code that
+    /// has nothing to do with proxying -- the overwhelming majority of
+    /// `HttpResponse` construction -- never needs to know this variant
+    /// exists at all; only `core::proxy`'s own route handler ever sets
+    /// it, and only each backend's own dispatch code ever reads it.
+    pub proxy_pending: Option<crate::core::proxy::ProxyPending>,
 }
 
 impl HttpResponse {
@@ -72,6 +87,7 @@ impl HttpResponse {
             file_body: None,
             chunked: false,
             early_hints: Vec::new(),
+            proxy_pending: None,
         }
     }
 

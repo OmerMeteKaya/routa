@@ -99,6 +99,14 @@ const OP_TAG_RECV: u64 = 1;
 const OP_TAG_SEND: u64 = 2;
 const OP_TAG_TIMEOUT: u64 = 3;
 const OP_TAG_CANCEL: u64 = 4;
+/// Completion of an `opcode::Connect` SQE opening a new upstream
+/// connection -- see `submit_connect`'s own doc comment. Distinct from
+/// `OP_TAG_ACCEPT` (which only ever fires for the listener socket,
+/// identified by a fixed sentinel slab_index rather than a real one --
+/// see that arm's own handling) since a Connect completion always
+/// corresponds to a real slab slot (the newly-created upstream
+/// Connection waiting to know whether its connect() succeeded).
+const OP_TAG_CONNECT: u64 = 5;
 
 /// The listener accept SQE has no associated connection slot and is
 /// submitted exactly once per worker (re-armed in place, never
@@ -355,6 +363,98 @@ fn advance_tls(tls: &mut crate::net::tls::TlsConnection, io: &mut crate::net::tl
         return Ok(TlsAdvanceOutcome::StillHandshaking);
     }
     Ok(TlsAdvanceOutcome::RecordLayerAdvanced)
+}
+
+/// Creates a fresh, non-blocking TCP socket (via `socket(2)`) for an
+/// upstream connection attempt -- doesn't connect it yet, that's
+/// `submit_connect`'s job via a real `Connect` SQE. A synchronous
+/// `socket(2)` call here is the same kind of short, non-blocking-I/O-free
+/// syscall `get_peer_addr`'s own `getpeername(2)` already is (see its
+/// own doc comment) -- it only asks the kernel to allocate an fd, no
+/// network I/O happens until the SQE this fd is used for actually
+/// runs.
+fn create_upstream_socket(remote_addr: &std::net::SocketAddr) -> std::io::Result<RawFd> {
+    let domain = match remote_addr {
+        std::net::SocketAddr::V4(_) => libc::AF_INET,
+        std::net::SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Encodes `addr` into the raw `sockaddr` bytes `opcode::Connect`
+/// needs -- the inverse of `get_peer_addr`'s own decoding. Returns the
+/// encoded bytes and their true length (`opcode::Connect` needs both
+/// a pointer and an exact length, not just a fixed-size buffer,
+/// because IPv4 and IPv6 addresses encode to different lengths).
+fn encode_sockaddr(addr: &std::net::SocketAddr) -> (Box<libc::sockaddr_storage>, libc::socklen_t) {
+    let mut storage: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
+    let len = match addr {
+        std::net::SocketAddr::V4(v4) => {
+            let sockaddr_in = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                std::ptr::write(&mut *storage as *mut _ as *mut libc::sockaddr_in, sockaddr_in);
+            }
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let sockaddr_in6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                std::ptr::write(&mut *storage as *mut _ as *mut libc::sockaddr_in6, sockaddr_in6);
+            }
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    };
+    (storage, len)
+}
+
+/// Submits a `Connect` SQE for a slab slot already holding an
+/// upstream `Connection` (created via `Connection::new_upstream` with
+/// `create_upstream_socket`'s fd) -- the async equivalent of
+/// `connect(2)`. The completion (`OP_TAG_CONNECT` in the main loop)
+/// reports success or failure the same way a real `connect(2)` would:
+/// `result == 0` means connected, a negative result is `-errno`
+/// (`ECONNREFUSED`, `ETIMEDOUT`, etc.), and there's no separate
+/// "connection in progress" completion the way a non-blocking
+/// synchronous `connect(2)` followed by `poll(2)` needs -- io_uring's
+/// own Connect opcode already waits for the handshake to finish
+/// before completing at all.
+fn submit_connect(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
+    let conn = &mut connections[slab_index];
+    let (storage, len) = encode_sockaddr(&conn.remote_addr);
+    let sockaddr_ptr = &*storage as *const libc::sockaddr_storage as *const libc::sockaddr;
+    let connect = opcode::Connect::new(types::Fd(conn.transport.fd()), sockaddr_ptr, len)
+        .build()
+        .user_data(make_user_data(OP_TAG_CONNECT, conn.generation, slab_index));
+    // storage must outlive the SQE the kernel will read sockaddr_ptr
+    // from -- stashing it on the connection itself (rather than
+    // letting it drop at the end of this function) is what keeps it
+    // alive until the OP_TAG_CONNECT completion arrives and clears it.
+    conn.pending_connect_addr = Some(storage);
+    unsafe {
+        ring.submission()
+            .push(&connect)
+            .map_err(|_| "failed to push connect SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    Ok(())
 }
 
 fn submit_listener_accept(ring: &mut IoUring, listener_fd: RawFd) -> Result<(), String> {
@@ -1228,9 +1328,6 @@ impl WorkerBody for EventLoopWorker {
                             continue;
                         }
                         if connections[slab_index].generation != completion_generation {
-                            // Stale completion from whatever used to
-                            // occupy this slot -- see make_user_data's
-                            // own doc comment.
                             continue;
                         }
                         if result < 0 {
@@ -1320,7 +1417,9 @@ impl WorkerBody for EventLoopWorker {
                         let (fully_flushed, should_close_after_flush) = match &connections[slab_index].protocol {
                             ConnectionProtocol::Http1(h1) => (h1.write_buf.is_empty(), !h1.keep_alive),
                             ConnectionProtocol::WebSocket(ws) => (ws.write_buf.is_empty(), already_marked_closing),
-                            ConnectionProtocol::Http2(h2) => (h2.write_buf.is_empty(), already_marked_closing),
+                            ConnectionProtocol::Http2(h2) => {
+                                (h2.write_buf.is_empty(), already_marked_closing)
+                            }
                             ConnectionProtocol::Handshaking => {
                                 // A non-TLS connection should never
                                 // have an outstanding Send while still
@@ -1731,8 +1830,6 @@ mod tests {
         // no visibility into the actual bytes.
         let mut raw_response = [0u8; 512];
         let n = stream.read(&mut raw_response).expect("read upgrade response should succeed");
-        eprintln!("DEBUG: raw response ({n} bytes): {:?}", String::from_utf8_lossy(&raw_response[..n]));
-        eprintln!("DEBUG: raw response bytes: {:?}", &raw_response[..n]);
 
         let mut reader = std::io::BufReader::new(&raw_response[..n]);
         let mut status_line = String::new();
@@ -2413,6 +2510,52 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         pool.shutdown();
+    }
+
+    /// Proves the raw building blocks (create_upstream_socket,
+    /// encode_sockaddr, submit_connect) actually complete a real TCP
+    /// connection through io_uring's Connect opcode, in isolation from
+    /// the rest of the proxy machinery this is a first step toward --
+    /// a minimal ring, a minimal listener the test itself accepts
+    /// from, and a direct check of the OP_TAG_CONNECT completion's
+    /// result.
+    #[test]
+    fn submit_connect_completes_a_real_tcp_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let target_addr = listener.local_addr().expect("local addr");
+
+        let mut ring = IoUring::new(8).expect("create ring");
+
+        let fd = create_upstream_socket(&target_addr).expect("create upstream socket");
+        let mut slab: Slab<Connection> = Slab::new();
+        let placeholder_transport = Transport::Plain(fd);
+        let conn = Connection::new_upstream(fd as u64, placeholder_transport, target_addr, 4096, 1);
+        let slab_index = slab.insert(conn);
+
+        submit_connect(&mut ring, &mut slab, slab_index).expect("submit connect SQE");
+        ring.submit_and_wait(1).expect("submit and wait for connect completion");
+
+        let cqe = ring.completion().next().expect("a completion should be available");
+        let (op_tag, _generation, completed_slab_index) = split_user_data(cqe.user_data());
+        assert_eq!(op_tag, OP_TAG_CONNECT);
+        assert_eq!(completed_slab_index, slab_index);
+        assert_eq!(cqe.result(), 0, "connect should succeed against a real, listening TCP socket");
+
+        // Accept the connection on the listener side, proving this
+        // wasn't just a local success code with no real peer.
+        listener.set_nonblocking(true).expect("set listener nonblocking");
+        let mut accepted = None;
+        for _ in 0..50 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = Some(stream);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => panic!("unexpected accept error: {e}"),
+            }
+        }
+        assert!(accepted.is_some(), "listener should have accepted the real connection submit_connect established");
     }
 
     #[test]

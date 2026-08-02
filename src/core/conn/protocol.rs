@@ -77,6 +77,26 @@ pub struct Http1Connection {
     /// `false` once that request finishes parsing (alongside
     /// `request_started_at`).
     pub continue_sent: bool,
+    /// `Some((upstream_slab_index, upstream_generation))` while this
+    /// downstream connection's current request has been forwarded to
+    /// an upstream connection and is waiting for that upstream's
+    /// response -- see `core::conn::uring_conn::ConnectionRole::Upstream`'s
+    /// own doc comment for the pairing's ABA-safety role. `process_http1_read_buf`
+    /// itself never sets or reads this (proxying is driven by the
+    /// backend event loop, one layer above the protocol state
+    /// machines this module holds) -- it exists here purely so a
+    /// downstream connection's own `Http1Connection` can carry this
+    /// bookkeeping across the (possibly several) event loop passes
+    /// between "request fully parsed, forwarded upstream" and
+    /// "upstream response arrived, ready to flush back to the
+    /// client", the same way `pending_file` already carries
+    /// in-progress sendfile state across passes for a different kind
+    /// of multi-step response. `None` outside of proxying (the
+    /// overwhelming majority of connections, and the only case
+    /// mio_backend's own equivalent Http1Connection usage needs to
+    /// consider today, since core::proxy's mio path doesn't route
+    /// through this at all -- see that module's own doc comment).
+    pub waiting_for_upstream: Option<(usize, u32)>,
 }
 
 /// A response body queued to be sent via `sendfile(2)` once the
@@ -99,6 +119,7 @@ impl Http1Connection {
             continue_sent: false,
             request_started_at: None,
             protocol_confirmed: true,
+            waiting_for_upstream: None,
         }
     }
 

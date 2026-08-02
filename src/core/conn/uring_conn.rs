@@ -95,6 +95,33 @@ impl Drop for Transport {
 /// currently active on it. Same shape and role as `mio_conn::Connection`
 /// -- see its doc comment -- with a completion-based `Transport` in
 /// place of a readiness-based one.
+/// Which side of a connection a `Connection` value represents --
+/// see `Connection::role`'s own doc comment for why this needs to
+/// exist at all (a proxied request's upstream connection is driven
+/// through this same event loop, the same Slab, and the same
+/// generation/cancel discipline as any client connection, rather than
+/// through a separate synchronous module the way mio_backend's own
+/// core::proxy currently is -- see that module's own doc comment on
+/// why it drives sockets synchronously, a design choice this backend
+/// deliberately doesn't repeat).
+pub enum ConnectionRole {
+    /// An ordinary client connection -- everything this backend has
+    /// done up to this point.
+    Downstream,
+    /// A connection to an upstream server, opened to satisfy a
+    /// downstream connection's proxied request.
+    Upstream {
+        /// The downstream connection currently waiting on this
+        /// upstream connection's response, identified by slab index
+        /// and generation (the same ABA-safety pairing every other
+        /// cross-referenced slot in this backend uses -- see
+        /// `core::event_loop::uring_backend`'s own `make_user_data`
+        /// doc comment). `None` while this upstream connection is
+        /// idle (in a pool, not currently serving any request).
+        serving_downstream: Option<(usize, u32)>,
+    },
+}
+
 pub struct Connection {
     pub id: ConnId,
     pub transport: Transport,
@@ -102,6 +129,12 @@ pub struct Connection {
     pub remote_addr: SocketAddr,
     pub created_at: Instant,
     pub last_active_at: Instant,
+    /// Which side of a proxied request this connection represents --
+    /// see `ConnectionRole`'s own doc comment. `Downstream` for every
+    /// connection this backend has driven before proxy support was
+    /// added; existing code paths that don't care about proxying
+    /// never need to check this field.
+    pub role: ConnectionRole,
     /// Set once this connection has been told to close (peer EOF, a
     /// fatal I/O error, or the server initiating a graceful drain) --
     /// checked before scheduling any further I/O on it.
@@ -114,6 +147,16 @@ pub struct Connection {
     /// io_uring SQE's buffer does (see `core::event_loop::uring_backend`'s
     /// own doc comment on buffer ownership).
     pub recv_buf: Vec<u8>,
+    /// The encoded `sockaddr` bytes for an in-flight `Connect` SQE on
+    /// this connection -- must stay alive at a stable address for as
+    /// long as the kernel might still read from it (i.e. until the
+    /// Connect completion arrives), the same buffer-ownership
+    /// constraint `recv_buf` documents for `Recv`/`Send`. `None`
+    /// outside of an in-flight connect (which is the common case:
+    /// once the completion arrives, whether success or failure, this
+    /// is set back to `None` -- there's no further use for the
+    /// encoded address after that point).
+    pub pending_connect_addr: Option<Box<libc::sockaddr_storage>>,
     /// This slot's current generation, embedded in every SQE's
     /// `user_data` for as long as this connection occupies it -- see
     /// `core::event_loop::uring_backend`'s `make_user_data` for the
@@ -135,10 +178,21 @@ impl Connection {
             remote_addr,
             created_at: now,
             last_active_at: now,
+            role: ConnectionRole::Downstream,
             closing: false,
             recv_buf: vec![0u8; recv_buf_size],
+            pending_connect_addr: None,
             generation,
         }
+    }
+
+    /// Same as `new`, but for a connection opened to an upstream
+    /// server rather than accepted from a client -- see
+    /// `ConnectionRole::Upstream`'s own doc comment.
+    pub fn new_upstream(id: ConnId, transport: Transport, remote_addr: SocketAddr, recv_buf_size: usize, generation: u32) -> Self {
+        let mut conn = Self::new(id, transport, remote_addr, recv_buf_size, generation);
+        conn.role = ConnectionRole::Upstream { serving_downstream: None };
+        conn
     }
 
     pub fn touch(&mut self) {

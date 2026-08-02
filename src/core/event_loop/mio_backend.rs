@@ -662,6 +662,41 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                 worker.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).inc();
                 let dispatch_start = Instant::now();
                 let response = worker.server.middleware_chain.execute(&request);
+                // A route handler that matched a proxy route
+                // deliberately does no I/O itself (see
+                // `HttpResponse::proxy_pending`'s own doc comment) --
+                // the actual forwarding, synchronously, on this same
+                // thread, is this backend's job, called from here
+                // rather than from inside the route handler. This
+                // matches this backend's own prior behavior exactly
+                // (forward() used to be called directly from the
+                // route handler, blocking this same call stack either
+                // way) -- only *where* forward() is invoked from
+                // changed, not its own synchronous nature or anything
+                // about what it does.
+                let response = match response.proxy_pending.clone() {
+                    Some(pending) => {
+                        match crate::core::proxy::forward(&pending.lb, &pending.h2_pools, &request, &pending.config, &worker.server.metrics) {
+                            Ok(resp) => resp,
+                            Err(crate::core::proxy::ForwardError::AllNodesExhausted) => {
+                                let mut resp = crate::http::response::HttpResponse::new(503, "Service Unavailable");
+                                resp.set_body(b"Service Unavailable\n".to_vec());
+                                resp
+                            }
+                            Err(crate::core::proxy::ForwardError::UpstreamError(_)) => {
+                                let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
+                                resp.set_body(b"Bad Gateway\n".to_vec());
+                                resp
+                            }
+                            Err(crate::core::proxy::ForwardError::AclDenied) => {
+                                let mut resp = crate::http::response::HttpResponse::new(403, "Forbidden");
+                                resp.set_body(b"Forbidden\n".to_vec());
+                                resp
+                            }
+                        }
+                    }
+                    None => response,
+                };
                 let duration_secs = dispatch_start.elapsed().as_secs_f64();
                 worker.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
                 worker.server.metrics.record_request(

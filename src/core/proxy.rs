@@ -320,6 +320,41 @@ impl Default for ProxyConfig {
     }
 }
 
+/// Carries everything a proxy route needs to actually forward a
+/// request, without doing any of that forwarding itself -- see
+/// `http::response::HttpResponse::proxy_pending`'s own doc comment
+/// for why a route handler returns this instead of calling
+/// `forward()` directly (or, on the mio path, in addition to still
+/// calling it: mio_backend's own proxy route handler keeps calling
+/// `forward()` synchronously and never touches this field at all --
+/// see this module's own top doc comment on why that's mio's existing,
+/// unchanged design). A backend that *does* check this field (today,
+/// only uring_backend) reads `lb`/`h2_pools`/`config` to drive its own
+/// asynchronous connect/send/recv cycle instead.
+///
+/// Cloning is deliberately cheap (three `Arc` clones and a config
+/// copy) since a route handler constructs one on every single proxied
+/// request -- there's no per-request state here, only shared handles
+/// to state that already exists for the route's whole lifetime.
+#[derive(Clone)]
+pub struct ProxyPending {
+    pub lb: Arc<LoadBalancer>,
+    pub h2_pools: Arc<H2PoolRegistry>,
+    pub config: ProxyConfig,
+}
+
+impl std::fmt::Debug for ProxyPending {
+    // Manual impl since LoadBalancer/H2PoolRegistry don't derive Debug
+    // themselves -- HttpResponse (which embeds this via proxy_pending)
+    // derives Debug, so this needs to exist, but there's nothing
+    // useful to print about a load balancer's internal state here;
+    // a placeholder is all any caller debug-formatting an HttpResponse
+    // actually needs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyPending").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 pub enum ForwardError {
     /// Every node the retry policy allowed trying failed to even

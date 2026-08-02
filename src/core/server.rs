@@ -235,7 +235,6 @@ impl RoutaServer {
             let lb = Arc::clone(&routed_pool.lb);
             let h2_pools_for_route = Arc::clone(&h2_pools);
             let proxy_config_for_route = proxy_config.clone();
-            let metrics_for_route = Arc::clone(&metrics);
             router.add(
                 &routed_pool.route_prefix,
                 &[
@@ -247,23 +246,30 @@ impl RoutaServer {
                     crate::http::request::HttpMethod::Patch,
                     crate::http::request::HttpMethod::Options,
                 ],
-                move |req, _params| match crate::core::proxy::forward(&lb, &h2_pools_for_route, req, &proxy_config_for_route, &metrics_for_route) {
-                    Ok(resp) => resp,
-                    Err(crate::core::proxy::ForwardError::AllNodesExhausted) => {
-                        let mut resp = HttpResponse::new(503, "Service Unavailable");
-                        resp.set_body(b"Service Unavailable\n".to_vec());
-                        resp
-                    }
-                    Err(crate::core::proxy::ForwardError::UpstreamError(_)) => {
-                        let mut resp = HttpResponse::new(502, "Bad Gateway");
-                        resp.set_body(b"Bad Gateway\n".to_vec());
-                        resp
-                    }
-                    Err(crate::core::proxy::ForwardError::AclDenied) => {
-                        let mut resp = HttpResponse::new(403, "Forbidden");
-                        resp.set_body(b"Forbidden\n".to_vec());
-                        resp
-                    }
+                move |_req, _params| {
+                    // This handler deliberately does no I/O itself --
+                    // it just packages up what a backend needs to
+                    // proxy the request (see
+                    // `http::response::HttpResponse::proxy_pending`'s
+                    // own doc comment for why). mio_backend's
+                    // `drive_http1` checks for this and calls
+                    // `core::proxy::forward` synchronously, matching
+                    // its existing behavior byte-for-byte (this
+                    // refactor changes *where* forward() is called
+                    // from, not *how* it forwards -- metrics_for_route
+                    // moves there instead of being captured here,
+                    // since the actual request/response accounting
+                    // only makes sense once a real attempt has been
+                    // made). uring_backend checks the same field and
+                    // drives its own asynchronous connect/send/recv
+                    // cycle instead.
+                    let mut resp = HttpResponse::new(200, "OK");
+                    resp.proxy_pending = Some(crate::core::proxy::ProxyPending {
+                        lb: Arc::clone(&lb),
+                        h2_pools: Arc::clone(&h2_pools_for_route),
+                        config: proxy_config_for_route.clone(),
+                    });
+                    resp
                 },
             );
         }
@@ -1133,9 +1139,24 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
+        // middleware_chain.execute() itself no longer performs the
+        // actual proxying -- it only returns a response carrying
+        // ProxyPending (see HttpResponse::proxy_pending's own doc
+        // comment for why: the real forward() call is now each
+        // backend's own responsibility, called from its own
+        // request-dispatch code, not from inside the route handler
+        // this chain runs). This test's job is to prove the *routing*
+        // -- that an /api/* request really does reach this pool's
+        // ProxyPending rather than falling through to a 404 -- and
+        // then, matching what mio_backend's own drive_http1 does with
+        // it, calls forward() itself to prove the whole path actually
+        // reaches the real upstream end to end.
         let resp = server.middleware_chain.execute(&req);
-        assert_eq!(resp.status, 200);
-        assert_eq!(resp.body(), b"upstream!");
+        let pending = resp.proxy_pending.expect("a request to /api/* should route to this pool's ProxyPending");
+        let metrics = crate::util::metrics::Metrics::new();
+        let forwarded = crate::core::proxy::forward(&pending.lb, &pending.h2_pools, &req, &pending.config, &metrics).expect("forward should succeed against the real upstream this test started");
+        assert_eq!(forwarded.status, 200);
+        assert_eq!(forwarded.body(), b"upstream!");
     }
 
     #[test]
