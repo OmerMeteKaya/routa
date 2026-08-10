@@ -119,6 +119,21 @@ pub enum ConnectionRole {
         /// doc comment). `None` while this upstream connection is
         /// idle (in a pool, not currently serving any request).
         serving_downstream: Option<(usize, u32)>,
+        /// The original client request to serialize and send once
+        /// this upstream connection's `Connect` completes -- kept
+        /// here (rather than, say, already serialized into
+        /// `Http1Connection::write_buf` before the connection even
+        /// exists) so this backend's own request-forwarding code
+        /// (mirroring `core::proxy::build_upstream_headers`, the same
+        /// header rewriting mio_backend's synchronous forward() does)
+        /// runs exactly once, right before the real send, with the
+        /// real upstream connection's own remote address available
+        /// for the `X-Forwarded-For`-style headers that need it.
+        /// `None` once actually taken and sent -- an upstream
+        /// connection reused from an idle pool for a second request
+        /// has this set again for that request, the same way the
+        /// first one set it.
+        pending_request: Option<Box<crate::http::request::HttpRequest>>,
     },
 }
 
@@ -191,7 +206,7 @@ impl Connection {
     /// `ConnectionRole::Upstream`'s own doc comment.
     pub fn new_upstream(id: ConnId, transport: Transport, remote_addr: SocketAddr, recv_buf_size: usize, generation: u32) -> Self {
         let mut conn = Self::new(id, transport, remote_addr, recv_buf_size, generation);
-        conn.role = ConnectionRole::Upstream { serving_downstream: None };
+        conn.role = ConnectionRole::Upstream { serving_downstream: None, pending_request: None };
         conn
     }
 

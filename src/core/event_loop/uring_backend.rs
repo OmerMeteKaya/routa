@@ -57,7 +57,7 @@ use io_uring::{opcode, types, IoUring, Probe};
 use slab::Slab;
 
 use crate::core::conn::protocol::{ConnectionProtocol, Http1Connection, Http1DispatchContext, Http1Outcome, Http2Connection};
-use crate::core::conn::uring_conn::{Connection, Transport};
+use crate::core::conn::uring_conn::{Connection, ConnectionRole, Transport};
 use crate::core::server::RoutaServer;
 use crate::core::worker::{ShutdownSignal, WorkerBody};
 
@@ -893,9 +893,107 @@ impl WorkerBody for EventLoopWorker {
                         if result <= 0 {
                             // 0 means the peer closed (EOF); negative
                             // is a real error -- either way, this
-                            // connection is done.
+                            // connection is done. For an upstream
+                            // connection, this means the upstream
+                            // closed before a complete response
+                            // arrived -- whatever partial bytes it
+                            // did send (already in read_buf from
+                            // earlier completions, if any) couldn't
+                            // form a full response, or there'd have
+                            // been a dispatch below already.
+                            let serving_downstream_on_close = match &connections[slab_index].role {
+                                ConnectionRole::Upstream { serving_downstream, .. } => *serving_downstream,
+                                ConnectionRole::Downstream => None,
+                            };
                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
+                            if let Some((downstream_slab_index, downstream_generation)) = serving_downstream_on_close {
+                                if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
+                                    let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
+                                    resp.set_body(b"Bad Gateway\n".to_vec());
+                                    if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
+                                        // Preserve the original request's
+                                        // keep_alive intent -- see
+                                        // Http1Connection::waiting_for_upstream's
+                                        // own doc comment on why it's
+                                        // carried here rather than
+                                        // re-derived (the original
+                                        // HttpRequest that would tell us
+                                        // this was consumed once
+                                        // forwarded upstream).
+                                        let keep_alive = h1.waiting_for_upstream.map(|(_, _, ka)| ka).unwrap_or(false);
+                                        h1.waiting_for_upstream = None;
+                                        crate::core::conn::protocol::queue_http1_response(h1, resp);
+                                        h1.keep_alive = keep_alive;
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, downstream_slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit 502 after upstream closed early");
+                                            cancel_outstanding_operations(&mut ring, downstream_generation, downstream_slab_index);
+                                            connections.remove(downstream_slab_index);
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // An upstream connection's Recv completions
+                        // carry the upstream's *response*, not a
+                        // client request -- handled entirely
+                        // separately from the ordinary
+                        // H2/WebSocket/HTTP1-request dispatch below,
+                        // which assumes it's looking at a downstream
+                        // connection.
+                        let upstream_serving_downstream = match &connections[slab_index].role {
+                            ConnectionRole::Upstream { serving_downstream, .. } => *serving_downstream,
+                            ConnectionRole::Downstream => None,
+                        };
+                        if let Some((downstream_slab_index, downstream_generation)) = upstream_serving_downstream {
+                            let n = result as usize;
+                            let recv_buf = connections[slab_index].recv_buf[..n].to_vec();
+                            connections[slab_index].touch();
+                            let parsed_response = {
+                                let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                h1.read_buf.push(&recv_buf);
+                                crate::core::proxy::try_parse_response(h1.read_buf.as_slice())
+                            };
+                            let Some(response) = parsed_response else {
+                                // Not a complete response yet -- keep
+                                // reading from the upstream.
+                                if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit follow-up recv from upstream");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
+                                continue;
+                            };
+
+                            // A complete response arrived -- this
+                            // upstream connection's job for this
+                            // request is done (no keep-alive/idle-pool
+                            // reuse yet -- see this arm's own
+                            // limitation note), tear it down and flush
+                            // the response back to whichever
+                            // downstream connection is still waiting
+                            // for it (it may have gone away already,
+                            // e.g. the client disconnected while
+                            // waiting -- generation-checked the same
+                            // way every other cross-referenced slot in
+                            // this backend is).
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
+                                if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
+                                    let keep_alive = h1.waiting_for_upstream.map(|(_, _, ka)| ka).unwrap_or(false);
+                                    h1.waiting_for_upstream = None;
+                                    crate::core::conn::protocol::queue_http1_response(h1, response);
+                                    h1.keep_alive = keep_alive;
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, downstream_slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit proxied response to downstream");
+                                        cancel_outstanding_operations(&mut ring, downstream_generation, downstream_slab_index);
+                                        connections.remove(downstream_slab_index);
+                                    }
+                                }
+                            }
                             continue;
                         }
 
@@ -1320,6 +1418,105 @@ impl WorkerBody for EventLoopWorker {
                                     connections.remove(slab_index);
                                 }
                             }
+                            Http1Outcome::ProxyPending(pending, original_request) => {
+                                // Picks a node the same way mio_backend's
+                                // own core::proxy::forward does (no
+                                // sticky-session cookie support here
+                                // yet -- see this arm's own limitation
+                                // note below) and opens a real,
+                                // asynchronous connection to it via
+                                // submit_connect, rather than the
+                                // synchronous connect+busy-poll
+                                // core::proxy::forward itself uses (see
+                                // that module's own doc comment on why
+                                // this backend deliberately doesn't
+                                // repeat that design).
+                                let Some(node) = pending.lb.pick_node_sticky(None, None) else {
+                                    let mut resp = crate::http::response::HttpResponse::new(503, "Service Unavailable");
+                                    resp.set_body(b"Service Unavailable\n".to_vec());
+                                    let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                    crate::core::conn::protocol::queue_http1_response(h1, resp);
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit 503 for exhausted upstream pool");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                    continue;
+                                };
+
+                                let upstream_addr = match node.resolve_addr() {
+                                    Ok(addr) => addr,
+                                    Err(_) => {
+                                        let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
+                                        resp.set_body(b"Bad Gateway\n".to_vec());
+                                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                        crate::core::conn::protocol::queue_http1_response(h1, resp);
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit 502 for unresolvable upstream");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                let upstream_fd = match create_upstream_socket(&upstream_addr) {
+                                    Ok(fd) => fd,
+                                    Err(e) => {
+                                        tracing::warn!(worker_id, error = %e, "failed to create upstream socket");
+                                        let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
+                                        resp.set_body(b"Bad Gateway\n".to_vec());
+                                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                        crate::core::conn::protocol::queue_http1_response(h1, resp);
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit 502 after socket creation failure");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                let downstream_generation = connections[slab_index].generation;
+                                let upstream_entry = connections.vacant_entry();
+                                let upstream_slab_index = upstream_entry.key();
+                                if upstream_slab_index >= generations.len() {
+                                    generations.resize(upstream_slab_index + 1, 0);
+                                }
+                                generations[upstream_slab_index] = generations[upstream_slab_index].wrapping_add(1);
+                                let upstream_generation = generations[upstream_slab_index];
+
+                                let mut upstream_conn = Connection::new_upstream(
+                                    upstream_fd as u64,
+                                    Transport::Plain(upstream_fd),
+                                    upstream_addr,
+                                    self.recv_buf_size,
+                                    upstream_generation,
+                                );
+                                upstream_conn.role = ConnectionRole::Upstream {
+                                    serving_downstream: Some((slab_index, downstream_generation)),
+                                    pending_request: Some(original_request.clone()),
+                                };
+                                // The upstream connection speaks
+                                // HTTP/1.1 back to us regardless of
+                                // what protocol the downstream client
+                                // used to reach this proxy -- proxying
+                                // doesn't yet translate protocols (H2
+                                // downstream -> H1 upstream, etc.), see
+                                // this arm's own limitation notes.
+                                upstream_conn.protocol = ConnectionProtocol::Http1(Http1Connection::new());
+                                upstream_entry.insert(upstream_conn);
+
+                                let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                h1.waiting_for_upstream = Some((upstream_slab_index, upstream_generation, original_request.keep_alive));
+
+                                if let Err(reason) = submit_connect(&mut ring, &mut connections, upstream_slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit connect to upstream");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                    connections.remove(upstream_slab_index);
+                                }
+                            }
                         }
                     }
 
@@ -1530,6 +1727,23 @@ impl WorkerBody for EventLoopWorker {
                                         cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                         connections.remove(slab_index);
                                     }
+                                    Http1Outcome::ProxyPending(..) => {
+                                        // A pipelined proxy request is
+                                        // a real but unusual case,
+                                        // same limitation as the
+                                        // pipelined-upgrade arm just
+                                        // above -- not yet supported
+                                        // here (implementing it means
+                                        // duplicating the full connect/
+                                        // send/recv cycle the primary
+                                        // ProxyPending arm above
+                                        // already handles, just
+                                        // reached from a different
+                                        // completion path).
+                                        tracing::warn!(worker_id, slab_index, "a pipelined proxy request is not yet supported by this backend, closing");
+                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
                                 }
                                 continue;
                             }
@@ -1539,6 +1753,81 @@ impl WorkerBody for EventLoopWorker {
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                             }
+                        }
+                    }
+
+                    OP_TAG_CONNECT => {
+                        if !connections.contains(slab_index) {
+                            continue; // upstream connection already torn down (e.g. its downstream vanished first)
+                        }
+                        if connections[slab_index].generation != completion_generation {
+                            continue; // stale completion -- see make_user_data's own doc comment
+                        }
+
+                        if result < 0 {
+                            // The connect(2) itself failed (ECONNREFUSED,
+                            // ETIMEDOUT, etc.) -- tell whichever
+                            // downstream was waiting, if it's still
+                            // around, and tear down this now-useless
+                            // upstream slot.
+                            let serving = match &connections[slab_index].role {
+                                ConnectionRole::Upstream { serving_downstream, .. } => *serving_downstream,
+                                ConnectionRole::Downstream => None,
+                            };
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            if let Some((downstream_slab_index, downstream_generation)) = serving {
+                                if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
+                                    let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
+                                    resp.set_body(b"Bad Gateway\n".to_vec());
+                                    let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol else { continue };
+                                    let keep_alive = h1.waiting_for_upstream.map(|(_, _, ka)| ka).unwrap_or(false);
+                                    h1.waiting_for_upstream = None;
+                                    crate::core::conn::protocol::queue_http1_response(h1, resp);
+                                    h1.keep_alive = keep_alive;
+                                    if let Err(reason) = submit_send(&mut ring, &mut connections, downstream_slab_index) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit 502 after upstream connect failure");
+                                        cancel_outstanding_operations(&mut ring, downstream_generation, downstream_slab_index);
+                                        connections.remove(downstream_slab_index);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Connected -- serialize the pending request
+                        // (see ConnectionRole::Upstream's own doc
+                        // comment on why it's kept here rather than
+                        // pre-serialized before the connection
+                        // existed) the same way mio_backend's own
+                        // synchronous forward_http1 does, via the same
+                        // shared build_upstream_headers, so both
+                        // backends rewrite headers identically.
+                        let pending_request = match &mut connections[slab_index].role {
+                            ConnectionRole::Upstream { pending_request, .. } => pending_request.take(),
+                            ConnectionRole::Downstream => None,
+                        };
+                        let Some(pending_request) = pending_request else {
+                            tracing::warn!(worker_id, slab_index, "connect completion for an upstream connection with no pending request -- closing");
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        };
+
+                        let client_addr = pending_request.remote_addr;
+                        let headers = crate::core::proxy::build_upstream_headers(&pending_request, client_addr, &self.server.config.pools.first().map(|p| p.name.clone()).unwrap_or_else(|| "routa".to_string()));
+                        let mut upstream_req = (*pending_request).clone();
+                        upstream_req.headers = headers.into_iter().map(|h| (h.name, h.value)).collect();
+                        let request_bytes = upstream_req.serialize();
+
+                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                        h1.write_buf.push(&request_bytes);
+
+                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                            tracing::warn!(worker_id, %reason, "failed to submit request to newly-connected upstream");
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                        } else {
                         }
                     }
 
@@ -2556,6 +2845,77 @@ mod tests {
             }
         }
         assert!(accepted.is_some(), "listener should have accepted the real connection submit_connect established");
+    }
+
+    /// A real client request, proxied through this backend's own
+    /// asynchronous connect/send/recv cycle (submit_connect,
+    /// OP_TAG_CONNECT, the upstream-response handling in OP_TAG_RECV)
+    /// to a real upstream TCP server, and the real upstream response
+    /// flushed back to the real client -- the uring-backend equivalent
+    /// of mio_backend's own `lb_pool_route_forwards_to_real_upstream_through_the_router`,
+    /// but exercising the full accept/recv/send completion loop end to
+    /// end rather than calling middleware_chain.execute() and forward()
+    /// directly.
+    #[test]
+    fn proxy_request_forwards_to_real_upstream_end_to_end() {
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().expect("upstream addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = b"upstream!";
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            upstreams: vec![crate::core::config::UpstreamConfig {
+                host: "127.0.0.1".to_string(),
+                port: upstream_port,
+                weight: 1,
+                use_tls: false,
+            }],
+            ..Default::default()
+        });
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write proxied request");
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read proxied response to EOF");
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200 from the real upstream, got: {response_text:?}");
+        assert!(response_text.ends_with("upstream!"), "expected the real upstream's body, got: {response_text:?}");
+
+        pool.shutdown();
     }
 
     #[test]

@@ -96,7 +96,7 @@ pub struct Http1Connection {
     /// mio_backend's own equivalent Http1Connection usage needs to
     /// consider today, since core::proxy's mio path doesn't route
     /// through this at all -- see that module's own doc comment).
-    pub waiting_for_upstream: Option<(usize, u32)>,
+    pub waiting_for_upstream: Option<(usize, u32, bool)>,
 }
 
 /// A response body queued to be sent via `sendfile(2)` once the
@@ -432,6 +432,25 @@ pub enum Http1Outcome {
     /// any `Http2` state at all, since the switch already replaced
     /// this connection's `protocol` by the time this returns.
     SwitchedToHttp2,
+    /// The matched route is a proxy route -- see
+    /// `http::response::HttpResponse::proxy_pending`'s own doc comment
+    /// for why this function returns this instead of the real
+    /// response itself. Nothing was queued into `write_buf`, and this
+    /// connection's `Http1Connection` state (specifically its
+    /// `read_buf`, which may already hold a further pipelined request)
+    /// is left exactly as it was when this call started -- the caller
+    /// is responsible for driving the actual proxy request (opening
+    /// an upstream connection, forwarding it, and eventually producing
+    /// a real response to flush back), then re-entering ordinary
+    /// dispatch once that's done, the same way it would after any
+    /// other asynchronous step this function itself can't perform
+    /// (this function's own doc comment on why it does no I/O applies
+    /// here too -- a backend's async connect/send/recv cycle has no
+    /// business inside protocol-parsing code that's shared, unchanged,
+    /// with mio_backend, which drives proxying through its own
+    /// completely separate, synchronous code path instead -- see
+    /// `core::proxy`'s own doc comment).
+    ProxyPending(crate::core::proxy::ProxyPending, Box<crate::http::request::HttpRequest>),
     /// The connection has just switched to
     /// `ConnectionProtocol::WebSocket` -- same flush-before-anything-else
     /// requirement as `SwitchedToHttp2` above.
@@ -461,7 +480,7 @@ fn negotiate_pmd_from_response(response: &crate::http::response::HttpResponse, c
 /// file-backed). Only the file-body deferral shape (`PendingFileSend`)
 /// is backend-agnostic here -- actually sending that file's bytes is
 /// transport-specific and left to each backend's own flush logic.
-fn queue_http1_response(h1: &mut Http1Connection, mut response: crate::http::response::HttpResponse) {
+pub fn queue_http1_response(h1: &mut Http1Connection, mut response: crate::http::response::HttpResponse) {
     let file_body = response.file_body.take();
 
     let mut serialized = crate::util::buf::Buf::new();
@@ -631,7 +650,18 @@ pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1Disp
                 let route = request.path.clone();
                 ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).inc();
                 let dispatch_start = std::time::Instant::now();
-                let response = ctx.server.middleware_chain.execute(&request);
+                let mut response = ctx.server.middleware_chain.execute(&request);
+                if let Some(pending) = response.proxy_pending.take() {
+                    // No metrics recorded here -- there's no real
+                    // response yet to record a status/duration/body
+                    // size for; the caller's own eventual real
+                    // forward() attempt is what actually produces
+                    // those, the same as mio_backend's own drive_http1
+                    // only records metrics after its (synchronous)
+                    // forward() call returns.
+                    ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
+                    return Http1Outcome::ProxyPending(pending, Box::new(request));
+                }
                 let duration_secs = dispatch_start.elapsed().as_secs_f64();
                 ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
                 ctx.server.metrics.record_request(
@@ -642,8 +672,6 @@ pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1Disp
                     request_body_len,
                     response.body().len(),
                 );
-
-                let mut response = response;
                 if !response.early_hints.is_empty() {
                     let mut early_hints_response = String::from("HTTP/1.1 103 Early Hints\r\n");
                     for (name, value) in &response.early_hints {

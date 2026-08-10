@@ -681,7 +681,7 @@ fn read_http1_response(stream: &mut mio::net::TcpStream, timeout: Duration) -> s
 /// this codebase's perspective so far), just enough structure to know
 /// when to stop reading and build the `HttpResponse` to hand back to
 /// the frontend.
-fn try_parse_response(buf: &[u8]) -> Option<HttpResponse> {
+pub fn try_parse_response(buf: &[u8]) -> Option<HttpResponse> {
     let headers_end = find_subslice(buf, b"\r\n\r\n")?;
     let header_bytes = &buf[..headers_end];
     let body_start = headers_end + 4;
