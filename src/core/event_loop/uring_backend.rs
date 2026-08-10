@@ -1182,18 +1182,26 @@ impl WorkerBody for EventLoopWorker {
                             // failure is -- see core::proxy::forward's
                             // own comment on this "gateway failure"
                             // framing.
-                            if let ConnectionRole::Upstream { node, pool, .. } = &connections[slab_index].role {
+                            let node_for_sticky = if let ConnectionRole::Upstream { node, pool, .. } = &connections[slab_index].role {
                                 if response.status < 500 {
                                     node.record_success(pool);
                                 } else {
                                     node.record_failure(pool);
                                 }
-                            }
+                                Some(Arc::clone(node))
+                            } else {
+                                None
+                            };
                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
                                 if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
                                     let keep_alive = h1.waiting_for_upstream.as_ref().map(|s| s.keep_alive).unwrap_or(false);
+                                    let mut response = response;
+                                    if let (Some(node), Some(attempt_state)) = (&node_for_sticky, &h1.waiting_for_upstream) {
+                                        let incoming_sticky = attempt_state.original_request.get_header(&crate::core::proxy::sticky_cookie_header_name(&attempt_state.pending.lb));
+                                        crate::core::proxy::apply_sticky_cookie(&mut response, &attempt_state.pending.lb, node, incoming_sticky);
+                                    }
                                     h1.waiting_for_upstream = None;
                                     crate::core::conn::protocol::queue_http1_response(h1, response);
                                     h1.keep_alive = keep_alive;
@@ -3280,6 +3288,69 @@ mod tests {
 
         assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200 after retrying to the working node, got: {response_text:?}");
         assert!(response_text.ends_with("second node!"), "expected the second (working) node's body, got: {response_text:?}");
+
+        pool.shutdown();
+    }
+
+    /// A real proxied request through a sticky-session-enabled pool
+    /// -- proves the response actually carries a Set-Cookie
+    /// identifying the node it was routed to, not just that
+    /// pick_node_sticky's own read side (honoring an incoming cookie)
+    /// works.
+    #[test]
+    fn proxy_sets_a_sticky_cookie_on_first_response() {
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind real upstream listener");
+        let upstream_port = upstream_listener.local_addr().expect("upstream addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = b"sticky!";
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            sticky_session_enabled: true,
+            upstreams: vec![crate::core::config::UpstreamConfig { host: "127.0.0.1".to_string(), port: upstream_port, weight: 1, use_tls: false }],
+            ..Default::default()
+        });
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write proxied request");
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read proxied response to EOF");
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200, got: {response_text:?}");
+        assert!(response_text.to_lowercase().contains("set-cookie:"), "expected a Set-Cookie header identifying the sticky target, got: {response_text:?}");
 
         pool.shutdown();
     }

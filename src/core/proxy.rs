@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use crate::http::h2::hpack::HeaderField;
 use crate::http::request::HttpRequest;
 use crate::http::response::HttpResponse;
-use crate::lb::lb::LoadBalancer;
+use crate::lb::lb::{sticky_id_for_node, LoadBalancer};
 use crate::lb::upstream::UpstreamNode;
 use crate::net::h2_client::H2Client;
 
@@ -431,6 +431,8 @@ pub fn forward(
                         // returns 5xx is just as much an outlier as one
                         // that can't be reached at all.
                         lb.pool.outlier_stats_for(&node).record_request(resp.status < 500);
+                        let mut resp = resp;
+                        apply_sticky_cookie(&mut resp, lb, &node, sticky_value.as_deref());
                         return Ok(resp);
                     }
                     Err(e) => {
@@ -504,7 +506,36 @@ fn circuit_breaker_state_value(state: crate::lb::upstream::NodeState) -> i64 {
     }
 }
 
-fn sticky_cookie_header_name(lb: &LoadBalancer) -> String {
+/// Sets a `Set-Cookie` header identifying `node` as this client's
+/// sticky-session target, if sticky sessions are enabled and the
+/// request either didn't already carry a valid sticky cookie or
+/// carried one pointing at a different node than the one actually
+/// picked (e.g. the cookie's node had gone Down and `pick_node_sticky`
+/// fell through to a different one -- see its own doc comment). A
+/// request that already carries a cookie matching the node it was
+/// actually routed to needs no `Set-Cookie` at all, since the
+/// client's next request will already carry the right value.
+///
+/// Shared between mio_backend's own synchronous `forward()` and
+/// uring_backend's asynchronous equivalent so both backends set this
+/// header identically -- neither backend had been setting it at all
+/// before this existed (pick_node_sticky's own read side -- honoring
+/// an incoming sticky cookie -- was already correct; only the write
+/// side, actually establishing the cookie on the client's first
+/// request, was missing).
+pub fn apply_sticky_cookie(response: &mut HttpResponse, lb: &LoadBalancer, node: &UpstreamNode, incoming_sticky_value: Option<&str>) {
+    if !lb.config.sticky_session_enabled {
+        return;
+    }
+    let this_node_id = sticky_id_for_node(node);
+    if incoming_sticky_value == Some(this_node_id.as_str()) {
+        return; // client already has the right cookie
+    }
+    let cookie_name = sticky_cookie_header_name(lb);
+    response.set_header("Set-Cookie", format!("{cookie_name}={this_node_id}; Path=/; HttpOnly"));
+}
+
+pub fn sticky_cookie_header_name(lb: &LoadBalancer) -> String {
     // Sticky value arrives as a Cookie header's value already parsed
     // out to just this cookie's value by whatever layer reads
     // incoming cookies -- this module only needs the configured
