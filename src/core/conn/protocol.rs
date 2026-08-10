@@ -41,6 +41,28 @@ pub enum ConnectionProtocol {
 /// `http::request`/`http::response`; this only holds the buffers they
 /// operate on plus the keep-alive bookkeeping that spans requests on
 /// the same connection.
+/// Everything a downstream connection needs to remember while its
+/// current request has been forwarded upstream and might need to be
+/// retried against a different node -- see `Http1Connection::waiting_for_upstream`'s
+/// own doc comment for why this lives here rather than being
+/// re-derived. `attempts_so_far` is what turns a single connect/send/recv
+/// failure into an actual retry loop (mirroring mio_backend's own
+/// synchronous `for attempt in 0..max_attempts` in `core::proxy::forward`)
+/// rather than the first failure always producing a 502: a backend's
+/// own failure-handling code checks this against
+/// `pending.config`-derived retry bounds (`core::proxy::ProxyConfig`
+/// doesn't carry `max_retries` itself -- see `ProxyPending`'s own
+/// fields -- so this is checked against `pending.lb.config.max_retries`)
+/// before giving up and finally producing an error response.
+pub struct ProxyAttemptState {
+    pub upstream_slab_index: usize,
+    pub upstream_generation: u32,
+    pub keep_alive: bool,
+    pub attempts_so_far: u32,
+    pub pending: crate::core::proxy::ProxyPending,
+    pub original_request: Box<crate::http::request::HttpRequest>,
+}
+
 pub struct Http1Connection {
     pub read_buf: Buf,
     pub write_buf: Buf,
@@ -96,7 +118,7 @@ pub struct Http1Connection {
     /// mio_backend's own equivalent Http1Connection usage needs to
     /// consider today, since core::proxy's mio path doesn't route
     /// through this at all -- see that module's own doc comment).
-    pub waiting_for_upstream: Option<(usize, u32, bool)>,
+    pub waiting_for_upstream: Option<ProxyAttemptState>,
 }
 
 /// A response body queued to be sent via `sendfile(2)` once the

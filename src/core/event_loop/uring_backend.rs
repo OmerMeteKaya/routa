@@ -489,6 +489,111 @@ fn submit_connect(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_i
     Ok(())
 }
 
+/// Called whenever an upstream attempt has failed (a connect(2)
+/// failure, or the upstream closing before a complete response
+/// arrived) for a downstream connection that's still around and still
+/// waiting -- decides whether to retry against a different node
+/// (mirroring mio_backend's own synchronous `for attempt in 0..max_attempts`
+/// loop in `core::proxy::forward`) or give up and flush a 502 back,
+/// and does whichever it decides. `downstream_slab_index` must already
+/// be known to exist with `attempt_state`'s own generation -- callers
+/// check this themselves (the same generation-checked pattern used
+/// throughout this module) before calling, since what to do if the
+/// downstream is already gone is caller-specific (usually: nothing).
+fn retry_or_fail_proxy_attempt(
+    ring: &mut IoUring,
+    connections: &mut Slab<Connection>,
+    generations: &mut Vec<u32>,
+    downstream_slab_index: usize,
+    mut attempt_state: crate::core::conn::protocol::ProxyAttemptState,
+    recv_buf_size: usize,
+    worker_id: usize,
+) {
+    let max_attempts = 1 + attempt_state.pending.lb.config.max_retries.max(0) as u32;
+    let downstream_generation = connections[downstream_slab_index].generation;
+    if attempt_state.attempts_so_far < max_attempts {
+        if let Some(node) = attempt_state.pending.lb.pick_node_sticky(None, None) {
+            if let Ok(upstream_addr) = node.resolve_addr() {
+                if let Ok(upstream_fd) = create_upstream_socket(&upstream_addr) {
+                    let upstream_entry = connections.vacant_entry();
+                    let upstream_slab_index = upstream_entry.key();
+                    if upstream_slab_index >= generations.len() {
+                        generations.resize(upstream_slab_index + 1, 0);
+                    }
+                    generations[upstream_slab_index] = generations[upstream_slab_index].wrapping_add(1);
+                    let upstream_generation = generations[upstream_slab_index];
+                    let read_write_timeouts = (attempt_state.pending.config.read_timeout, attempt_state.pending.config.write_timeout);
+                    let mut upstream_conn = Connection::new_upstream(
+                        upstream_fd as u64,
+                        Transport::Plain(upstream_fd),
+                        upstream_addr,
+                        recv_buf_size,
+                        upstream_generation,
+                        Arc::clone(&node),
+                        Arc::clone(&attempt_state.pending.lb.pool),
+                        read_write_timeouts,
+                    );
+                    upstream_conn.role = ConnectionRole::Upstream {
+                        node: Arc::clone(&node),
+                        pool: Arc::clone(&attempt_state.pending.lb.pool),
+                        read_write_timeouts,
+                        serving_downstream: Some((downstream_slab_index, downstream_generation)),
+                        pending_request: Some(attempt_state.original_request.clone()),
+                    };
+                    upstream_conn.protocol = ConnectionProtocol::Http1(Http1Connection::new());
+                    upstream_entry.insert(upstream_conn);
+
+                    attempt_state.upstream_slab_index = upstream_slab_index;
+                    attempt_state.upstream_generation = upstream_generation;
+                    attempt_state.attempts_so_far += 1;
+                    let connect_timeout = attempt_state.pending.config.connect_timeout;
+                    if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
+                        h1.waiting_for_upstream = Some(attempt_state);
+                    }
+                    if let Err(reason) = submit_connect(ring, connections, upstream_slab_index, connect_timeout) {
+                        tracing::warn!(worker_id, %reason, "failed to submit connect for a retried upstream attempt");
+                        cancel_outstanding_operations(ring, upstream_generation, upstream_slab_index);
+                        connections.remove(upstream_slab_index);
+                        flush_proxy_error_to_downstream(ring, connections, downstream_slab_index, 502, b"Bad Gateway\n");
+                    }
+                    return;
+                }
+            }
+        }
+        // Node selection, address resolution, or socket creation
+        // itself failed -- same as exhausting retries, there's no
+        // further attempt to make.
+    }
+    flush_proxy_error_to_downstream(ring, connections, downstream_slab_index, 502, b"Bad Gateway\n");
+}
+
+/// Queues `status`/`body` as this downstream connection's response
+/// and flushes it -- shared by every one of this backend's proxy
+/// error paths (exhausted retries, a connect failure with no retries
+/// left, etc.) so the keep_alive-preservation dance
+/// (`Http1Connection::waiting_for_upstream`'s own doc comment) isn't
+/// duplicated at each call site.
+fn flush_proxy_error_to_downstream(ring: &mut IoUring, connections: &mut Slab<Connection>, downstream_slab_index: usize, status: u16, body: &[u8]) {
+    let mut resp = crate::http::response::HttpResponse::new(status, "");
+    resp.set_body(body.to_vec());
+    let keep_alive = if let ConnectionProtocol::Http1(h1) = &connections[downstream_slab_index].protocol {
+        h1.waiting_for_upstream.as_ref().map(|s| s.keep_alive).unwrap_or(false)
+    } else {
+        false
+    };
+    let downstream_generation = connections[downstream_slab_index].generation;
+    if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
+        h1.waiting_for_upstream = None;
+        crate::core::conn::protocol::queue_http1_response(h1, resp);
+        h1.keep_alive = keep_alive;
+    }
+    if let Err(reason) = submit_send(ring, connections, downstream_slab_index) {
+        tracing::warn!(downstream_slab_index, %reason, "failed to submit proxy error response to downstream");
+        cancel_outstanding_operations(ring, downstream_generation, downstream_slab_index);
+        connections.remove(downstream_slab_index);
+    }
+}
+
 fn submit_listener_accept(ring: &mut IoUring, listener_fd: RawFd) -> Result<(), String> {
     let accept_multi = opcode::AcceptMulti::new(types::Fd(listener_fd)).build().user_data(USER_DATA_ACCEPT);
     unsafe {
@@ -1011,27 +1116,13 @@ impl WorkerBody for EventLoopWorker {
                             connections.remove(slab_index);
                             if let Some((downstream_slab_index, downstream_generation)) = serving_downstream_on_close {
                                 if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
-                                    let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
-                                    resp.set_body(b"Bad Gateway\n".to_vec());
-                                    if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
-                                        // Preserve the original request's
-                                        // keep_alive intent -- see
-                                        // Http1Connection::waiting_for_upstream's
-                                        // own doc comment on why it's
-                                        // carried here rather than
-                                        // re-derived (the original
-                                        // HttpRequest that would tell us
-                                        // this was consumed once
-                                        // forwarded upstream).
-                                        let keep_alive = h1.waiting_for_upstream.map(|(_, _, ka)| ka).unwrap_or(false);
-                                        h1.waiting_for_upstream = None;
-                                        crate::core::conn::protocol::queue_http1_response(h1, resp);
-                                        h1.keep_alive = keep_alive;
-                                        if let Err(reason) = submit_send(&mut ring, &mut connections, downstream_slab_index) {
-                                            tracing::warn!(worker_id, %reason, "failed to submit 502 after upstream closed early");
-                                            cancel_outstanding_operations(&mut ring, downstream_generation, downstream_slab_index);
-                                            connections.remove(downstream_slab_index);
-                                        }
+                                    let attempt_state = if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
+                                        h1.waiting_for_upstream.take()
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(attempt_state) = attempt_state {
+                                        retry_or_fail_proxy_attempt(&mut ring, &mut connections, &mut generations, downstream_slab_index, attempt_state, self.recv_buf_size, worker_id);
                                     }
                                 }
                             }
@@ -1102,7 +1193,7 @@ impl WorkerBody for EventLoopWorker {
                             connections.remove(slab_index);
                             if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
                                 if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
-                                    let keep_alive = h1.waiting_for_upstream.map(|(_, _, ka)| ka).unwrap_or(false);
+                                    let keep_alive = h1.waiting_for_upstream.as_ref().map(|s| s.keep_alive).unwrap_or(false);
                                     h1.waiting_for_upstream = None;
                                     crate::core::conn::protocol::queue_http1_response(h1, response);
                                     h1.keep_alive = keep_alive;
@@ -1634,7 +1725,14 @@ impl WorkerBody for EventLoopWorker {
                                 upstream_entry.insert(upstream_conn);
 
                                 let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
-                                h1.waiting_for_upstream = Some((upstream_slab_index, upstream_generation, original_request.keep_alive));
+                                h1.waiting_for_upstream = Some(crate::core::conn::protocol::ProxyAttemptState {
+                                    upstream_slab_index,
+                                    upstream_generation,
+                                    keep_alive: original_request.keep_alive,
+                                    attempts_so_far: 1,
+                                    pending: pending.clone(),
+                                    original_request: original_request.clone(),
+                                });
 
                                 if let Err(reason) = submit_connect(&mut ring, &mut connections, upstream_slab_index, pending.config.connect_timeout) {
                                     tracing::warn!(worker_id, %reason, "failed to submit connect to upstream");
@@ -1917,17 +2015,13 @@ impl WorkerBody for EventLoopWorker {
                             }
                             if let Some((downstream_slab_index, downstream_generation)) = serving {
                                 if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
-                                    let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
-                                    resp.set_body(b"Bad Gateway\n".to_vec());
-                                    let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol else { continue };
-                                    let keep_alive = h1.waiting_for_upstream.map(|(_, _, ka)| ka).unwrap_or(false);
-                                    h1.waiting_for_upstream = None;
-                                    crate::core::conn::protocol::queue_http1_response(h1, resp);
-                                    h1.keep_alive = keep_alive;
-                                    if let Err(reason) = submit_send(&mut ring, &mut connections, downstream_slab_index) {
-                                        tracing::warn!(worker_id, %reason, "failed to submit 502 after upstream connect failure");
-                                        cancel_outstanding_operations(&mut ring, downstream_generation, downstream_slab_index);
-                                        connections.remove(downstream_slab_index);
+                                    let attempt_state = if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
+                                        h1.waiting_for_upstream.take()
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(attempt_state) = attempt_state {
+                                        retry_or_fail_proxy_attempt(&mut ring, &mut connections, &mut generations, downstream_slab_index, attempt_state, self.recv_buf_size, worker_id);
                                     }
                                 }
                             }
@@ -3110,6 +3204,84 @@ mod tests {
             op_tag == OP_TAG_CONNECT || op_tag == OP_TAG_LINK_TIMEOUT,
             "expected either the Connect or its LinkTimeout to complete first, got op_tag={op_tag}"
         );
+    }
+
+    /// Two upstream nodes, the first one refusing every connection --
+    /// proves the proxy retries against a second node rather than
+    /// failing the client's request after the first node's
+    /// connect(2) failure, mirroring mio_backend's own synchronous
+    /// retry loop in core::proxy::forward.
+    #[test]
+    fn proxy_retries_a_second_node_after_the_first_refuses_connections() {
+        // Bind and immediately close a listener to get a real port
+        // number that's guaranteed to refuse connections (ECONNREFUSED)
+        // rather than silently drop them the way an unroutable address
+        // would -- a fast, deterministic failure is what actually
+        // exercises the retry path itself, distinct from
+        // submit_connect_link_timeout_cancels_a_hanging_connect's own
+        // (slow, by design) timeout path.
+        let refusing_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a refusing port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind real upstream listener");
+        let upstream_port = upstream_listener.local_addr().expect("upstream addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = b"second node!";
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            lb_max_retries: 2,
+            upstreams: vec![
+                crate::core::config::UpstreamConfig { host: "127.0.0.1".to_string(), port: refusing_port, weight: 1, use_tls: false },
+                crate::core::config::UpstreamConfig { host: "127.0.0.1".to_string(), port: upstream_port, weight: 1, use_tls: false },
+            ],
+            ..Default::default()
+        });
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write proxied request");
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read proxied response to EOF");
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200 after retrying to the working node, got: {response_text:?}");
+        assert!(response_text.ends_with("second node!"), "expected the second (working) node's body, got: {response_text:?}");
+
+        pool.shutdown();
     }
 
     #[test]
