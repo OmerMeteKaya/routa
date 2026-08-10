@@ -126,6 +126,18 @@ pub enum ConnectionRole {
         /// mio_backend's own `forward()` always has both `node` and
         /// `lb.pool` on hand together when it calls them.
         pool: std::sync::Arc<crate::lb::upstream::UpstreamPool>,
+        /// The read/write timeouts to bound this upstream connection's
+        /// own `Send`/`Recv` SQEs with, via a `LinkTimeout` on each --
+        /// `submit_send`/`submit_recv` check this field themselves
+        /// (rather than every one of their many call sites needing to
+        /// pass a timeout through explicitly) so a plaintext
+        /// downstream connection's own calls to the very same two
+        /// functions stay completely unchanged. Taken from
+        /// `core::proxy::ProxyConfig`'s own `read_timeout`/`write_timeout`,
+        /// the same fields mio_backend's own synchronous
+        /// `write_all_with_timeout`/`read_http1_response` are bounded
+        /// by.
+        read_write_timeouts: (std::time::Duration, std::time::Duration),
         /// The downstream connection currently waiting on this
         /// upstream connection's response, identified by slab index
         /// and generation (the same ABA-safety pairing every other
@@ -187,6 +199,17 @@ pub struct Connection {
     /// is set back to `None` -- there's no further use for the
     /// encoded address after that point).
     pub pending_connect_addr: Option<Box<libc::sockaddr_storage>>,
+    /// The `Timespec` backing an in-flight `LinkTimeout` SQE bounding
+    /// this connection's current `Connect`/`Send`/`Recv` -- same
+    /// buffer-ownership constraint as `pending_connect_addr` and
+    /// `recv_buf` (must stay alive at a stable address until the
+    /// timeout's own completion arrives). Only ever set on an
+    /// *upstream* connection (see `ConnectionRole::Upstream`'s own doc
+    /// comment) -- downstream connections have no per-operation
+    /// timeout of their own yet (client-facing timeouts are a
+    /// separate, not-yet-implemented concern from ProxyConfig's
+    /// upstream-facing ones).
+    pub pending_timeout: Option<Box<io_uring::types::Timespec>>,
     /// This slot's current generation, embedded in every SQE's
     /// `user_data` for as long as this connection occupies it -- see
     /// `core::event_loop::uring_backend`'s `make_user_data` for the
@@ -212,6 +235,7 @@ impl Connection {
             closing: false,
             recv_buf: vec![0u8; recv_buf_size],
             pending_connect_addr: None,
+            pending_timeout: None,
             generation,
         }
     }
@@ -227,9 +251,10 @@ impl Connection {
         generation: u32,
         node: std::sync::Arc<crate::lb::upstream::UpstreamNode>,
         pool: std::sync::Arc<crate::lb::upstream::UpstreamPool>,
+        read_write_timeouts: (std::time::Duration, std::time::Duration),
     ) -> Self {
         let mut conn = Self::new(id, transport, remote_addr, recv_buf_size, generation);
-        conn.role = ConnectionRole::Upstream { node, pool, serving_downstream: None, pending_request: None };
+        conn.role = ConnectionRole::Upstream { node, pool, read_write_timeouts, serving_downstream: None, pending_request: None };
         conn
     }
 

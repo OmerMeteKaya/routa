@@ -53,7 +53,7 @@
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use io_uring::{opcode, types, IoUring, Probe};
+use io_uring::{opcode, squeue, types, IoUring, Probe};
 use slab::Slab;
 
 use crate::core::conn::protocol::{ConnectionProtocol, Http1Connection, Http1DispatchContext, Http1Outcome, Http2Connection};
@@ -107,6 +107,20 @@ const OP_TAG_CANCEL: u64 = 4;
 /// corresponds to a real slab slot (the newly-created upstream
 /// Connection waiting to know whether its connect() succeeded).
 const OP_TAG_CONNECT: u64 = 5;
+/// Completion of a `LinkTimeout` SQE submitted alongside a
+/// `Connect`/`Send`/`Recv` on an *upstream* connection (see
+/// `submit_connect`/`submit_send`/`submit_recv`'s own handling of
+/// `ProxyConfig`'s timeouts) -- carries no useful result of its own to
+/// act on: either the timeout fired first (the linked operation
+/// itself then completes with `-ECANCELED`, which its own completion
+/// arm already treats as a real failure) or the linked operation
+/// completed first (this timeout then completes with `-ECANCELED`
+/// too, RFC-consistent io_uring behavior for a timeout whose target
+/// finished before it fired -- see LinkTimeout's own doc comment).
+/// Either way, nothing needs to happen when *this* completion itself
+/// arrives; the real teardown/response logic already lives in the
+/// linked operation's own arm.
+const OP_TAG_LINK_TIMEOUT: u64 = 6;
 
 /// The listener accept SQE has no associated connection slot and is
 /// submitted exactly once per worker (re-armed in place, never
@@ -437,22 +451,40 @@ fn encode_sockaddr(addr: &std::net::SocketAddr) -> (Box<libc::sockaddr_storage>,
 /// synchronous `connect(2)` followed by `poll(2)` needs -- io_uring's
 /// own Connect opcode already waits for the handshake to finish
 /// before completing at all.
-fn submit_connect(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
+fn submit_connect(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize, timeout: std::time::Duration) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     let (storage, len) = encode_sockaddr(&conn.remote_addr);
     let sockaddr_ptr = &*storage as *const libc::sockaddr_storage as *const libc::sockaddr;
     let connect = opcode::Connect::new(types::Fd(conn.transport.fd()), sockaddr_ptr, len)
         .build()
+        // IO_LINK ties this SQE to the very next one submitted (the
+        // LinkTimeout below) -- see submit_connect's own doc comment
+        // for the completion semantics this produces.
+        .flags(squeue::Flags::IO_LINK)
         .user_data(make_user_data(OP_TAG_CONNECT, conn.generation, slab_index));
     // storage must outlive the SQE the kernel will read sockaddr_ptr
     // from -- stashing it on the connection itself (rather than
     // letting it drop at the end of this function) is what keeps it
     // alive until the OP_TAG_CONNECT completion arrives and clears it.
     conn.pending_connect_addr = Some(storage);
+
+    let timespec = Box::new(types::Timespec::new().sec(timeout.as_secs()).nsec(timeout.subsec_nanos()));
+    let timespec_ptr: *const types::Timespec = &*timespec;
+    let link_timeout = opcode::LinkTimeout::new(timespec_ptr)
+        .build()
+        .user_data(make_user_data(OP_TAG_LINK_TIMEOUT, conn.generation, slab_index));
+    // timespec must outlive the LinkTimeout SQE the same way
+    // pending_connect_addr's storage must outlive the Connect SQE --
+    // see pending_timeout's own doc comment.
+    conn.pending_timeout = Some(timespec);
+
     unsafe {
         ring.submission()
             .push(&connect)
             .map_err(|_| "failed to push connect SQE -- submission queue unexpectedly full".to_string())?;
+        ring.submission()
+            .push(&link_timeout)
+            .map_err(|_| "failed to push connect's link-timeout SQE -- submission queue unexpectedly full".to_string())?;
     }
     Ok(())
 }
@@ -495,14 +527,36 @@ fn submit_loop_timeout(ring: &mut IoUring, timespec: &types::Timespec) -> Result
 /// comment on scope).
 fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
-    let recv = opcode::Recv::new(types::Fd(conn.transport.fd()), conn.recv_buf.as_mut_ptr(), conn.recv_buf.len() as u32)
-        .build()
-        .user_data(make_user_data(OP_TAG_RECV, conn.generation, slab_index));
+    // An upstream connection's own read_timeout (ProxyConfig's,
+    // carried on ConnectionRole::Upstream -- see its own doc comment)
+    // bounds this Recv via a linked LinkTimeout, the same way
+    // submit_connect already bounds Connect. A downstream connection
+    // has no such timeout configured (client-facing timeouts are a
+    // separate, not-yet-implemented concern -- see ConnectionRole::Upstream's
+    // own doc comment), so this check is what keeps every one of this
+    // function's many existing call sites correct unchanged for that
+    // case.
+    let read_timeout = match &conn.role {
+        ConnectionRole::Upstream { read_write_timeouts, .. } => Some(read_write_timeouts.0),
+        ConnectionRole::Downstream => None,
+    };
+
+    let mut recv = opcode::Recv::new(types::Fd(conn.transport.fd()), conn.recv_buf.as_mut_ptr(), conn.recv_buf.len() as u32).build();
+    if read_timeout.is_some() {
+        recv = recv.flags(squeue::Flags::IO_LINK);
+    }
+    let recv = recv.user_data(make_user_data(OP_TAG_RECV, conn.generation, slab_index));
+
     unsafe {
         ring.submission()
             .push(&recv)
             .map_err(|_| "failed to push recv SQE -- submission queue unexpectedly full".to_string())?;
     }
+
+    if let Some(timeout) = read_timeout {
+        push_link_timeout(ring, conn, slab_index, timeout)?;
+    }
+
     Ok(())
 }
 
@@ -578,8 +632,35 @@ fn submit_tls_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_
     Ok(())
 }
 
+/// Pushes a `LinkTimeout` SQE bounding whatever operation was just
+/// pushed onto `ring` (which must itself have been built with
+/// `.flags(squeue::Flags::IO_LINK)` already) for `slab_index` -- shared
+/// by `submit_recv`/`submit_send`'s own upstream-timeout handling so
+/// the LinkTimeout construction/push logic isn't duplicated between
+/// them (this function still needs a separate call at each of
+/// submit_send's own two Send call sites -- TLS and plaintext -- since
+/// each pushes its own, separate Send SQE to link it to).
+fn push_link_timeout(ring: &mut IoUring, conn: &mut Connection, slab_index: usize, timeout: std::time::Duration) -> Result<(), String> {
+    let timespec = Box::new(types::Timespec::new().sec(timeout.as_secs()).nsec(timeout.subsec_nanos()));
+    let timespec_ptr: *const types::Timespec = &*timespec;
+    let link_timeout = opcode::LinkTimeout::new(timespec_ptr)
+        .build()
+        .user_data(make_user_data(OP_TAG_LINK_TIMEOUT, conn.generation, slab_index));
+    conn.pending_timeout = Some(timespec);
+    unsafe {
+        ring.submission()
+            .push(&link_timeout)
+            .map_err(|_| "failed to push a link-timeout SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    Ok(())
+}
+
 fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
+    let write_timeout = match &conn.role {
+        ConnectionRole::Upstream { read_write_timeouts, .. } => Some(read_write_timeouts.1),
+        ConnectionRole::Downstream => None,
+    };
     let Some(pending) = active_write_buf(&conn.protocol) else {
         return Err("submit_send called while no active protocol has a driven write buffer (Handshaking isn't driven by this backend)".to_string());
     };
@@ -633,25 +714,35 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
         // Send still produces a normal, immediate completion, letting
         // OP_TAG_SEND's own existing "fully flushed -> submit_recv"
         // logic run exactly as it would for any other completed send.
-        let send = opcode::Send::new(types::Fd(*fd), ciphertext.as_ptr(), ciphertext.len() as u32)
-            .build()
-            .user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
+        let mut send = opcode::Send::new(types::Fd(*fd), ciphertext.as_ptr(), ciphertext.len() as u32).build();
+        if write_timeout.is_some() {
+            send = send.flags(squeue::Flags::IO_LINK);
+        }
+        let send = send.user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
         unsafe {
             ring.submission()
                 .push(&send)
                 .map_err(|_| "failed to push tls send SQE -- submission queue unexpectedly full".to_string())?;
         }
+        if let Some(timeout) = write_timeout {
+            push_link_timeout(ring, conn, slab_index, timeout)?;
+        }
         return Ok(());
     }
 
     let pending = pending.as_slice();
-    let send = opcode::Send::new(types::Fd(conn.transport.fd()), pending.as_ptr(), pending.len() as u32)
-        .build()
-        .user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
+    let mut send = opcode::Send::new(types::Fd(conn.transport.fd()), pending.as_ptr(), pending.len() as u32).build();
+    if write_timeout.is_some() {
+        send = send.flags(squeue::Flags::IO_LINK);
+    }
+    let send = send.user_data(make_user_data(OP_TAG_SEND, conn.generation, slab_index));
     unsafe {
         ring.submission()
             .push(&send)
             .map_err(|_| "failed to push send SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    if let Some(timeout) = write_timeout {
+        push_link_timeout(ring, conn, slab_index, timeout)?;
     }
     Ok(())
 }
@@ -1514,6 +1605,7 @@ impl WorkerBody for EventLoopWorker {
                                 generations[upstream_slab_index] = generations[upstream_slab_index].wrapping_add(1);
                                 let upstream_generation = generations[upstream_slab_index];
 
+                                let read_write_timeouts = (pending.config.read_timeout, pending.config.write_timeout);
                                 let mut upstream_conn = Connection::new_upstream(
                                     upstream_fd as u64,
                                     Transport::Plain(upstream_fd),
@@ -1522,10 +1614,12 @@ impl WorkerBody for EventLoopWorker {
                                     upstream_generation,
                                     Arc::clone(&node),
                                     Arc::clone(&pending.lb.pool),
+                                    read_write_timeouts,
                                 );
                                 upstream_conn.role = ConnectionRole::Upstream {
                                     node: Arc::clone(&node),
                                     pool: Arc::clone(&pending.lb.pool),
+                                    read_write_timeouts,
                                     serving_downstream: Some((slab_index, downstream_generation)),
                                     pending_request: Some(original_request.clone()),
                                 };
@@ -1542,7 +1636,7 @@ impl WorkerBody for EventLoopWorker {
                                 let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
                                 h1.waiting_for_upstream = Some((upstream_slab_index, upstream_generation, original_request.keep_alive));
 
-                                if let Err(reason) = submit_connect(&mut ring, &mut connections, upstream_slab_index) {
+                                if let Err(reason) = submit_connect(&mut ring, &mut connections, upstream_slab_index, pending.config.connect_timeout) {
                                     tracing::warn!(worker_id, %reason, "failed to submit connect to upstream");
                                     cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
@@ -1901,6 +1995,16 @@ impl WorkerBody for EventLoopWorker {
                         // react to here beyond falling through to the
                         // next loop iteration, which re-checks
                         // shutdown.is_set() and resubmits a fresh one.
+                    }
+
+                    OP_TAG_LINK_TIMEOUT => {
+                        // See this constant's own doc comment --
+                        // deliberately a no-op. The linked operation
+                        // (Connect/Send/Recv) this timeout was bound
+                        // to gets its own completion, with -ECANCELED
+                        // if the timeout actually fired first; that
+                        // arm is where the real teardown/failure
+                        // handling happens, not here.
                     }
 
                     _ => {
@@ -2865,10 +2969,10 @@ mod tests {
         let placeholder_transport = Transport::Plain(fd);
         let test_node = std::sync::Arc::new(crate::lb::upstream::UpstreamNode::new(target_addr.ip().to_string(), target_addr.port(), 1, false, 32));
         let test_pool = std::sync::Arc::new(crate::lb::upstream::UpstreamPool::new(3, 2));
-        let conn = Connection::new_upstream(fd as u64, placeholder_transport, target_addr, 4096, 1, test_node, test_pool);
+        let conn = Connection::new_upstream(fd as u64, placeholder_transport, target_addr, 4096, 1, test_node, test_pool, (std::time::Duration::from_secs(5), std::time::Duration::from_secs(5)));
         let slab_index = slab.insert(conn);
 
-        submit_connect(&mut ring, &mut slab, slab_index).expect("submit connect SQE");
+        submit_connect(&mut ring, &mut slab, slab_index, std::time::Duration::from_secs(5)).expect("submit connect SQE");
         ring.submit_and_wait(1).expect("submit and wait for connect completion");
 
         let cqe = ring.completion().next().expect("a completion should be available");
@@ -2963,6 +3067,49 @@ mod tests {
         assert!(response_text.ends_with("upstream!"), "expected the real upstream's body, got: {response_text:?}");
 
         pool.shutdown();
+    }
+
+    /// A real Connect SQE bounded by a real LinkTimeout, against a
+    /// TCP address that never responds (RFC 5737 TEST-NET-1, a
+    /// documentation-only range guaranteed to never route anywhere)
+    /// -- proves the LinkTimeout actually cancels the Connect within
+    /// its configured bound rather than leaving submit_and_wait
+    /// blocked indefinitely.
+    #[test]
+    fn submit_connect_link_timeout_cancels_a_hanging_connect() {
+        let mut ring = IoUring::new(8).expect("create ring");
+
+        // 192.0.2.1 (TEST-NET-1, RFC 5737) is documentation-only --
+        // never assigned to a real host, and typically silently
+        // dropped rather than actively refused, so connect(2) against
+        // it hangs until something (here, the LinkTimeout) cancels it.
+        let target_addr: std::net::SocketAddr = "192.0.2.1:9".parse().expect("parse test-net-1 address");
+        let fd = create_upstream_socket(&target_addr).expect("create upstream socket");
+        let mut slab: Slab<Connection> = Slab::new();
+        let test_node = std::sync::Arc::new(crate::lb::upstream::UpstreamNode::new(target_addr.ip().to_string(), target_addr.port(), 1, false, 32));
+        let test_pool = std::sync::Arc::new(crate::lb::upstream::UpstreamPool::new(3, 2));
+        let conn = Connection::new_upstream(fd as u64, Transport::Plain(fd), target_addr, 4096, 1, test_node, test_pool, (std::time::Duration::from_secs(5), std::time::Duration::from_secs(5)));
+        let slab_index = slab.insert(conn);
+
+        let start = std::time::Instant::now();
+        submit_connect(&mut ring, &mut slab, slab_index, std::time::Duration::from_millis(500)).expect("submit connect+timeout SQEs");
+        ring.submit_and_wait(1).expect("submit and wait for a completion");
+        let elapsed = start.elapsed();
+
+        let cqe = ring.completion().next().expect("a completion should be available");
+        let (op_tag, _, _) = split_user_data(cqe.user_data());
+
+        // Whichever of the two linked SQEs happens to be reported
+        // first, the connect itself must have been cancelled well
+        // before this test's own hard failure bound -- 500ms
+        // configured, generous slack up to 5s to stay robust under
+        // slow CI/test-machine scheduling without the test itself
+        // waiting anywhere near that long in practice.
+        assert!(elapsed < std::time::Duration::from_secs(5), "connect should have been cancelled by its LinkTimeout, took {elapsed:?}");
+        assert!(
+            op_tag == OP_TAG_CONNECT || op_tag == OP_TAG_LINK_TIMEOUT,
+            "expected either the Connect or its LinkTimeout to complete first, got op_tag={op_tag}"
+        );
     }
 
     #[test]
