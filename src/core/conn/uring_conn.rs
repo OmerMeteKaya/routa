@@ -111,6 +111,21 @@ pub enum ConnectionRole {
     /// A connection to an upstream server, opened to satisfy a
     /// downstream connection's proxied request.
     Upstream {
+        /// The `LoadBalancer` node this connection was opened to --
+        /// kept here so a connect failure or an early close (both
+        /// handled well after `pick_node_sticky` returned this same
+        /// `Arc`, in a different completion entirely) can still report
+        /// `record_failure`/`record_success` against the right node,
+        /// the same way mio_backend's own synchronous `forward()`
+        /// does immediately after each attempt.
+        node: std::sync::Arc<crate::lb::upstream::UpstreamNode>,
+        /// The pool `node` belongs to -- `record_success`/`record_failure`
+        /// need this (see their own signatures in `lb::upstream`) to
+        /// update the pool-wide outlier-detection/circuit-breaker
+        /// bookkeeping alongside the node's own state, the same way
+        /// mio_backend's own `forward()` always has both `node` and
+        /// `lb.pool` on hand together when it calls them.
+        pool: std::sync::Arc<crate::lb::upstream::UpstreamPool>,
         /// The downstream connection currently waiting on this
         /// upstream connection's response, identified by slab index
         /// and generation (the same ABA-safety pairing every other
@@ -204,9 +219,17 @@ impl Connection {
     /// Same as `new`, but for a connection opened to an upstream
     /// server rather than accepted from a client -- see
     /// `ConnectionRole::Upstream`'s own doc comment.
-    pub fn new_upstream(id: ConnId, transport: Transport, remote_addr: SocketAddr, recv_buf_size: usize, generation: u32) -> Self {
+    pub fn new_upstream(
+        id: ConnId,
+        transport: Transport,
+        remote_addr: SocketAddr,
+        recv_buf_size: usize,
+        generation: u32,
+        node: std::sync::Arc<crate::lb::upstream::UpstreamNode>,
+        pool: std::sync::Arc<crate::lb::upstream::UpstreamPool>,
+    ) -> Self {
         let mut conn = Self::new(id, transport, remote_addr, recv_buf_size, generation);
-        conn.role = ConnectionRole::Upstream { serving_downstream: None, pending_request: None };
+        conn.role = ConnectionRole::Upstream { node, pool, serving_downstream: None, pending_request: None };
         conn
     }
 

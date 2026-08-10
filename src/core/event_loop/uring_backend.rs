@@ -901,10 +901,21 @@ impl WorkerBody for EventLoopWorker {
                             // earlier completions, if any) couldn't
                             // form a full response, or there'd have
                             // been a dispatch below already.
-                            let serving_downstream_on_close = match &connections[slab_index].role {
-                                ConnectionRole::Upstream { serving_downstream, .. } => *serving_downstream,
+                            let close_context = match &connections[slab_index].role {
+                                ConnectionRole::Upstream { serving_downstream, node, pool, .. } => Some((*serving_downstream, Arc::clone(node), Arc::clone(pool))),
                                 ConnectionRole::Downstream => None,
                             };
+                            let serving_downstream_on_close = close_context.as_ref().and_then(|(serving, ..)| *serving);
+                            if let Some((_, node, pool)) = &close_context {
+                                // Same failure model as a connect(2)
+                                // failure -- reaching EOF/an error
+                                // before a complete response arrived
+                                // is a connection-level failure from
+                                // the load balancer's point of view,
+                                // regardless of how far the response
+                                // got.
+                                node.record_failure(pool);
+                            }
                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             if let Some((downstream_slab_index, downstream_generation)) = serving_downstream_on_close {
@@ -979,6 +990,23 @@ impl WorkerBody for EventLoopWorker {
                             // waiting -- generation-checked the same
                             // way every other cross-referenced slot in
                             // this backend is).
+                            //
+                            // Health reporting mirrors mio_backend's
+                            // own forward(): reaching this arm at all
+                            // means a complete HTTP response came
+                            // back (the connection itself is healthy),
+                            // but a 5xx status is treated as an
+                            // outlier the same way a connection-level
+                            // failure is -- see core::proxy::forward's
+                            // own comment on this "gateway failure"
+                            // framing.
+                            if let ConnectionRole::Upstream { node, pool, .. } = &connections[slab_index].role {
+                                if response.status < 500 {
+                                    node.record_success(pool);
+                                } else {
+                                    node.record_failure(pool);
+                                }
+                            }
                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
@@ -1492,8 +1520,12 @@ impl WorkerBody for EventLoopWorker {
                                     upstream_addr,
                                     self.recv_buf_size,
                                     upstream_generation,
+                                    Arc::clone(&node),
+                                    Arc::clone(&pending.lb.pool),
                                 );
                                 upstream_conn.role = ConnectionRole::Upstream {
+                                    node: Arc::clone(&node),
+                                    pool: Arc::clone(&pending.lb.pool),
                                     serving_downstream: Some((slab_index, downstream_generation)),
                                     pending_request: Some(original_request.clone()),
                                 };
@@ -1770,12 +1802,25 @@ impl WorkerBody for EventLoopWorker {
                             // downstream was waiting, if it's still
                             // around, and tear down this now-useless
                             // upstream slot.
-                            let serving = match &connections[slab_index].role {
-                                ConnectionRole::Upstream { serving_downstream, .. } => *serving_downstream,
+                            let failed_node_pool = match &connections[slab_index].role {
+                                ConnectionRole::Upstream { serving_downstream, node, pool, .. } => Some((*serving_downstream, Arc::clone(node), Arc::clone(pool))),
                                 ConnectionRole::Downstream => None,
                             };
+                            let serving = failed_node_pool.as_ref().and_then(|(serving, ..)| *serving);
                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
+                            if let Some((_, node, pool)) = failed_node_pool {
+                                // Mirrors mio_backend's own forward():
+                                // a connect(2) failure is reported to
+                                // the load balancer's health tracking
+                                // the same way any other
+                                // connection-level failure is (see
+                                // core::proxy::forward's own comment on
+                                // treating a 5xx response the same way
+                                // -- this is the "can't even reach it"
+                                // half of that same failure model).
+                                node.record_failure(&pool);
+                            }
                             if let Some((downstream_slab_index, downstream_generation)) = serving {
                                 if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
                                     let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
@@ -2818,7 +2863,9 @@ mod tests {
         let fd = create_upstream_socket(&target_addr).expect("create upstream socket");
         let mut slab: Slab<Connection> = Slab::new();
         let placeholder_transport = Transport::Plain(fd);
-        let conn = Connection::new_upstream(fd as u64, placeholder_transport, target_addr, 4096, 1);
+        let test_node = std::sync::Arc::new(crate::lb::upstream::UpstreamNode::new(target_addr.ip().to_string(), target_addr.port(), 1, false, 32));
+        let test_pool = std::sync::Arc::new(crate::lb::upstream::UpstreamPool::new(3, 2));
+        let conn = Connection::new_upstream(fd as u64, placeholder_transport, target_addr, 4096, 1, test_node, test_pool);
         let slab_index = slab.insert(conn);
 
         submit_connect(&mut ring, &mut slab, slab_index).expect("submit connect SQE");
