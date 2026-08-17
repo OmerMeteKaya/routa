@@ -3355,6 +3355,145 @@ mod tests {
         pool.shutdown();
     }
 
+    /// A POST request with a real body -- proves the request body
+    /// (not just headers) is actually forwarded to the upstream
+    /// intact, by having the upstream itself echo back whatever body
+    /// it received.
+    #[test]
+    fn proxy_forwards_request_body_to_upstream() {
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind real upstream listener");
+        let upstream_port = upstream_listener.local_addr().expect("upstream addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).expect("read request from proxy");
+                let received = String::from_utf8_lossy(&buf[..n]);
+                // Echo the received body back as this "upstream"'s own
+                // response body, so the test can assert on it directly
+                // rather than needing its own HTTP/1.1 request parser.
+                let body_start = received.find("\r\n\r\n").map(|i| i + 4).unwrap_or(received.len());
+                let echoed_body = received[body_start..].as_bytes().to_vec();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", echoed_body.len());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&echoed_body);
+            }
+        });
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            upstreams: vec![crate::core::config::UpstreamConfig { host: "127.0.0.1".to_string(), port: upstream_port, weight: 1, use_tls: false }],
+            ..Default::default()
+        });
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        let body = b"a real POST body with several bytes in it";
+        let request = format!(
+            "POST /api/submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).expect("write proxied request headers");
+        stream.write_all(body).expect("write proxied request body");
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read proxied response to EOF");
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200, got: {response_text:?}");
+        assert!(
+            response.ends_with(body),
+            "expected the upstream's echoed body to match what the client sent, got: {response_text:?}"
+        );
+
+        pool.shutdown();
+    }
+
+    /// An upstream responding with Transfer-Encoding: chunked --
+    /// proves try_parse_response (shared with mio_backend's own
+    /// forward()) correctly recognizes a complete chunked response's
+    /// framing (including its terminating zero-length chunk) rather
+    /// than only ever handling Content-Length-framed responses, which
+    /// is all every other proxy test here has exercised so far.
+    #[test]
+    fn proxy_handles_a_chunked_upstream_response() {
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind real upstream listener");
+        let upstream_port = upstream_listener.local_addr().expect("upstream addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            upstreams: vec![crate::core::config::UpstreamConfig { host: "127.0.0.1".to_string(), port: upstream_port, weight: 1, use_tls: false }],
+            ..Default::default()
+        });
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write proxied request");
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read proxied response to EOF");
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200, got: {response_text:?}");
+        assert!(
+            response_text.contains("hello world") || response_text.contains("hello\r\n6\r\n world"),
+            "expected the chunked body's decoded content somewhere in the response, got: {response_text:?}"
+        );
+
+        pool.shutdown();
+    }
+
     #[test]
     fn recv_completion_of_zero_means_peer_closed() {
         // Documents the exact convention the main loop's OP_TAG_RECV

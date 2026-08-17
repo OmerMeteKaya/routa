@@ -980,6 +980,15 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
         assert!(try_parse_response(raw).is_none());
     }
+#[test]
+fn debug_two_chunk_decode() {
+    let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    let resp = try_parse_response(raw);
+    assert!(resp.is_some(), "expected Some, got None -- raw: {:?}", String::from_utf8_lossy(raw));
+    let resp = resp.unwrap();
+    assert_eq!(resp.body(), b"hello world");
+}
+
 
     // ─── End-to-end forward() ─────────────────────────────────────────
 
