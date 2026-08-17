@@ -922,6 +922,19 @@ impl WorkerBody for EventLoopWorker {
         }
 
         let mut connections: Slab<Connection> = Slab::new();
+        // Worker-local (no locking needed, unlike UpstreamNode's own
+        // Mutex-protected idle_conns pool mio_backend's core::proxy
+        // uses -- see this field's own design discussion) pool of
+        // upstream connections kept open between requests rather than
+        // torn down after each one. Keyed by (host, port) since that's
+        // what actually identifies "the same upstream" for reuse
+        // purposes; an idle entry's slab_index/generation identify the
+        // real Connection still sitting in `connections` above (idle
+        // connections are never removed from the Slab, only marked
+        // as not currently serving anyone -- see this field's use
+        // sites for how that's threaded through ConnectionRole::Upstream's
+        // own serving_downstream).
+        let mut idle_upstream_conns: std::collections::HashMap<(String, u16), Vec<(usize, u32, std::time::Instant, std::time::Duration)>> = std::collections::HashMap::new();
         // Parallel to `connections`: `generations[i]` is the
         // generation currently valid for slab index `i`, bumped every
         // time that slot is reused for a new connection -- see
@@ -1182,18 +1195,66 @@ impl WorkerBody for EventLoopWorker {
                             // failure is -- see core::proxy::forward's
                             // own comment on this "gateway failure"
                             // framing.
-                            let node_for_sticky = if let ConnectionRole::Upstream { node, pool, .. } = &connections[slab_index].role {
+                            let (node_for_sticky, upstream_host_port) = if let ConnectionRole::Upstream { node, pool, .. } = &connections[slab_index].role {
                                 if response.status < 500 {
                                     node.record_success(pool);
                                 } else {
                                     node.record_failure(pool);
                                 }
-                                Some(Arc::clone(node))
+                                (Some(Arc::clone(node)), Some((node.host.clone(), node.port)))
                             } else {
-                                None
+                                (None, None)
                             };
-                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                            connections.remove(slab_index);
+
+                            // Keep this connection open for reuse
+                            // (see idle_upstream_conns's own doc
+                            // comment) if both this response and the
+                            // request it answered allow it -- an
+                            // upstream that returned `Connection:
+                            // close`, or a request the client sent
+                            // with the same, both mean this specific
+                            // TCP connection is done regardless of
+                            // what either side's protocol otherwise
+                            // permits. response.keep_alive() reads the
+                            // response's own Connection/HTTP-version
+                            // framing (mirroring http::response's own
+                            // rules for what mio_backend's forward()
+                            // implicitly assumes too); the request's
+                            // own intent has already been threaded
+                            // through as keep_alive below.
+                            let upstream_response_keep_alive = response
+                                .get_header("Connection")
+                                .map(|v| !v.eq_ignore_ascii_case("close"))
+                                .unwrap_or(true);
+                            let can_reuse_upstream = upstream_response_keep_alive
+                                && connections.contains(downstream_slab_index)
+                                && connections[downstream_slab_index].generation == downstream_generation
+                                && if let ConnectionProtocol::Http1(h1) = &connections[downstream_slab_index].protocol {
+                                    h1.waiting_for_upstream.as_ref().map(|s| s.keep_alive).unwrap_or(false)
+                                } else {
+                                    false
+                                };
+
+                            if can_reuse_upstream {
+                                let idle_timeout = if let ConnectionProtocol::Http1(h1) = &connections[downstream_slab_index].protocol {
+                                    h1.waiting_for_upstream.as_ref().map(|s| s.pending.config.idle_timeout).unwrap_or(std::time::Duration::from_secs(60))
+                                } else {
+                                    std::time::Duration::from_secs(60)
+                                };
+                                if let ConnectionRole::Upstream { serving_downstream, pending_request, .. } = &mut connections[slab_index].role {
+                                    *serving_downstream = None;
+                                    *pending_request = None;
+                                }
+                                if let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol {
+                                    h1.read_buf = crate::util::buf::Buf::new();
+                                }
+                                if let Some(key) = upstream_host_port {
+                                    idle_upstream_conns.entry(key).or_default().push((slab_index, connections[slab_index].generation, std::time::Instant::now(), idle_timeout));
+                                }
+                            } else {
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
                             if connections.contains(downstream_slab_index) && connections[downstream_slab_index].generation == downstream_generation {
                                 if let ConnectionProtocol::Http1(h1) = &mut connections[downstream_slab_index].protocol {
                                     let keep_alive = h1.waiting_for_upstream.as_ref().map(|s| s.keep_alive).unwrap_or(false);
@@ -1678,6 +1739,68 @@ impl WorkerBody for EventLoopWorker {
                                     }
                                 };
 
+                                // Check the idle pool before opening a
+                                // fresh TCP connection -- see
+                                // idle_upstream_conns's own doc
+                                // comment for why this is worker-local
+                                // rather than sharing UpstreamNode's
+                                // own Mutex-protected pool.
+                                let idle_key = (node.host.clone(), node.port);
+                                let idle_entry = idle_upstream_conns.get_mut(&idle_key).and_then(|v| v.pop());
+                                if let Some((idle_slab_index, idle_generation, _last_used, _idle_timeout)) = idle_entry {
+                                    if connections.contains(idle_slab_index) && connections[idle_slab_index].generation == idle_generation {
+                                        let downstream_generation = connections[slab_index].generation;
+                                        let read_write_timeouts = (pending.config.read_timeout, pending.config.write_timeout);
+                                        if let ConnectionRole::Upstream { serving_downstream, pending_request, .. } = &mut connections[idle_slab_index].role {
+                                            *serving_downstream = Some((slab_index, downstream_generation));
+                                            *pending_request = Some(original_request.clone());
+                                        }
+                                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                        h1.waiting_for_upstream = Some(crate::core::conn::protocol::ProxyAttemptState {
+                                            upstream_slab_index: idle_slab_index,
+                                            upstream_generation: idle_generation,
+                                            keep_alive: original_request.keep_alive,
+                                            attempts_so_far: 1,
+                                            pending: pending.clone(),
+                                            original_request: original_request.clone(),
+                                        });
+
+                                        // Serialize and send immediately -- an
+                                        // idle connection is already
+                                        // established, so this jumps
+                                        // straight to what OP_TAG_CONNECT's
+                                        // completion handler otherwise does
+                                        // once a fresh connect(2) finishes.
+                                        let client_addr = original_request.remote_addr;
+                                        let headers = crate::core::proxy::build_upstream_headers(&original_request, client_addr, &self.server.config.pools.first().map(|p| p.name.clone()).unwrap_or_else(|| "routa".to_string()));
+                                        let mut upstream_req = (*original_request).clone();
+                                        upstream_req.headers = headers.into_iter().map(|h| (h.name, h.value)).collect();
+                                        let request_bytes = upstream_req.serialize();
+                                        let _ = read_write_timeouts; // already set on this connection when it was first created
+                                        if let ConnectionProtocol::Http1(h1) = &mut connections[idle_slab_index].protocol {
+                                            h1.write_buf.push(&request_bytes);
+                                        }
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, idle_slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit request to a reused idle upstream connection, falling back to a fresh connect");
+                                            // The idle connection turned
+                                            // out to be dead (e.g. the
+                                            // upstream closed it while
+                                            // it sat idle) -- fall
+                                            // through to a fresh
+                                            // connect rather than
+                                            // failing the client's
+                                            // request outright.
+                                            cancel_outstanding_operations(&mut ring, idle_generation, idle_slab_index);
+                                            connections.remove(idle_slab_index);
+                                            if let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol {
+                                                h1.waiting_for_upstream = None;
+                                            }
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 let upstream_fd = match create_upstream_socket(&upstream_addr) {
                                     Ok(fd) => fd,
                                     Err(e) => {
@@ -2097,6 +2220,32 @@ impl WorkerBody for EventLoopWorker {
                         // react to here beyond falling through to the
                         // next loop iteration, which re-checks
                         // shutdown.is_set() and resubmits a fresh one.
+                        //
+                        // Also a convenient, already-periodic point to
+                        // sweep idle_upstream_conns for entries that
+                        // have sat unused past their own idle_timeout
+                        // -- mirrors UpstreamPool's own periodic
+                        // idle-connection cleanup on the mio side (see
+                        // that method's own doc comment), just driven
+                        // by this backend's existing loop timeout
+                        // instead of a separate health-check cycle.
+                        let now = std::time::Instant::now();
+                        for entries in idle_upstream_conns.values_mut() {
+                            let mut i = 0;
+                            while i < entries.len() {
+                                let (idle_slab_index, idle_generation, last_used, idle_timeout) = entries[i];
+                                if now.duration_since(last_used) > idle_timeout {
+                                    entries.swap_remove(i);
+                                    if connections.contains(idle_slab_index) && connections[idle_slab_index].generation == idle_generation {
+                                        cancel_outstanding_operations(&mut ring, idle_generation, idle_slab_index);
+                                        connections.remove(idle_slab_index);
+                                    }
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        idle_upstream_conns.retain(|_, entries| !entries.is_empty());
                     }
 
                     OP_TAG_LINK_TIMEOUT => {
@@ -3490,6 +3639,88 @@ mod tests {
             response_text.contains("hello world") || response_text.contains("hello\r\n6\r\n world"),
             "expected the chunked body's decoded content somewhere in the response, got: {response_text:?}"
         );
+
+        pool.shutdown();
+    }
+
+    /// Two keep-alive proxied requests over the same downstream
+    /// connection -- proves the second request reuses the first's
+    /// upstream TCP connection (via the idle pool) rather than
+    /// opening a fresh one, by having the upstream itself accept only
+    /// once and answer both requests on that single accepted socket.
+    #[test]
+    fn proxy_reuses_an_idle_upstream_connection_for_a_second_request() {
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind real upstream listener");
+        let upstream_port = upstream_listener.local_addr().expect("upstream addr").port();
+        std::thread::spawn(move || {
+            // Accept exactly once -- if the proxy opened a second TCP
+            // connection instead of reusing the idle one, that second
+            // request would hang waiting on an accept() that never
+            // comes, and the test's own read timeout would catch it.
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                for body in [&b"first"[..], &b"second"[..]] {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).expect("read a request on the reused connection");
+                    assert!(n > 0, "expected a real request on the reused connection");
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+            }
+        });
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.port = port as i32;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            upstreams: vec![crate::core::config::UpstreamConfig { host: "127.0.0.1".to_string(), port: upstream_port, weight: 1, use_tls: false }],
+            ..Default::default()
+        });
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        // First request -- keep-alive, both sides.
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write first proxied request");
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read first proxied response");
+        let first_response = String::from_utf8_lossy(&buf[..n]);
+        assert!(first_response.starts_with("HTTP/1.1 200"), "expected a 200, got: {first_response:?}");
+        assert!(first_response.ends_with("first"), "expected the first upstream body, got: {first_response:?}");
+
+        // Give the event loop a moment to actually return the
+        // upstream connection to the idle pool before the second
+        // request arrives.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Second request, same downstream connection -- the real
+        // assertion is in the upstream thread's own accept()-once
+        // logic above; this just drives it.
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write second proxied request");
+        let mut response2 = Vec::new();
+        stream.read_to_end(&mut response2).expect("read second proxied response to EOF");
+        let second_response = String::from_utf8_lossy(&response2);
+        assert!(second_response.starts_with("HTTP/1.1 200"), "expected a 200, got: {second_response:?}");
+        assert!(second_response.ends_with("second"), "expected the second upstream body, got: {second_response:?}");
 
         pool.shutdown();
     }

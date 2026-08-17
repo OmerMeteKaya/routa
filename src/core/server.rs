@@ -223,6 +223,13 @@ impl RoutaServer {
                     .map(|p| p.lb_pool_connect_timeout_ms.max(0) as u64)
                     .unwrap_or(5_000),
             ),
+            idle_timeout: Duration::from_secs(
+                config
+                    .pools
+                    .first()
+                    .map(|p| p.lb_pool_idle_timeout_s.max(0) as u64)
+                    .unwrap_or(60),
+            ),
         };
 
         // Every configured LB pool gets its own catch-all route at its

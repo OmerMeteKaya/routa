@@ -307,6 +307,11 @@ pub struct ProxyConfig {
     /// which bounds writing the request once a connection is already
     /// established.
     pub connect_timeout: Duration,
+    /// How long an idle pooled upstream connection may sit unused
+    /// before it's dropped -- mirrors `LbPoolConfig::lb_pool_idle_timeout_s`,
+    /// the same bound `UpstreamPool`'s own idle-connection cleanup
+    /// (see its own doc comment) uses for mio_backend's idle pool.
+    pub idle_timeout: Duration,
 }
 
 impl Default for ProxyConfig {
@@ -316,6 +321,7 @@ impl Default for ProxyConfig {
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 }
