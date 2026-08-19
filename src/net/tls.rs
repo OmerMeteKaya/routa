@@ -448,13 +448,15 @@ impl TlsConnection {
         let mut peer_closed = false;
 
         if self.wants_read() {
-            match self.read_tls(socket) {
+            let read_result = self.read_tls(socket);
+            match read_result {
                 Ok(0) => peer_closed = true,
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e),
             }
-            if let Err(e) = self.process_new_packets() {
+            let process_result = self.process_new_packets();
+            if let Err(e) = process_result {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
         }

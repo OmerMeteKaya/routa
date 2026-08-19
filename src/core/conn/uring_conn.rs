@@ -76,6 +76,24 @@ impl Transport {
     }
 }
 
+impl Transport {
+    /// Extracts this transport's fd for reuse in a *replacement*
+    /// `Transport` value, without running `Drop::drop`'s own
+    /// `libc::close` -- needed whenever an existing `Transport::Plain`
+    /// is upgraded in place to `Transport::Tls` (see
+    /// `OP_TAG_CONNECT`'s own upstream-TLS handling): a plain
+    /// assignment (`connections[i].transport = Transport::Tls { .. }`)
+    /// drops the old `Transport::Plain` value first, which closes its
+    /// fd -- exactly the fd the new `Transport::Tls` value is about to
+    /// reuse. `std::mem::forget` on the old value (after copying its
+    /// fd out via this method) is what actually suppresses that close.
+    pub(crate) fn take_fd_for_reuse(self) -> RawFd {
+        let fd = self.fd();
+        std::mem::forget(self);
+        fd
+    }
+}
+
 impl Drop for Transport {
     fn drop(&mut self) {
         // Plain fd ownership, mirroring what a std/mio socket type's
