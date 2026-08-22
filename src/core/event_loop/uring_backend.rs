@@ -644,7 +644,7 @@ fn submit_loop_timeout(ring: &mut IoUring, timespec: &types::Timespec) -> Result
 /// comment on scope).
 #[track_caller]
 fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
-    let loc = std::panic::Location::caller();
+    // let loc = std::panic::Location::caller(); // debug removed
     let conn = &mut connections[slab_index];
     // An upstream connection's own read_timeout (ProxyConfig's,
     // carried on ConnectionRole::Upstream -- see its own doc comment)
@@ -703,11 +703,12 @@ fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
 /// one lookup rather than needing its own copy of the same submit
 /// logic per protocol. Returns `None` for `Handshaking`/`Http2`
 /// (H2's own write buffer isn't driven by this backend yet).
-fn active_write_buf(protocol: &ConnectionProtocol) -> Option<&crate::util::buf::Buf> {
+fn active_write_buf(protocol: &ConnectionProtocol) -> Option<&[u8]> {
     match protocol {
-        ConnectionProtocol::Http1(h1) => Some(&h1.write_buf),
-        ConnectionProtocol::WebSocket(ws) => Some(&ws.write_buf),
-        ConnectionProtocol::Http2(h2) => Some(&h2.write_buf),
+        ConnectionProtocol::Http1(h1) => Some(h1.write_buf.as_slice()),
+        ConnectionProtocol::WebSocket(ws) => Some(ws.write_buf.as_slice()),
+        ConnectionProtocol::Http2(h2) => Some(h2.write_buf.as_slice()),
+        ConnectionProtocol::UpstreamH2(h2c) => Some(h2c.write_buf_slice()),
         ConnectionProtocol::Handshaking => None,
     }
 }
@@ -717,6 +718,7 @@ fn consume_active_write_buf(protocol: &mut ConnectionProtocol, n: usize) {
         ConnectionProtocol::Http1(h1) => h1.write_buf.consume(n),
         ConnectionProtocol::WebSocket(ws) => ws.write_buf.consume(n),
         ConnectionProtocol::Http2(h2) => h2.write_buf.consume(n),
+        ConnectionProtocol::UpstreamH2(h2c) => h2c.consume_write_buf(n),
         ConnectionProtocol::Handshaking => {}
     }
 }
@@ -799,7 +801,7 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
         // this function used to, would leak unencrypted application
         // data onto the wire on a connection the peer believes is
         // encrypted.
-        let plaintext = pending.as_slice().to_vec();
+        let plaintext = pending.to_vec();
         let Transport::Tls { tls, io, fd } = &mut conn.transport else { unreachable!() };
         tls.write_plaintext(&plaintext).map_err(|e| format!("failed to queue plaintext for TLS encryption: {e}"))?;
         tls.advance_io(io.as_mut()).map_err(|e| format!("failed to advance TLS record layer while encrypting: {e}"))?;
@@ -849,7 +851,6 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
         return Ok(());
     }
 
-    let pending = pending.as_slice();
     let mut send = opcode::Send::new(types::Fd(conn.transport.fd()), pending.as_ptr(), pending.len() as u32).build();
     if write_timeout.is_some() {
         send = send.flags(squeue::Flags::IO_LINK);
@@ -1197,7 +1198,7 @@ impl WorkerBody for EventLoopWorker {
                                 let conn = &mut connections[slab_index];
                                 let Transport::Tls { tls, io, .. } = &mut conn.transport else { unreachable!() };
                                 let outcome = advance_tls(tls, io, &ciphertext);
-                                let outcome_str = match &outcome {
+                                let _outcome_str = match &outcome {
                                     Ok(TlsAdvanceOutcome::PeerClosed) => "PeerClosed",
                                     Ok(TlsAdvanceOutcome::StillHandshaking) => "StillHandshaking",
                                     Ok(TlsAdvanceOutcome::HandshakeJustCompleted) => "HandshakeJustCompleted",
@@ -2080,12 +2081,13 @@ impl WorkerBody for EventLoopWorker {
                         // otherwise treat Handshaking as an
                         // unrecognized state and incorrectly tear the
                         // connection down mid-handshake.
-                        let is_tls_snapshot = connections[slab_index].transport.is_tls();
-                        let protocol_str = match &connections[slab_index].protocol {
+                        let _is_tls_snapshot = connections[slab_index].transport.is_tls();
+                        let _protocol_str = match &connections[slab_index].protocol {
                             ConnectionProtocol::Handshaking => "Handshaking",
                             ConnectionProtocol::Http1(_) => "Http1",
                             ConnectionProtocol::Http2(_) => "Http2",
                             ConnectionProtocol::WebSocket(_) => "WebSocket",
+                            ConnectionProtocol::UpstreamH2(_) => "UpstreamH2",
                         };
                         if connections[slab_index].transport.is_tls() && matches!(connections[slab_index].protocol, ConnectionProtocol::Handshaking) {
                             let still_pending = {
@@ -2157,6 +2159,17 @@ impl WorkerBody for EventLoopWorker {
                             ConnectionProtocol::WebSocket(ws) => (ws.write_buf.is_empty(), already_marked_closing),
                             ConnectionProtocol::Http2(h2) => {
                                 (h2.write_buf.is_empty(), already_marked_closing)
+                            }
+                            ConnectionProtocol::UpstreamH2(h2c) => {
+                                // Never independently closed here --
+                                // an UpstreamH2 connection's lifetime
+                                // is driven by idle-pool/circuit-breaker
+                                // logic elsewhere (mirroring how a
+                                // plain HTTP/1.1 upstream connection's
+                                // own reuse-or-close decision is made
+                                // once a response completes), not by
+                                // this generic flush-completion path.
+                                (!h2c.has_pending_write(), false)
                             }
                             ConnectionProtocol::Handshaking => {
                                 // A non-TLS connection should never
@@ -2360,13 +2373,23 @@ impl WorkerBody for EventLoopWorker {
                             ConnectionRole::Downstream => None,
                         };
                         if let Some((true, host)) = node_use_tls_and_host {
+                            // Offering h2 via ALPN here is what
+                            // lets HandshakeJustCompleted (below)
+                            // discover whether this node actually
+                            // speaks H2 (checked via alpn_protocol())
+                            // rather than needing a separate
+                            // config-level "this upstream is H2" flag
+                            // -- the same offer-and-check-what-was-
+                            // negotiated approach downstream connections
+                            // already use for ALPN.
+                            let alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                             #[cfg(test)]
                             let tls_result = match &self.upstream_tls_test_roots {
-                                Some(roots) => crate::net::tls::TlsConnection::new_client_with_roots(&host, vec![], roots.clone()),
-                                None => crate::net::tls::TlsConnection::new_client(&host, vec![]),
+                                Some(roots) => crate::net::tls::TlsConnection::new_client_with_roots(&host, alpn_protocols, roots.clone()),
+                                None => crate::net::tls::TlsConnection::new_client(&host, alpn_protocols),
                             };
                             #[cfg(not(test))]
-                            let tls_result = crate::net::tls::TlsConnection::new_client(&host, vec![]);
+                            let tls_result = crate::net::tls::TlsConnection::new_client(&host, alpn_protocols);
                             let tls = match tls_result {
                                 Ok(tls) => tls,
                                 Err(e) => {

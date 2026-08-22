@@ -33,6 +33,20 @@ pub enum ConnectionProtocol {
     Http1(Http1Connection),
     Http2(Http2Connection),
     WebSocket(WsConnection),
+    /// An *upstream* connection speaking H2 as a client -- distinct
+    /// from `Http2` (which is `http::h2::stream::Connection`, a
+    /// server-side state machine: different stream-id allocation,
+    /// different frame-validation rules, no request parsing at all --
+    /// see `net::uring_h2_client`'s own top doc comment for the full
+    /// rationale for keeping the two separate types entirely rather
+    /// than adding a client/server role flag to one shared type).
+    /// Only ever constructed by uring_backend, once ALPN negotiates
+    /// "h2" on a TLS-enabled upstream node's connection -- mio_backend
+    /// has no equivalent variant to reach here at all, since its own
+    /// H2 upstream support (`core::proxy::H2PoolRegistry`) is built
+    /// entirely around `net::h2_client::H2Client` instead, outside
+    /// this enum altogether.
+    UpstreamH2(crate::net::uring_h2_client::UringH2Client),
 }
 
 /// HTTP/1.1 connection state: what's been read but not yet parsed into

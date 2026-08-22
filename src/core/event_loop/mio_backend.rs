@@ -490,6 +490,7 @@ fn handle_connection_event(
         ConnectionProtocol::Http1(_) => drive_http1(worker, connections, idx),
         ConnectionProtocol::Http2(_) => drive_http2(worker, connections, idx),
         ConnectionProtocol::WebSocket(_) => drive_websocket(worker, connections, idx),
+        ConnectionProtocol::UpstreamH2(_) => unreachable!("mio_backend never constructs ConnectionProtocol::UpstreamH2 -- see that variant's own doc comment"),
     };
 
     if result.is_err() || connections[idx].closing {
@@ -933,6 +934,7 @@ fn flush_transport(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
             ConnectionProtocol::Http2(h2) => h2.write_buf.as_slice(),
             ConnectionProtocol::WebSocket(ws) => ws.write_buf.as_slice(),
             ConnectionProtocol::Handshaking => &[],
+            ConnectionProtocol::UpstreamH2(_) => unreachable!("mio_backend never constructs ConnectionProtocol::UpstreamH2"),
         };
         if pending.is_empty() {
             break;
@@ -950,6 +952,7 @@ fn flush_transport(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
                     ConnectionProtocol::Http2(h2) => h2.write_buf.consume(n),
                     ConnectionProtocol::WebSocket(ws) => ws.write_buf.consume(n),
                     ConnectionProtocol::Handshaking => {}
+                    ConnectionProtocol::UpstreamH2(_) => unreachable!("mio_backend never constructs ConnectionProtocol::UpstreamH2"),
                 }
                 // For a TLS transport, write_plaintext only queues into
                 // rustls's own outgoing buffer -- advance_io flushes
