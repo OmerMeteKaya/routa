@@ -156,14 +156,22 @@ pub enum ConnectionRole {
         /// `write_all_with_timeout`/`read_http1_response` are bounded
         /// by.
         read_write_timeouts: (std::time::Duration, std::time::Duration),
-        /// The downstream connection currently waiting on this
-        /// upstream connection's response, identified by slab index
-        /// and generation (the same ABA-safety pairing every other
-        /// cross-referenced slot in this backend uses -- see
-        /// `core::event_loop::uring_backend`'s own `make_user_data`
-        /// doc comment). `None` while this upstream connection is
+        /// The downstream connection(s) currently waiting on this
+        /// upstream connection's response(s), keyed by H2 stream id
+        /// (each value identified by slab index and generation -- the
+        /// same ABA-safety pairing every other cross-referenced slot
+        /// in this backend uses). An HTTP/1.1 upstream connection only
+        /// ever has at most one entry, always under the sentinel key
+        /// `0` (H1 has no real stream ids of its own to key by, and
+        /// only ever serves one request at a time regardless -- see
+        /// this module's own doc comment on why a single shared map
+        /// shape is used for both protocols rather than an enum
+        /// switching between "one downstream" and "many"). An H2
+        /// upstream connection can have as many entries as concurrent
+        /// streams it's actually serving, each key being that
+        /// stream's real id. Empty while this upstream connection is
         /// idle (in a pool, not currently serving any request).
-        serving_downstream: Option<(usize, u32)>,
+        serving_downstream: std::collections::HashMap<u32, (usize, u32)>,
         /// The original client request to serialize and send once
         /// this upstream connection's `Connect` completes -- kept
         /// here (rather than, say, already serialized into
@@ -272,7 +280,7 @@ impl Connection {
         read_write_timeouts: (std::time::Duration, std::time::Duration),
     ) -> Self {
         let mut conn = Self::new(id, transport, remote_addr, recv_buf_size, generation);
-        conn.role = ConnectionRole::Upstream { node, pool, read_write_timeouts, serving_downstream: None, pending_request: None };
+        conn.role = ConnectionRole::Upstream { node, pool, read_write_timeouts, serving_downstream: std::collections::HashMap::new(), pending_request: None };
         conn
     }
 
