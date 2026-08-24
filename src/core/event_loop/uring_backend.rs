@@ -121,6 +121,14 @@ const OP_TAG_CONNECT: u64 = 5;
 /// arrives; the real teardown/response logic already lives in the
 /// linked operation's own arm.
 const OP_TAG_LINK_TIMEOUT: u64 = 6;
+/// First leg of a `PendingFileSend` relay -- `Splice(file_fd -> pipe_write_fd)`.
+/// See `PendingSplice`/`SplicePhase`'s own doc comments for why a file
+/// body's bytes cross a pipe rather than going straight to the socket.
+const OP_TAG_SPLICE_TO_PIPE: u64 = 7;
+/// Second leg of a `PendingFileSend` relay -- `Splice(pipe_read_fd -> socket_fd)`,
+/// moving however many bytes the matching `OP_TAG_SPLICE_TO_PIPE`
+/// completion reported were placed into the pipe.
+const OP_TAG_SPLICE_TO_SOCKET: u64 = 8;
 
 /// The listener accept SQE has no associated connection slot and is
 /// submitted exactly once per worker (re-armed in place, never
@@ -776,6 +784,56 @@ fn push_link_timeout(ring: &mut IoUring, conn: &mut Connection, slab_index: usiz
     Ok(())
 }
 
+/// Worker-local pool of already-open pipe fd pairs (`pipe(2)`, opened
+/// `O_CLOEXEC | O_NONBLOCK`), reused across successive `PendingFileSend`
+/// relays rather than paying a fresh `pipe(2)`/two `close(2)` calls on
+/// every file response -- see `Connection::pending_splice`'s own doc
+/// comment for why the relay needs a pipe at all. Never shared across
+/// worker threads, so no locking (same rationale as `idle_upstream_conns`).
+struct PipePool {
+    pairs: Vec<(i32, i32)>,
+}
+
+impl PipePool {
+    fn new() -> Self {
+        PipePool { pairs: Vec::new() }
+    }
+
+    /// Hands back a pipe fd pair for a new relay to use, opening one
+    /// fresh via `pipe2(2)` only if the pool is currently empty.
+    fn acquire(&mut self) -> std::io::Result<(i32, i32)> {
+        if let Some(pair) = self.pairs.pop() {
+            return Ok(pair);
+        }
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((fds[0], fds[1]))
+    }
+
+    /// Returns a pipe fd pair to the pool once its relay has finished
+    /// (or failed) -- the pipe's own buffered contents are irrelevant
+    /// at this point, since a relay only ever returns its pipe once
+    /// `PendingFileSend::remaining` has reached 0 (fully drained) or
+    /// the connection is being torn down anyway.
+    fn release(&mut self, pair: (i32, i32)) {
+        self.pairs.push(pair);
+    }
+}
+
+impl Drop for PipePool {
+    fn drop(&mut self) {
+        for (r, w) in self.pairs.drain(..) {
+            unsafe {
+                libc::close(r);
+                libc::close(w);
+            }
+        }
+    }
+}
+
 fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     let write_timeout = match &conn.role {
@@ -866,6 +924,151 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
     }
     Ok(())
 }
+/// After a Send completion fully drains an HTTP/1.1 connection's
+/// write_buf (with no pending_file behind it -- see this function's
+/// own call sites for that check), decides what's next: if a further
+/// pipelined request (RFC 9112 9.4) is already sitting in read_buf,
+/// dispatches it immediately rather than waiting on a Recv that bytes
+/// the peer already sent would never satisfy; otherwise submits an
+/// ordinary follow-up Recv. Shared between the plain post-Send path
+/// and the post-file-relay path (OP_TAG_SPLICE_TO_SOCKET), both of
+/// which reach the exact same "write_buf just emptied, what now"
+/// decision from different completions.
+fn drain_pipelined_request_or_recv(
+    worker: &EventLoopWorker,
+    worker_id: usize,
+    ring: &mut IoUring,
+    connections: &mut Slab<Connection>,
+    slab_index: usize,
+    completion_generation: u32,
+) {
+    let has_pipelined_request = matches!(
+        &connections[slab_index].protocol,
+        ConnectionProtocol::Http1(h1) if !h1.read_buf.is_empty()
+    );
+    if has_pipelined_request {
+        let outcome = {
+            let conn = &mut connections[slab_index];
+            let ctx = Http1DispatchContext {
+                server: &worker.server,
+                max_request_size: worker.max_request_size,
+                h2_settings: &worker.h2_settings,
+                ws_settings: &worker.ws_settings,
+                h2c_upgrade_enabled: worker.h2c_upgrade_enabled,
+                ws_enabled: worker.ws_enabled,
+                ws_max_connections: worker.ws_max_connections,
+                ws_permessage_deflate: worker.ws_permessage_deflate,
+                remote_addr: conn.remote_addr.ip(),
+            };
+            crate::core::conn::protocol::process_http1_read_buf(&mut conn.protocol, &ctx)
+        };
+        match outcome {
+            Http1Outcome::NeedsMoreData => {
+                if let Err(reason) = submit_recv(ring, connections, slab_index) {
+                    tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after draining a pipelined request");
+                    cancel_outstanding_operations(ring, completion_generation, slab_index);
+                    connections.remove(slab_index);
+                }
+            }
+            Http1Outcome::FlushThenContinue | Http1Outcome::FlushThenClose => {
+                if let Err(reason) = submit_send(ring, connections, slab_index) {
+                    tracing::warn!(worker_id, %reason, "failed to submit response to a pipelined request");
+                    cancel_outstanding_operations(ring, completion_generation, slab_index);
+                    connections.remove(slab_index);
+                }
+            }
+            Http1Outcome::SwitchedToHttp2 | Http1Outcome::SwitchedToWebSocket => {
+                if let Err(reason) = submit_send(ring, connections, slab_index) {
+                    tracing::warn!(worker_id, %reason, "failed to submit upgrade response to a pipelined request");
+                }
+                cancel_outstanding_operations(ring, completion_generation, slab_index);
+                connections.remove(slab_index);
+            }
+            Http1Outcome::ProxyPending(..) => {
+                tracing::warn!(worker_id, slab_index, "a pipelined proxy request is not yet supported by this backend, closing");
+                cancel_outstanding_operations(ring, completion_generation, slab_index);
+                connections.remove(slab_index);
+            }
+        }
+        return;
+    }
+    if let Err(reason) = submit_recv(ring, connections, slab_index) {
+        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
+        cancel_outstanding_operations(ring, completion_generation, slab_index);
+        connections.remove(slab_index);
+    }
+}
+
+
+/// Starts (or continues) a `PendingFileSend` relay by submitting the
+/// first leg: `Splice(file_fd -> pipe_write_fd)`, moving up to one
+/// pipe's worth of the file's remaining bytes into the pool-acquired
+/// pipe. Only valid on a plaintext HTTP/1.1 connection with a
+/// `pending_file` still holding bytes to send -- callers must check
+/// both before calling (see this function's own call sites).
+fn submit_splice_to_pipe(ring: &mut IoUring, connections: &mut Slab<Connection>, pipe_pool: &mut PipePool, slab_index: usize) -> Result<(), String> {
+    let conn = &mut connections[slab_index];
+    let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
+        return Err("submit_splice_to_pipe called on a non-HTTP/1.1 connection".to_string());
+    };
+    let Some(pending) = &h1.pending_file else {
+        return Err("submit_splice_to_pipe called with no pending_file".to_string());
+    };
+    let remaining = pending.remaining;
+    let file_fd = std::os::unix::io::AsRawFd::as_raw_fd(&pending.file);
+    let offset = pending.offset as i64;
+
+    let (pipe_read_fd, pipe_write_fd) = match conn.pending_splice.as_ref() {
+        Some(existing) => (existing.pipe_read_fd, existing.pipe_write_fd),
+        None => pipe_pool.acquire().map_err(|e| format!("failed to acquire a pipe for file splice: {e}"))?,
+    };
+    conn.pending_splice = Some(crate::core::conn::uring_conn::PendingSplice {
+        pipe_read_fd,
+        pipe_write_fd,
+        phase: crate::core::conn::uring_conn::SplicePhase::FileToPipe,
+    });
+
+    // Bounded the same way flush_pending_file's own sendfile call caps
+    // its per-call size -- a pipe's kernel buffer is limited (commonly
+    // 64KiB unless resized via F_SETPIPE_SZ, which this doesn't do),
+    // so requesting more than that per splice would just have the
+    // kernel silently cap it anyway.
+    let want = remaining.min(64 * 1024) as u32;
+
+    let splice = opcode::Splice::new(types::Fd(file_fd), offset, types::Fd(pipe_write_fd), -1, want)
+        .build()
+        .user_data(make_user_data(OP_TAG_SPLICE_TO_PIPE, conn.generation, slab_index));
+    unsafe {
+        ring.submission()
+            .push(&splice)
+            .map_err(|_| "failed to push splice-to-pipe SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    Ok(())
+}
+
+/// Second leg of a `PendingFileSend` relay: `Splice(pipe_read_fd -> socket_fd)`,
+/// moving `bytes_in_pipe` bytes (as reported by the matching
+/// `OP_TAG_SPLICE_TO_PIPE` completion) out of the pipe and onto the
+/// wire.
+fn submit_splice_to_socket(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize, bytes_in_pipe: u32) -> Result<(), String> {
+    let conn = &mut connections[slab_index];
+    let socket_fd = conn.transport.fd();
+    let Some(splice_state) = &mut conn.pending_splice else {
+        return Err("submit_splice_to_socket called with no pending_splice".to_string());
+    };
+    splice_state.phase = crate::core::conn::uring_conn::SplicePhase::PipeToSocket { bytes_in_pipe };
+    let pipe_read_fd = splice_state.pipe_read_fd;
+
+    let splice = opcode::Splice::new(types::Fd(pipe_read_fd), -1, types::Fd(socket_fd), -1, bytes_in_pipe)
+        .build()
+        .user_data(make_user_data(OP_TAG_SPLICE_TO_SOCKET, conn.generation, slab_index));
+    unsafe {
+        ring.submission()
+            .push(&splice)
+            .map_err(|_| "failed to push splice-to-socket SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    Ok(())
+}
 
 /// Submits an `AsyncCancel` SQE targeting every outstanding SQE tagged
 /// with `target_user_data` -- used when a connection is about to be
@@ -950,6 +1153,12 @@ impl WorkerBody for EventLoopWorker {
         // sites for how that's threaded through ConnectionRole::Upstream's
         // own serving_downstream).
         let mut idle_upstream_conns: std::collections::HashMap<(String, u16), Vec<(usize, u32, std::time::Instant, std::time::Duration)>> = std::collections::HashMap::new();
+        // Worker-local (no locking, same rationale as idle_upstream_conns
+        // above) pool of already-open pipe fd pairs reused across
+        // successive PendingFileSend relays rather than calling
+        // pipe(2) and closing both ends on every single file response
+        // -- see PipePool's own doc comment.
+        let mut pipe_pool = PipePool::new();
         // Parallel to `connections`: `generations[i]` is the
         // generation currently valid for slab index `i`, bumped every
         // time that slot is reused for a new connection -- see
@@ -2473,7 +2682,8 @@ impl WorkerBody for EventLoopWorker {
                             }
                         };
 
-                        if fully_flushed && should_close_after_flush {
+                        let has_pending_file = matches!(&connections[slab_index].protocol, ConnectionProtocol::Http1(h1) if h1.pending_file.is_some());
+                        if fully_flushed && should_close_after_flush && !has_pending_file {
                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                             connections.remove(slab_index);
                             continue;
@@ -2484,6 +2694,21 @@ impl WorkerBody for EventLoopWorker {
                             // same buffer before doing anything else.
                             if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
                                 tracing::warn!(worker_id, %reason, "failed to submit remainder of a partially-sent buffer");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
+                        } else if matches!(&connections[slab_index].protocol, ConnectionProtocol::Http1(h1) if h1.pending_file.is_some()) {
+                            // The response's headers just finished
+                            // flushing and a PendingFileSend is
+                            // waiting behind them -- relay its bytes
+                            // over a pooled pipe via two chained
+                            // Splice SQEs (see submit_splice_to_pipe's
+                            // own doc comment) instead of falling
+                            // through to a Recv, which is what every
+                            // other branch here does once write_buf
+                            // is empty.
+                            if let Err(reason) = submit_splice_to_pipe(&mut ring, &mut connections, &mut pipe_pool, slab_index) {
+                                tracing::warn!(worker_id, %reason, "failed to submit splice-to-pipe for a pending file body");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
                             }
@@ -2516,87 +2741,9 @@ impl WorkerBody for EventLoopWorker {
                             // is handled once and then control returns
                             // to the main event loop rather than
                             // looping internally.
-                            let has_pipelined_request = matches!(
-                                &connections[slab_index].protocol,
-                                ConnectionProtocol::Http1(h1) if !h1.read_buf.is_empty()
-                            );
-
-                            if has_pipelined_request {
-                                let outcome = {
-                                    let conn = &mut connections[slab_index];
-                                    let ctx = Http1DispatchContext {
-                                        server: &self.server,
-                                        max_request_size: self.max_request_size,
-                                        h2_settings: &self.h2_settings,
-                                        ws_settings: &self.ws_settings,
-                                        h2c_upgrade_enabled: self.h2c_upgrade_enabled,
-                                        ws_enabled: self.ws_enabled,
-                                        ws_max_connections: self.ws_max_connections,
-                                        ws_permessage_deflate: self.ws_permessage_deflate,
-                                        remote_addr: conn.remote_addr.ip(),
-                                    };
-                                    crate::core::conn::protocol::process_http1_read_buf(&mut conn.protocol, &ctx)
-                                };
-                                match outcome {
-                                    Http1Outcome::NeedsMoreData => {
-                                        if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
-                                            tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after draining a pipelined request");
-                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                            connections.remove(slab_index);
-                                        }
-                                    }
-                                    Http1Outcome::FlushThenContinue | Http1Outcome::FlushThenClose => {
-                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
-                                            tracing::warn!(worker_id, %reason, "failed to submit response to a pipelined request");
-                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                            connections.remove(slab_index);
-                                        }
-                                    }
-                                    Http1Outcome::SwitchedToHttp2 | Http1Outcome::SwitchedToWebSocket => {
-                                        // A pipelined upgrade request
-                                        // is a real but unusual case
-                                        // (an Upgrade request is
-                                        // ordinarily the last request
-                                        // on a connection) -- not yet
-                                        // supported here, same
-                                        // limitation as the equivalent
-                                        // arms elsewhere in this
-                                        // function.
-                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
-                                            tracing::warn!(worker_id, %reason, "failed to submit upgrade response to a pipelined request");
-                                        }
-                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                        connections.remove(slab_index);
-                                    }
-                                    Http1Outcome::ProxyPending(..) => {
-                                        // A pipelined proxy request is
-                                        // a real but unusual case,
-                                        // same limitation as the
-                                        // pipelined-upgrade arm just
-                                        // above -- not yet supported
-                                        // here (implementing it means
-                                        // duplicating the full connect/
-                                        // send/recv cycle the primary
-                                        // ProxyPending arm above
-                                        // already handles, just
-                                        // reached from a different
-                                        // completion path).
-                                        tracing::warn!(worker_id, slab_index, "a pipelined proxy request is not yet supported by this backend, closing");
-                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                        connections.remove(slab_index);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
-                                tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
-                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                connections.remove(slab_index);
-                            }
+                            drain_pipelined_request_or_recv(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation);
                         }
                     }
-
                     OP_TAG_CONNECT => {
                         if !connections.contains(slab_index) {
                             continue; // upstream connection already torn down (e.g. its downstream vanished first)
@@ -2776,6 +2923,84 @@ impl WorkerBody for EventLoopWorker {
                         }
                     }
 
+                    OP_TAG_SPLICE_TO_PIPE => {
+                        if !connections.contains(slab_index) || connections[slab_index].generation != completion_generation {
+                            continue;
+                        }
+                        if result <= 0 {
+                            // 0 means the file has no more bytes at
+                            // its current offset despite pending_file
+                            // still expecting some (a truncated file
+                            // underneath an in-flight response, the
+                            // same failure mode flush_pending_file's
+                            // own TLS fallback branch guards against)
+                            // -- either way, this connection can't
+                            // finish its response correctly, so it's
+                            // torn down rather than left half-sent.
+                            if let Some(splice_state) = connections[slab_index].pending_splice.take() {
+                                pipe_pool.release((splice_state.pipe_read_fd, splice_state.pipe_write_fd));
+                            }
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        }
+                        let bytes_in_pipe = result as u32;
+                        if let Err(reason) = submit_splice_to_socket(&mut ring, &mut connections, slab_index, bytes_in_pipe) {
+                            tracing::warn!(worker_id, %reason, "failed to submit splice-to-socket leg of a file relay");
+                            if let Some(splice_state) = connections[slab_index].pending_splice.take() {
+                                pipe_pool.release((splice_state.pipe_read_fd, splice_state.pipe_write_fd));
+                            }
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                        }
+                    }
+                    OP_TAG_SPLICE_TO_SOCKET => {
+                        if !connections.contains(slab_index) || connections[slab_index].generation != completion_generation {
+                            continue;
+                        }
+                        if result < 0 {
+                            if let Some(splice_state) = connections[slab_index].pending_splice.take() {
+                                pipe_pool.release((splice_state.pipe_read_fd, splice_state.pipe_write_fd));
+                            }
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        }
+                        let n = result as u64;
+                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else {
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        };
+                        let Some(pending) = &mut h1.pending_file else {
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        };
+                        pending.offset += n;
+                        pending.remaining = pending.remaining.saturating_sub(n);
+
+                        if pending.remaining == 0 {
+                            h1.pending_file = None;
+                            let keep_alive = h1.keep_alive;
+                            if let Some(splice_state) = connections[slab_index].pending_splice.take() {
+                                pipe_pool.release((splice_state.pipe_read_fd, splice_state.pipe_write_fd));
+                            }
+                            if !keep_alive {
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                                continue;
+                            }
+                            drain_pipelined_request_or_recv(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation);
+                        } else if let Err(reason) = submit_splice_to_pipe(&mut ring, &mut connections, &mut pipe_pool, slab_index) {
+                            tracing::warn!(worker_id, %reason, "failed to submit next splice-to-pipe leg of a file relay");
+                            if let Some(splice_state) = connections[slab_index].pending_splice.take() {
+                                pipe_pool.release((splice_state.pipe_read_fd, splice_state.pipe_write_fd));
+                            }
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                        }
+                    }
                     OP_TAG_CANCEL => {
                         // Nothing to act on -- the cancellation
                         // completion carries no connection state, and
@@ -3675,6 +3900,61 @@ mod tests {
     /// completion or a later one on the same connection) alive across
     /// requests, rather than requiring a fresh connection each time.
     /// Mirrors mio_backend's own equivalent test.
+    #[test]
+    /// A GET request for a file above FileCache's mmap_threshold --
+    /// proves this backend's own Splice-based relay (see
+    /// submit_splice_to_pipe/submit_splice_to_socket) actually
+    /// delivers the complete, byte-correct body over a real TCP
+    /// connection, including on a Connection: close request (which
+    /// requires the fully_flushed-but-pending_file distinction in the
+    /// OP_TAG_SEND completion arm to hold: the connection must stay
+    /// open long enough to relay the file before closing, not close
+    /// the instant its headers are flushed).
+    fn serves_large_static_file_via_splice_relay() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_uring_splice_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp webroot");
+        // Larger than the pipe-relay's own 64KiB per-splice cap, so a
+        // correct test run must cross multiple FileToPipe/PipeToSocket
+        // cycles, not just prove a single splice pair works.
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("big.bin"), &body).expect("write big.bin");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+        stream.write_all(b"GET /big.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response to EOF");
+        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(response.len());
+        let headers = String::from_utf8_lossy(&response[..header_end]);
+        assert!(headers.starts_with("HTTP/1.1 200"), "expected a 200, got: {headers:?}");
+        assert_eq!(response[header_end..].len(), body.len(), "relayed body length mismatch");
+        assert_eq!(&response[header_end..], &body[..], "relayed body content mismatch");
+
+        pool.shutdown();
+        std::fs::remove_dir_all(&dir).ok();
+    }
     #[test]
     fn keep_alive_connection_serves_multiple_requests_over_real_tcp() {
         let port = {

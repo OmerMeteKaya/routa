@@ -245,6 +245,50 @@ pub struct Connection {
     /// type tracks on its own -- `Connection` has no notion of "which
     /// slot" it occupies, only the backend driving it does.
     pub generation: u32,
+    /// Tracks an in-progress `Http1Connection::pending_file` transfer
+    /// being driven over a pipe via two chained `Splice` SQEs
+    /// (file -> pipe write end, then pipe read end -> socket) -- direct
+    /// file-to-socket splicing isn't a kernel-supported shape (splice(2)
+    /// requires one side of the transfer to be a pipe), so this two-hop
+    /// relay is the io_uring-native equivalent of `sendfile(2)`, which
+    /// mio_backend's own `flush_pending_file` calls directly. `None`
+    /// whenever no splice is currently in flight on this connection --
+    /// only ever `Some` on a plaintext HTTP/1.1 connection actively
+    /// relaying a `PendingFileSend` body (a TLS connection's own
+    /// pending-file body still goes through the ordinary read+encrypt+
+    /// send path, since splice can't see through TLS's userspace
+    /// encryption step).
+    pub pending_splice: Option<PendingSplice>,
+}
+
+/// The pipe fd pair (and current relay phase) backing one in-flight
+/// `Splice`-based file transfer -- see `Connection::pending_splice`'s
+/// own doc comment for why a pipe hop is required at all. The pipe fds
+/// themselves are borrowed from a worker-lokal `PipePool` (see
+/// `core::event_loop::uring_backend`) for the transfer's duration and
+/// returned there once it completes, rather than being opened and
+/// closed on every single file response.
+pub struct PendingSplice {
+    pub pipe_read_fd: i32,
+    pub pipe_write_fd: i32,
+    pub phase: SplicePhase,
+}
+
+/// Which leg of the file -> pipe -> socket relay is currently
+/// in-flight. A single `PendingFileSend::remaining` byte range may be
+/// relayed across many `FileToPipe`/`PipeToSocket` cycles -- one cycle
+/// moves at most one pipe's worth of buffered bytes (bounded by the
+/// pipe's own kernel buffer size), not the whole remaining length in
+/// one shot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplicePhase {
+    /// A `Splice(file_fd -> pipe_write_fd)` SQE is in flight; its
+    /// completion reports how many bytes now sit in the pipe, which is
+    /// exactly how many the follow-up `PipeToSocket` splice must move.
+    FileToPipe,
+    /// A `Splice(pipe_read_fd -> socket_fd)` SQE is in flight, moving
+    /// the `n` bytes the prior `FileToPipe` completion reported.
+    PipeToSocket { bytes_in_pipe: u32 },
 }
 
 impl Connection {
@@ -263,6 +307,7 @@ impl Connection {
             pending_connect_addr: None,
             pending_timeout: None,
             generation,
+            pending_splice: None,
         }
     }
 
