@@ -621,6 +621,12 @@ fn parse_top_level_key(
         "io_uring_recv_buf_size" => {
             cfg.io_uring.recv_buf_size = cfg_size_bytes(val, 16_384, ctx, lineno)
         }
+        "io_uring_registered_buffers_enabled" => {
+            cfg.io_uring.registered_buffers_enabled = cfg_atob(val, true, ctx, lineno)
+        }
+        "io_uring_registered_buffer_count" => {
+            cfg.io_uring.registered_buffer_count = cfg_atoi(val, 256)
+        }
 
         "ws_enabled" => cfg.ws.enabled = cfg_atob(val, false, ctx, lineno),
         "ws_max_connections" => cfg.ws.max_connections = cfg_atoi(val, 10_000),

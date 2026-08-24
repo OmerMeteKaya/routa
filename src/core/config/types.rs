@@ -142,6 +142,22 @@ pub struct RoutaIoUringConfig {
     /// 16384, matching the chunk size `mio_backend`'s own transport
     /// reads use.
     pub recv_buf_size: i64,
+    /// Whether to register a pool of fixed recv buffers with the
+    /// kernel (`IORING_REGISTER_BUFFERS`) and use `ReadFixed` instead
+    /// of plain `Recv` when one is available -- avoids the kernel
+    /// re-pinning/re-mapping a fresh buffer address on every single
+    /// recv. Falls back to an ordinary (non-fixed) `Recv` whenever the
+    /// pool is exhausted or the running kernel doesn't support
+    /// registered buffers at all -- never a hard requirement, purely
+    /// an optimization this backend degrades out of gracefully.
+    /// Default: true.
+    pub registered_buffers_enabled: bool,
+    /// How many fixed buffers to register, each `recv_buf_size` bytes.
+    /// Sized to `ring_entries` by default -- the same reasoning
+    /// `ring_entries` itself documents (tolerating that many
+    /// simultaneously in-flight operations before falling back)
+    /// applies here too. Default: 256.
+    pub registered_buffer_count: i32,
 }
 
 impl Default for RoutaIoUringConfig {
@@ -149,6 +165,8 @@ impl Default for RoutaIoUringConfig {
         RoutaIoUringConfig {
             ring_entries: 256,
             recv_buf_size: 16_384,
+            registered_buffers_enabled: true,
+            registered_buffer_count: 256,
         }
     }
 }

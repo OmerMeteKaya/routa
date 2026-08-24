@@ -178,6 +178,8 @@ pub struct EventLoopWorker {
     server: Arc<RoutaServer>,
     ring_entries: u32,
     recv_buf_size: usize,
+    registered_buffers_enabled: bool,
+    registered_buffer_count: u32,
     max_request_size: usize,
     h2_settings: crate::core::conn::Http2Settings,
     ws_settings: crate::core::conn::WsSettings,
@@ -205,6 +207,8 @@ impl EventLoopWorker {
         // casts below don't need their own bounds-checking here.
         let ring_entries = server.config.io_uring.ring_entries as u32;
         let recv_buf_size = server.config.io_uring.recv_buf_size as usize;
+        let registered_buffers_enabled = server.config.io_uring.registered_buffers_enabled;
+        let registered_buffer_count = server.config.io_uring.registered_buffer_count.max(0) as u32;
 
         const DEFAULT_MAX_REQUEST_SIZE: usize = 0; // 0 = unlimited, matches http::request::parse's convention
         let max_request_size = if server.config.max_request_size > 0 {
@@ -257,6 +261,8 @@ impl EventLoopWorker {
             port,
             ring_entries,
             recv_buf_size,
+            registered_buffers_enabled,
+            registered_buffer_count,
             max_request_size,
             h2_settings,
             ws_settings,
@@ -678,8 +684,7 @@ fn submit_loop_timeout(ring: &mut IoUring, timespec: &types::Timespec) -> Result
 /// rather than added speculatively here (see this module's own doc
 /// comment on scope).
 #[track_caller]
-fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
-    // let loc = std::panic::Location::caller(); // debug removed
+fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize, registered_buffer_pool: &mut Option<RegisteredBufferPool>) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     // An upstream connection's own read_timeout (ProxyConfig's,
     // carried on ConnectionRole::Upstream -- see its own doc comment)
@@ -695,6 +700,37 @@ fn submit_recv(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
         ConnectionRole::Downstream => None,
     };
 
+    // ReadFixed needs both a registered buffer index (buf_index) and
+    // a pointer into that exact buffer's own backing memory. Unlike
+    // SendZc's size threshold (see submit_send's own doc comment),
+    // there's no size-based reason to prefer plain Recv: a fixed
+    // buffer is exactly recv_buf's own size regardless of how much
+    // the peer actually sends, so ReadFixed is strictly preferable
+    // whenever the pool has one available -- only unavailability
+    // (pool exhausted, or registration never happened at all -- see
+    // RegisteredBufferPool::new's own doc comment) falls back to the
+    // ordinary path below.
+    if let Some(pool) = registered_buffer_pool.as_mut() {
+        if let Some((buf_index, buf_ptr, buf_len)) = pool.acquire() {
+            conn.pending_recv_buf_index = Some(buf_index);
+            let mut recv = opcode::ReadFixed::new(types::Fd(conn.transport.fd()), buf_ptr, buf_len as u32, buf_index).build();
+            if read_timeout.is_some() {
+                recv = recv.flags(squeue::Flags::IO_LINK);
+            }
+            let recv = recv.user_data(make_user_data(OP_TAG_RECV, conn.generation, slab_index));
+            unsafe {
+                ring.submission()
+                    .push(&recv)
+                    .map_err(|_| "failed to push read_fixed SQE -- submission queue unexpectedly full".to_string())?;
+            }
+            if let Some(timeout) = read_timeout {
+                push_link_timeout(ring, conn, slab_index, timeout)?;
+            }
+            return Ok(());
+        }
+    }
+
+    conn.pending_recv_buf_index = None;
     let mut recv = opcode::Recv::new(types::Fd(conn.transport.fd()), conn.recv_buf.as_mut_ptr(), conn.recv_buf.len() as u32).build();
     if read_timeout.is_some() {
         recv = recv.flags(squeue::Flags::IO_LINK);
@@ -861,6 +897,110 @@ impl Drop for PipePool {
     }
 }
 
+/// Worker-local pool of buffers registered with the kernel via
+/// `IORING_REGISTER_BUFFERS`, used for `ReadFixed` recvs instead of
+/// plain `Recv` when one is available (see `submit_recv`'s own doc
+/// comment) -- registering a buffer once up front lets the kernel
+/// pin/map it a single time rather than re-validating a fresh
+/// userspace address on every single recv. Each buffer is
+/// `recv_buf_size` bytes, matching Connection::recv_buf's own size so
+/// a ReadFixed recv can read exactly as much as an ordinary Recv
+/// would.
+///
+/// The pool's own `Vec<Vec<u8>>` keeps each buffer's backing memory
+/// at a stable address even as the outer Vec grows/reallocates --
+/// only the outer Vec's own pointer/len/cap triple moves on
+/// reallocation, never the heap allocation each inner `Vec<u8>` owns,
+/// which is what the kernel was actually given the address of via
+/// `register_buffers`. Never resized after construction for exactly
+/// this reason: growing it post-registration would invalidate
+/// addresses the kernel already has pinned.
+struct RegisteredBufferPool {
+    buffers: Vec<Vec<u8>>,
+    available: Vec<u16>,
+}
+
+impl RegisteredBufferPool {
+    /// Allocates `count` buffers of `buf_size` bytes each and
+    /// registers them with `ring` via `IORING_REGISTER_BUFFERS`.
+    /// Returns `None` (rather than an error) if registration fails --
+    /// an unsupported kernel or a `ulimit`/memlock ceiling are both
+    /// plausible causes, and this optimization's own designed
+    /// fallback (see this pool's own doc comment) means a `None` here
+    /// simply means callers use ordinary `Recv` instead, not that the
+    /// worker should refuse to start.
+    fn new(ring: &IoUring, count: u32, buf_size: usize) -> Option<Self> {
+        if count == 0 || buf_size == 0 {
+            return None;
+        }
+        let mut buffers: Vec<Vec<u8>> = (0..count).map(|_| vec![0u8; buf_size]).collect();
+        let iovecs: Vec<libc::iovec> = buffers
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr() as *mut libc::c_void,
+                iov_len: b.len(),
+            })
+            .collect();
+        // Safety: each iovec's (base, len) points into a buffer this
+        // pool owns for its own entire lifetime (buffers is never
+        // resized or dropped before the pool itself is, and the pool
+        // is worker-local, never shared across threads) -- exactly
+        // the validity/lifetime contract register_buffers's own doc
+        // comment requires.
+        let register_result = unsafe { ring.submitter().register_buffers(&iovecs) };
+        if register_result.is_err() {
+            return None;
+        }
+        let available: Vec<u16> = (0..count as u16).collect();
+        Some(RegisteredBufferPool { buffers, available })
+    }
+
+    /// Hands back a registered buffer's index and a mutable pointer
+    /// to its backing memory, or `None` if every buffer is currently
+    /// in use -- callers fall back to an ordinary (non-fixed) Recv in
+    /// that case (see this pool's own doc comment).
+    fn acquire(&mut self) -> Option<(u16, *mut u8, usize)> {
+        let idx = self.available.pop()?;
+        let buf = &mut self.buffers[idx as usize];
+        Some((idx, buf.as_mut_ptr(), buf.len()))
+    }
+
+    /// Returns a buffer index to the pool once its ReadFixed
+    /// completes (or the connection using it is torn down).
+    fn release(&mut self, idx: u16) {
+        self.available.push(idx);
+    }
+
+    /// Borrows a registered buffer's full backing memory by index --
+    /// used to read back what a completed ReadFixed wrote into it
+    /// (see `recv_bytes`'s own doc comment). Callers slice this down
+    /// to the completion's own reported byte count themselves, since
+    /// this pool has no notion of how many bytes a given recv
+    /// actually filled.
+    fn buffer_slice(&self, idx: u16) -> &[u8] {
+        &self.buffers[idx as usize]
+    }
+}
+
+/// Returns the bytes a completed Recv/ReadFixed actually delivered --
+/// either `conn.recv_buf` (an ordinary Recv wrote directly into it) or
+/// the registered buffer `conn.pending_recv_buf_index` names (a
+/// ReadFixed wrote into the pool's own memory instead -- see
+/// `submit_recv`'s own doc comment on why ReadFixed can't write into
+/// recv_buf itself). Every call site that used to read
+/// `conn.recv_buf[..n]` directly goes through this instead, so a
+/// ReadFixed completion's bytes are found where they actually are
+/// rather than in an untouched (and therefore stale or zeroed)
+/// recv_buf.
+fn recv_bytes<'a>(conn: &'a Connection, pool: &'a Option<RegisteredBufferPool>) -> &'a [u8] {
+    if let Some(idx) = conn.pending_recv_buf_index {
+        if let Some(pool) = pool {
+            return pool.buffer_slice(idx);
+        }
+    }
+    conn.recv_buf.as_slice()
+}
+
 /// Handles a settled Send completion -- shared by OP_TAG_SEND
 /// (ordinary Send, one CQE) and OP_TAG_SEND_ZC's own NOTIF arm
 /// (SendZc, whose second completion is the point its transfer is
@@ -876,6 +1016,7 @@ fn handle_send_completion(
     completion_generation: u32,
     result: i32,
     pipe_pool: &mut PipePool,
+    registered_buffer_pool: &mut Option<RegisteredBufferPool>,
 ) {
                         if !connections.contains(slab_index) {
                             return;
@@ -922,7 +1063,7 @@ fn handle_send_completion(
                                     cancel_outstanding_operations(ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
                                 }
-                            } else if let Err(reason) = submit_recv(ring, connections, slab_index) {
+                            } else if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
                                 tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after a tls handshake send");
                                 cancel_outstanding_operations(ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
@@ -1066,7 +1207,7 @@ fn handle_send_completion(
                             // is handled once and then control returns
                             // to the main event loop rather than
                             // looping internally.
-                            drain_pipelined_request_or_recv(worker, worker_id, ring, connections, slab_index, completion_generation);
+                            drain_pipelined_request_or_recv(worker, worker_id, ring, connections, slab_index, completion_generation, registered_buffer_pool);
                         }
 }
 
@@ -1204,6 +1345,7 @@ fn drain_pipelined_request_or_recv(
     connections: &mut Slab<Connection>,
     slab_index: usize,
     completion_generation: u32,
+    registered_buffer_pool: &mut Option<RegisteredBufferPool>,
 ) {
     let has_pipelined_request = matches!(
         &connections[slab_index].protocol,
@@ -1227,7 +1369,7 @@ fn drain_pipelined_request_or_recv(
         };
         match outcome {
             Http1Outcome::NeedsMoreData => {
-                if let Err(reason) = submit_recv(ring, connections, slab_index) {
+                if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
                     tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after draining a pipelined request");
                     cancel_outstanding_operations(ring, completion_generation, slab_index);
                     connections.remove(slab_index);
@@ -1255,7 +1397,7 @@ fn drain_pipelined_request_or_recv(
         }
         return;
     }
-    if let Err(reason) = submit_recv(ring, connections, slab_index) {
+    if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
         tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
         cancel_outstanding_operations(ring, completion_generation, slab_index);
         connections.remove(slab_index);
@@ -1427,6 +1569,16 @@ impl WorkerBody for EventLoopWorker {
         // fresh Probe registration on every large send would be
         // pure overhead for a value that's already known.
         let send_zc_supported = probe_send_zc_support(&ring);
+        // None whenever registration is disabled by config, the
+        // kernel doesn't support IORING_REGISTER_BUFFERS, or a
+        // resource limit (memlock, etc.) rejected it -- submit_recv
+        // falls back to an ordinary Recv in that case (see
+        // RegisteredBufferPool's own doc comment).
+        let mut registered_buffer_pool = if self.registered_buffers_enabled {
+            RegisteredBufferPool::new(&ring, self.registered_buffer_count, self.recv_buf_size)
+        } else {
+            None
+        };
         // Parallel to `connections`: `generations[i]` is the
         // generation currently valid for slab index `i`, bumped every
         // time that slot is reused for a new connection -- see
@@ -1566,7 +1718,7 @@ impl WorkerBody for EventLoopWorker {
                         }
                         entry.insert(conn);
 
-                        if let Err(reason) = submit_recv(&mut ring, &mut connections, new_slab_index) {
+                        if let Err(reason) = submit_recv(&mut ring, &mut connections, new_slab_index, &mut registered_buffer_pool) {
                             tracing::warn!(worker_id, %reason, "failed to submit initial recv for accepted connection");
                             cancel_outstanding_operations(&mut ring, generation, new_slab_index);
                             connections.remove(new_slab_index);
@@ -1592,6 +1744,7 @@ impl WorkerBody for EventLoopWorker {
                             // own Recv is unaffected; nothing to do.
                             continue;
                         }
+
                         if result <= 0 {
                             // 0 means the peer closed (EOF); negative
                             // is a real error -- either way, this
@@ -1692,7 +1845,13 @@ impl WorkerBody for EventLoopWorker {
                             // a plaintext upstream skips straight to
                             // using recv_buf as-is, same as before.
                             let plaintext: Vec<u8> = if connections[slab_index].transport.is_tls() {
-                                let ciphertext = connections[slab_index].recv_buf[..n].to_vec();
+                                let ciphertext = {
+                                let bytes = recv_bytes(&connections[slab_index], &registered_buffer_pool)[..n].to_vec();
+                                if let Some(idx) = connections[slab_index].pending_recv_buf_index.take() {
+                                    if let Some(pool) = registered_buffer_pool.as_mut() { pool.release(idx); }
+                                }
+                                bytes
+                            };
                                 let conn = &mut connections[slab_index];
                                 let Transport::Tls { tls, io, .. } = &mut conn.transport else { unreachable!() };
                                 let outcome = advance_tls(tls, io, &ciphertext);
@@ -1736,7 +1895,7 @@ impl WorkerBody for EventLoopWorker {
                                             // since it's literally
                                             // nothing) response to
                                             // parse.
-                                            if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                            if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                                 tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after a TLS record with no application data");
                                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                                 connections.remove(slab_index);
@@ -1760,7 +1919,7 @@ impl WorkerBody for EventLoopWorker {
                                         let submit_result = if has_outgoing {
                                             submit_tls_send(&mut ring, &mut connections, slab_index)
                                         } else {
-                                            submit_recv(&mut ring, &mut connections, slab_index)
+                                            submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool)
                                         };
                                         if let Err(reason) = submit_result {
                                             tracing::warn!(worker_id, %reason, "failed to submit follow-up during upstream TLS rekey");
@@ -1794,7 +1953,13 @@ impl WorkerBody for EventLoopWorker {
                                     }
                                 }
                             } else {
-                                connections[slab_index].recv_buf[..n].to_vec()
+                                {
+                                let bytes = recv_bytes(&connections[slab_index], &registered_buffer_pool)[..n].to_vec();
+                                if let Some(idx) = connections[slab_index].pending_recv_buf_index.take() {
+                                    if let Some(pool) = registered_buffer_pool.as_mut() { pool.release(idx); }
+                                }
+                                bytes
+                            }
                             };
                             connections[slab_index].touch();
                             let parsed_response = {
@@ -1805,7 +1970,7 @@ impl WorkerBody for EventLoopWorker {
                             let Some(response) = parsed_response else {
                                 // Not a complete response yet -- keep
                                 // reading from the upstream.
-                                if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                     tracing::warn!(worker_id, %reason, "failed to submit follow-up recv from upstream");
                                     cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
@@ -1933,7 +2098,13 @@ impl WorkerBody for EventLoopWorker {
                         let is_upstream_h2 = matches!(connections[slab_index].protocol, ConnectionProtocol::UpstreamH2(_));
                         if is_upstream_h2 {
                             let n = result as usize;
-                            let ciphertext = connections[slab_index].recv_buf[..n].to_vec();
+                            let ciphertext = {
+                                let bytes = recv_bytes(&connections[slab_index], &registered_buffer_pool)[..n].to_vec();
+                                if let Some(idx) = connections[slab_index].pending_recv_buf_index.take() {
+                                    if let Some(pool) = registered_buffer_pool.as_mut() { pool.release(idx); }
+                                }
+                                bytes
+                            };
                             let plaintext: Vec<u8> = {
                                 let conn = &mut connections[slab_index];
                                 let Transport::Tls { tls, io, .. } = &mut conn.transport else { unreachable!() };
@@ -1957,7 +2128,7 @@ impl WorkerBody for EventLoopWorker {
                             };
 
                             if plaintext.is_empty() {
-                                if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                     tracing::warn!(worker_id, %reason, "failed to submit follow-up recv for upstream H2 connection");
                                     cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
@@ -2028,7 +2199,7 @@ impl WorkerBody for EventLoopWorker {
                                         connections.remove(slab_index);
                                         continue;
                                     }
-                                } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                     tracing::warn!(worker_id, %reason, "failed to submit follow-up recv for upstream H2 connection");
                                     cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
@@ -2047,7 +2218,13 @@ impl WorkerBody for EventLoopWorker {
                         // dispatch logic.
                         let is_tls = connections[slab_index].transport.is_tls();
                         if is_tls {
-                            let ciphertext = connections[slab_index].recv_buf[..n].to_vec();
+                            let ciphertext = {
+                                let bytes = recv_bytes(&connections[slab_index], &registered_buffer_pool)[..n].to_vec();
+                                if let Some(idx) = connections[slab_index].pending_recv_buf_index.take() {
+                                    if let Some(pool) = registered_buffer_pool.as_mut() { pool.release(idx); }
+                                }
+                                bytes
+                            };
                             let tls_outcome = {
                                 let conn = &mut connections[slab_index];
                                 let Transport::Tls { tls, io, .. } = &mut conn.transport else { unreachable!() };
@@ -2071,7 +2248,7 @@ impl WorkerBody for EventLoopWorker {
                                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                             connections.remove(slab_index);
                                         }
-                                    } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                    } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                         tracing::warn!(worker_id, %reason, "failed to submit follow-up recv during tls handshake");
                                         cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                         connections.remove(slab_index);
@@ -2346,7 +2523,7 @@ impl WorkerBody for EventLoopWorker {
                                             cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                             connections.remove(slab_index);
                                         }
-                                    } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                    } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                         tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after tls handshake");
                                         cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                         connections.remove(slab_index);
@@ -2376,11 +2553,17 @@ impl WorkerBody for EventLoopWorker {
                             }
                             collected
                         } else {
-                            connections[slab_index].recv_buf[..n].to_vec()
+                            {
+                                let bytes = recv_bytes(&connections[slab_index], &registered_buffer_pool)[..n].to_vec();
+                                if let Some(idx) = connections[slab_index].pending_recv_buf_index.take() {
+                                    if let Some(pool) = registered_buffer_pool.as_mut() { pool.release(idx); }
+                                }
+                                bytes
+                            }
                         };
 
                         if plaintext.is_empty() && is_tls {
-                            if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                            if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                 tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after an empty decrypted record");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                 connections.remove(slab_index);
@@ -2450,7 +2633,7 @@ impl WorkerBody for EventLoopWorker {
 
                             match ws_outcome {
                                 crate::core::conn::protocol::WebSocketOutcome::NoActionNeeded => {
-                                    if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                    if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                         tracing::warn!(worker_id, %reason, "failed to submit follow-up recv (websocket)");
                                         cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                         connections.remove(slab_index);
@@ -2528,7 +2711,7 @@ impl WorkerBody for EventLoopWorker {
                             };
                             match decision {
                                 crate::core::conn::protocol::PlaintextProtocolDecision::NeedMoreData => {
-                                    if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                    if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                         tracing::warn!(worker_id, %reason, "failed to submit follow-up recv while deciding plaintext protocol");
                                         cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                         connections.remove(slab_index);
@@ -2589,7 +2772,7 @@ impl WorkerBody for EventLoopWorker {
 
                         match outcome {
                             Http1Outcome::NeedsMoreData => {
-                                if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
+                                if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
                                     tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
                                     cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
@@ -2822,7 +3005,7 @@ impl WorkerBody for EventLoopWorker {
                     }
 
                     OP_TAG_SEND => {
-                        handle_send_completion(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, result, &mut pipe_pool);
+                        handle_send_completion(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, result, &mut pipe_pool, &mut registered_buffer_pool);
                     }
                     OP_TAG_CONNECT => {
                         if !connections.contains(slab_index) {
@@ -2958,7 +3141,7 @@ impl WorkerBody for EventLoopWorker {
                             let submit_result = if has_outgoing {
                                 submit_tls_send(&mut ring, &mut connections, slab_index)
                             } else {
-                                submit_recv(&mut ring, &mut connections, slab_index)
+                                submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool)
                             };
                             if let Err(reason) = submit_result {
                                 tracing::warn!(worker_id, %reason, "failed to submit initial upstream TLS handshake step");
@@ -3025,7 +3208,7 @@ impl WorkerBody for EventLoopWorker {
                                 connections.remove(slab_index);
                                 continue;
                             };
-                            handle_send_completion(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, n as i32, &mut pipe_pool);
+                            handle_send_completion(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, n as i32, &mut pipe_pool, &mut registered_buffer_pool);
                             continue;
                         }
                         // The first (MORE) completion -- result is the
@@ -3112,7 +3295,7 @@ impl WorkerBody for EventLoopWorker {
                                 connections.remove(slab_index);
                                 continue;
                             }
-                            drain_pipelined_request_or_recv(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation);
+                            drain_pipelined_request_or_recv(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, &mut registered_buffer_pool);
                         } else if let Err(reason) = submit_splice_to_pipe(&mut ring, &mut connections, &mut pipe_pool, slab_index) {
                             tracing::warn!(worker_id, %reason, "failed to submit next splice-to-pipe leg of a file relay");
                             if let Some(splice_state) = connections[slab_index].pending_splice.take() {
@@ -4131,6 +4314,64 @@ mod tests {
         pool.shutdown();
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// Many sequential requests over separate connections, each
+    /// expected to use a ReadFixed recv against the worker's
+    /// RegisteredBufferPool -- proves buffers are correctly returned
+    /// to the pool after each connection closes rather than being
+    /// permanently consumed (a leak here would exhaust the pool after
+    /// registered_buffer_count connections and force every later one
+    /// onto the ordinary Recv fallback silently, which this test
+    /// would not directly observe -- what it does prove is that
+    /// running well past the pool's own size still serves every
+    /// request correctly, which a real leak would eventually break as
+    /// requests kept accumulating unreturned buffers).
+    #[test]
+    fn many_sequential_requests_reuse_the_registered_buffer_pool() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_uring_bufpool_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp webroot");
+        std::fs::write(dir.join("small.txt"), b"pooled").expect("write small.txt");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        config.port = port as i32;
+        // Default registered_buffer_count is 256 -- run more requests
+        // than that so a leaked buffer would eventually exhaust the
+        // pool.
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        for _ in 0..300 {
+            let mut connected = None;
+            for _ in 0..50 {
+                match StdTcpStream::connect(("127.0.0.1", port)) {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+            let mut stream = connected.expect("worker should eventually accept a connection");
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).expect("set read timeout");
+            stream.write_all(b"GET /small.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write request");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read response to EOF");
+            let response_text = String::from_utf8_lossy(&response);
+            assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200, got: {response_text:?}");
+            assert!(response_text.ends_with("pooled"), "expected the file's body, got: {response_text:?}");
+        }
+
+        pool.shutdown();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn keep_alive_connection_serves_multiple_requests_over_real_tcp() {
         let port = {

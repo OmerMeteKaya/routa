@@ -279,6 +279,16 @@ pub struct Connection {
     /// arm). `None` whenever no SendZc is currently between its two
     /// completions on this connection.
     pub pending_send_zc_result: Option<u32>,
+    /// The registered buffer index backing this connection's current
+    /// in-flight `ReadFixed` recv, if it's using one (see
+    /// `submit_recv`'s own doc comment on the ReadFixed/Recv choice).
+    /// Returned to the worker's `RegisteredBufferPool` once the recv
+    /// completes (or the connection is torn down) -- see
+    /// `OP_TAG_RECV`'s own completion arm. `None` whenever the most
+    /// recent (or current) recv used an ordinary (non-fixed) `Recv`
+    /// instead, which reads directly into `recv_buf` and has no
+    /// pool-owned buffer to return.
+    pub pending_recv_buf_index: Option<u16>,
 }
 
 /// The pipe fd pair (and current relay phase) backing one in-flight
@@ -330,6 +340,7 @@ impl Connection {
             pending_splice: None,
             send_zc_supported: false,
             pending_send_zc_result: None,
+            pending_recv_buf_index: None,
         }
     }
 
