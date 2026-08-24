@@ -259,6 +259,26 @@ pub struct Connection {
     /// send path, since splice can't see through TLS's userspace
     /// encryption step).
     pub pending_splice: Option<PendingSplice>,
+    /// Whether this worker's kernel supports `SendZc` -- copied in at
+    /// construction time from the worker-level probe result (see
+    /// `uring_backend::probe_send_zc_support`) rather than re-probed
+    /// per connection, since the answer is identical for every
+    /// connection a given worker ever drives and re-probing per
+    /// connection would be pure overhead for a value that never
+    /// changes during the worker's lifetime. Read by `submit_send` to
+    /// decide between `Send` and `SendZc` for a given write (see that
+    /// function's own doc comment for the size threshold).
+    pub send_zc_supported: bool,
+    /// The byte count reported by a `SendZc` SQE's first completion
+    /// (the one carrying `IORING_CQE_F_MORE`) -- held here until the
+    /// matching second completion (carrying `IORING_CQE_F_NOTIF`,
+    /// which reports the kernel is done reading the send buffer)
+    /// arrives, since only that second completion makes it safe to
+    /// treat the transfer as settled (consume write_buf, decide
+    /// fully_flushed, etc. -- see OP_TAG_SEND_ZC's own completion
+    /// arm). `None` whenever no SendZc is currently between its two
+    /// completions on this connection.
+    pub pending_send_zc_result: Option<u32>,
 }
 
 /// The pipe fd pair (and current relay phase) backing one in-flight
@@ -308,6 +328,8 @@ impl Connection {
             pending_timeout: None,
             generation,
             pending_splice: None,
+            send_zc_supported: false,
+            pending_send_zc_result: None,
         }
     }
 

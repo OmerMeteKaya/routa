@@ -129,6 +129,11 @@ const OP_TAG_SPLICE_TO_PIPE: u64 = 7;
 /// moving however many bytes the matching `OP_TAG_SPLICE_TO_PIPE`
 /// completion reported were placed into the pipe.
 const OP_TAG_SPLICE_TO_SOCKET: u64 = 8;
+/// A `SendZc` (zero-copy send) SQE -- see `submit_send`'s own doc
+/// comment for the size threshold that decides `Send` vs `SendZc`,
+/// and this tag's own completion arm for the two-CQE (MORE, then
+/// NOTIF) lifecycle SendZc requires that ordinary `Send` doesn't.
+const OP_TAG_SEND_ZC: u64 = 9;
 
 /// The listener accept SQE has no associated connection slot and is
 /// submitted exactly once per worker (re-armed in place, never
@@ -307,6 +312,26 @@ fn create_ring_and_check_support(ring_entries: u32) -> Result<IoUring, String> {
         ));
     }
     Ok(ring)
+}
+
+/// Probes whether the running kernel's io_uring supports `SendZc`
+/// (`IORING_OP_SEND_ZC`, stabilized in Linux 6.1) -- unlike the
+/// opcodes `create_ring_and_check_support` checks, SendZc is an
+/// optional optimization this backend degrades gracefully without
+/// (see `submit_send`'s own doc comment on its size-thresholded
+/// SendZc/Send choice), not a hard requirement that should refuse to
+/// start the worker if missing. A dedicated probe call, separate from
+/// the one `create_ring_and_check_support` already made, since a
+/// `Probe` snapshot is a one-time registration against the kernel's
+/// current opcode table -- reusing the same probe object would need
+/// threading it out of that function's own scope for a single extra
+/// check this rarely-changing capability doesn't warrant.
+fn probe_send_zc_support(ring: &IoUring) -> bool {
+    let mut probe = Probe::new();
+    if ring.submitter().register_probe(&mut probe).is_err() {
+        return false;
+    }
+    probe.is_supported(opcode::SendZc::CODE)
 }
 
 /// Submits the listener's multishot accept SQE. Called once at
@@ -528,6 +553,7 @@ fn retry_or_fail_proxy_attempt(
     mut attempt_state: crate::core::conn::protocol::ProxyAttemptState,
     recv_buf_size: usize,
     worker_id: usize,
+    send_zc_supported: bool,
 ) {
     let max_attempts = 1 + attempt_state.pending.lb.config.max_retries.max(0) as u32;
     let downstream_generation = connections[downstream_slab_index].generation;
@@ -553,6 +579,7 @@ fn retry_or_fail_proxy_attempt(
                         Arc::clone(&attempt_state.pending.lb.pool),
                         read_write_timeouts,
                     );
+                    upstream_conn.send_zc_supported = send_zc_supported;
                     upstream_conn.role = ConnectionRole::Upstream {
                         node: Arc::clone(&node),
                         pool: Arc::clone(&attempt_state.pending.lb.pool),
@@ -834,6 +861,215 @@ impl Drop for PipePool {
     }
 }
 
+/// Handles a settled Send completion -- shared by OP_TAG_SEND
+/// (ordinary Send, one CQE) and OP_TAG_SEND_ZC's own NOTIF arm
+/// (SendZc, whose second completion is the point its transfer is
+/// actually settled -- see that arm's own doc comment). `result`
+/// is the settled byte count (already resolved from whichever of
+/// the two completions carries it for its own opcode).
+fn handle_send_completion(
+    worker: &EventLoopWorker,
+    worker_id: usize,
+    ring: &mut IoUring,
+    connections: &mut Slab<Connection>,
+    slab_index: usize,
+    completion_generation: u32,
+    result: i32,
+    pipe_pool: &mut PipePool,
+) {
+                        if !connections.contains(slab_index) {
+                            return;
+                        }
+                        if connections[slab_index].generation != completion_generation {
+                            return;
+                        }
+                        if result < 0 {
+                            cancel_outstanding_operations(ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            return;
+                        }
+
+                        let n = result as usize;
+
+                        // A TLS handshake's own Send (see
+                        // submit_tls_send) drains MemoryTlsIo::outgoing
+                        // directly rather than going through any
+                        // protocol's write_buf -- the connection is
+                        // still ConnectionProtocol::Handshaking at this
+                        // point (ALPN hasn't decided Http1 vs Http2
+                        // yet), so this has to be handled before the
+                        // protocol-based dispatch below, which would
+                        // otherwise treat Handshaking as an
+                        // unrecognized state and incorrectly tear the
+                        // connection down mid-handshake.
+                        let _is_tls_snapshot = connections[slab_index].transport.is_tls();
+                        let _protocol_str = match &connections[slab_index].protocol {
+                            ConnectionProtocol::Handshaking => "Handshaking",
+                            ConnectionProtocol::Http1(_) => "Http1",
+                            ConnectionProtocol::Http2(_) => "Http2",
+                            ConnectionProtocol::WebSocket(_) => "WebSocket",
+                            ConnectionProtocol::UpstreamH2(_) => "UpstreamH2",
+                        };
+                        if connections[slab_index].transport.is_tls() && matches!(connections[slab_index].protocol, ConnectionProtocol::Handshaking) {
+                            let still_pending = {
+                                let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
+                                io.outgoing.consume(n);
+                                !io.outgoing.is_empty()
+                            };
+                            if still_pending {
+                                if let Err(reason) = submit_tls_send(ring, connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit remainder of a tls handshake send");
+                                    cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
+                            } else if let Err(reason) = submit_recv(ring, connections, slab_index) {
+                                tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after a tls handshake send");
+                                cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
+                            return;
+                        }
+
+                        // TLS connections already had their
+                        // write_buf consumed (against the plaintext
+                        // length, not this completion's ciphertext
+                        // length `n`) inside submit_send itself -- see
+                        // its own doc comment for why the two lengths
+                        // don't correspond and consuming here a second
+                        // time, against the wrong unit, would corrupt
+                        // write_buf's accounting. What DOES need to
+                        // happen here for a TLS connection is
+                        // consuming `n` bytes from MemoryTlsIo::outgoing
+                        // itself -- the real ciphertext this Send just
+                        // transmitted -- so the next submit_send call
+                        // doesn't re-send bytes the peer already
+                        // received (which is exactly what a real
+                        // client sees as TLS record corruption /
+                        // DecryptError, since it's being handed the
+                        // same ciphertext bytes twice, out of their
+                        // correct position in the TLS record stream).
+                        if connections[slab_index].transport.is_tls() {
+                            let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
+                            io.outgoing.consume(n);
+                        } else {
+                            consume_active_write_buf(&mut connections[slab_index].protocol, n);
+                        }
+
+                        // "Should this connection close once its write
+                        // buffer is fully flushed" means something
+                        // different per protocol: HTTP/1.1 has an
+                        // explicit keep_alive flag (a request or its
+                        // response may have asked for the connection to
+                        // close); WebSocket has no such per-message
+                        // flag -- a WS connection is expected to stay
+                        // open until its own close handshake completes,
+                        // which process_websocket_input already
+                        // reflected by returning FlushThenClose rather
+                        // than something this arm needs to re-derive.
+                        // Tracking "this send was the tail end of a
+                        // close-triggering flush" would need its own
+                        // state; for now, a WS connection whose write
+                        // buffer just fully drained always goes back to
+                        // reading rather than closing -- correct for
+                        // every case except the close-handshake
+                        // completion's own final send, a gap called out
+                        // here rather than silently accepted.
+                        let already_marked_closing = connections[slab_index].closing;
+                        let (fully_flushed, should_close_after_flush) = match &connections[slab_index].protocol {
+                            ConnectionProtocol::Http1(h1) => (h1.write_buf.is_empty(), !h1.keep_alive),
+                            ConnectionProtocol::WebSocket(ws) => (ws.write_buf.is_empty(), already_marked_closing),
+                            ConnectionProtocol::Http2(h2) => {
+                                (h2.write_buf.is_empty(), already_marked_closing)
+                            }
+                            ConnectionProtocol::UpstreamH2(h2c) => {
+                                // Never independently closed here --
+                                // an UpstreamH2 connection's lifetime
+                                // is driven by idle-pool/circuit-breaker
+                                // logic elsewhere (mirroring how a
+                                // plain HTTP/1.1 upstream connection's
+                                // own reuse-or-close decision is made
+                                // once a response completes), not by
+                                // this generic flush-completion path.
+                                (!h2c.has_pending_write(), false)
+                            }
+                            ConnectionProtocol::Handshaking => {
+                                // A non-TLS connection should never
+                                // have an outstanding Send while still
+                                // Handshaking (plaintext connections
+                                // skip Handshaking entirely -- see the
+                                // accept arm) -- reaching this means
+                                // something unexpected happened, not a
+                                // normal TLS handshake send (handled
+                                // above).
+                                cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                                return;
+                            }
+                        };
+
+                        let has_pending_file = matches!(&connections[slab_index].protocol, ConnectionProtocol::Http1(h1) if h1.pending_file.is_some());
+                        if fully_flushed && should_close_after_flush && !has_pending_file {
+                            cancel_outstanding_operations(ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            return;
+                        }
+
+                        if !fully_flushed {
+                            // A partial write -- send the rest of the
+                            // same buffer before doing anything else.
+                            if let Err(reason) = submit_send(ring, connections, slab_index) {
+                                tracing::warn!(worker_id, %reason, "failed to submit remainder of a partially-sent buffer");
+                                cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
+                        } else if matches!(&connections[slab_index].protocol, ConnectionProtocol::Http1(h1) if h1.pending_file.is_some()) {
+                            // The response's headers just finished
+                            // flushing and a PendingFileSend is
+                            // waiting behind them -- relay its bytes
+                            // over a pooled pipe via two chained
+                            // Splice SQEs (see submit_splice_to_pipe's
+                            // own doc comment) instead of falling
+                            // through to a Recv, which is what every
+                            // other branch here does once write_buf
+                            // is empty.
+                            if let Err(reason) = submit_splice_to_pipe(ring, connections, pipe_pool, slab_index) {
+                                tracing::warn!(worker_id, %reason, "failed to submit splice-to-pipe for a pending file body");
+                                cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
+                        } else {
+                            // Fully flushed, and either HTTP/1.1
+                            // keep-alive or WebSocket (which always
+                            // goes back to reading here -- see this
+                            // arm's own comment). Before submitting a
+                            // new Recv, check whether this connection
+                            // is HTTP/1.1 and its read_buf already
+                            // holds a further pipelined request (RFC
+                            // 9112 9.4: a client may send a second
+                            // request without waiting for the first
+                            // response, so both can legitimately have
+                            // arrived in the same earlier Recv
+                            // completion, well before this Send even
+                            // finished). Submitting a fresh Recv in
+                            // that case would wait for bytes the peer
+                            // has no reason to send again -- it
+                            // already sent them -- stalling the
+                            // connection forever from the peer's point
+                            // of view. Re-running process_http1_read_buf
+                            // against what's already buffered is what
+                            // mio_backend's own drive_http1 does
+                            // implicitly (its read/dispatch loop
+                            // always re-checks read_buf before
+                            // returning to wait on the poller); this
+                            // backend needs to do that check
+                            // explicitly, since each completion here
+                            // is handled once and then control returns
+                            // to the main event loop rather than
+                            // looping internally.
+                            drain_pipelined_request_or_recv(worker, worker_id, ring, connections, slab_index, completion_generation);
+                        }
+}
+
 fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     let write_timeout = match &conn.role {
@@ -909,6 +1145,33 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
         return Ok(());
     }
 
+    // SendZc trades a small per-call fixed overhead (an extra CQE:
+    // the kernel reports the transfer's own result via one CQE
+    // carrying IORING_CQE_F_MORE, then a second, separate "notify"
+    // CQE carrying IORING_CQE_F_NOTIF once the kernel is done reading
+    // the buffer -- see OP_TAG_SEND_ZC's own completion arm) for
+    // avoiding a userspace copy of the buffer into the kernel. That
+    // trade only pays off once the copy it avoids is large enough to
+    // matter more than the extra CQE round-trip -- below this
+    // threshold, an ordinary Send (a single completion, no notify
+    // bookkeeping) is both simpler and faster in practice.
+    const SEND_ZC_MIN_LEN: usize = 16 * 1024;
+    if conn.send_zc_supported && pending.len() >= SEND_ZC_MIN_LEN {
+        let mut send = opcode::SendZc::new(types::Fd(conn.transport.fd()), pending.as_ptr(), pending.len() as u32).build();
+        if write_timeout.is_some() {
+            send = send.flags(squeue::Flags::IO_LINK);
+        }
+        let send = send.user_data(make_user_data(OP_TAG_SEND_ZC, conn.generation, slab_index));
+        unsafe {
+            ring.submission()
+                .push(&send)
+                .map_err(|_| "failed to push send_zc SQE -- submission queue unexpectedly full".to_string())?;
+        }
+        if let Some(timeout) = write_timeout {
+            push_link_timeout(ring, conn, slab_index, timeout)?;
+        }
+        return Ok(());
+    }
     let mut send = opcode::Send::new(types::Fd(conn.transport.fd()), pending.as_ptr(), pending.len() as u32).build();
     if write_timeout.is_some() {
         send = send.flags(squeue::Flags::IO_LINK);
@@ -1159,6 +1422,11 @@ impl WorkerBody for EventLoopWorker {
         // pipe(2) and closing both ends on every single file response
         // -- see PipePool's own doc comment.
         let mut pipe_pool = PipePool::new();
+        // Probed once per worker rather than per-send -- SendZc
+        // support doesn't change during a worker's lifetime, and a
+        // fresh Probe registration on every large send would be
+        // pure overhead for a value that's already known.
+        let send_zc_supported = probe_send_zc_support(&ring);
         // Parallel to `connections`: `generations[i]` is the
         // generation currently valid for slab index `i`, bumped every
         // time that slot is reused for a new connection -- see
@@ -1282,6 +1550,7 @@ impl WorkerBody for EventLoopWorker {
                         // equivalent plaintext path -- see
                         // decide_plaintext_protocol's own doc comment.
                         let mut conn = Connection::new(accepted_fd as u64, transport, remote_addr, self.recv_buf_size, generation);
+                        conn.send_zc_supported = send_zc_supported;
                         // TLS connections stay Handshaking (the
                         // default Connection::new starts with) until
                         // the handshake completes and ALPN decides
@@ -1368,7 +1637,7 @@ impl WorkerBody for EventLoopWorker {
                                         None
                                     };
                                     if let Some(attempt_state) = attempt_state {
-                                        retry_or_fail_proxy_attempt(&mut ring, &mut connections, &mut generations, downstream_slab_index, attempt_state, self.recv_buf_size, worker_id);
+                                        retry_or_fail_proxy_attempt(&mut ring, &mut connections, &mut generations, downstream_slab_index, attempt_state, self.recv_buf_size, worker_id, send_zc_supported);
                                     }
                                 }
                             }
@@ -2514,6 +2783,7 @@ impl WorkerBody for EventLoopWorker {
                                     Arc::clone(&pending.lb.pool),
                                     read_write_timeouts,
                                 );
+                                upstream_conn.send_zc_supported = send_zc_supported;
                                 upstream_conn.role = ConnectionRole::Upstream {
                                     node: Arc::clone(&node),
                                     pool: Arc::clone(&pending.lb.pool),
@@ -2552,197 +2822,7 @@ impl WorkerBody for EventLoopWorker {
                     }
 
                     OP_TAG_SEND => {
-                        if !connections.contains(slab_index) {
-                            continue;
-                        }
-                        if connections[slab_index].generation != completion_generation {
-                            continue;
-                        }
-                        if result < 0 {
-                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                            connections.remove(slab_index);
-                            continue;
-                        }
-
-                        let n = result as usize;
-
-                        // A TLS handshake's own Send (see
-                        // submit_tls_send) drains MemoryTlsIo::outgoing
-                        // directly rather than going through any
-                        // protocol's write_buf -- the connection is
-                        // still ConnectionProtocol::Handshaking at this
-                        // point (ALPN hasn't decided Http1 vs Http2
-                        // yet), so this has to be handled before the
-                        // protocol-based dispatch below, which would
-                        // otherwise treat Handshaking as an
-                        // unrecognized state and incorrectly tear the
-                        // connection down mid-handshake.
-                        let _is_tls_snapshot = connections[slab_index].transport.is_tls();
-                        let _protocol_str = match &connections[slab_index].protocol {
-                            ConnectionProtocol::Handshaking => "Handshaking",
-                            ConnectionProtocol::Http1(_) => "Http1",
-                            ConnectionProtocol::Http2(_) => "Http2",
-                            ConnectionProtocol::WebSocket(_) => "WebSocket",
-                            ConnectionProtocol::UpstreamH2(_) => "UpstreamH2",
-                        };
-                        if connections[slab_index].transport.is_tls() && matches!(connections[slab_index].protocol, ConnectionProtocol::Handshaking) {
-                            let still_pending = {
-                                let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
-                                io.outgoing.consume(n);
-                                !io.outgoing.is_empty()
-                            };
-                            if still_pending {
-                                if let Err(reason) = submit_tls_send(&mut ring, &mut connections, slab_index) {
-                                    tracing::warn!(worker_id, %reason, "failed to submit remainder of a tls handshake send");
-                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                    connections.remove(slab_index);
-                                }
-                            } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index) {
-                                tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after a tls handshake send");
-                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                connections.remove(slab_index);
-                            }
-                            continue;
-                        }
-
-                        // TLS connections already had their
-                        // write_buf consumed (against the plaintext
-                        // length, not this completion's ciphertext
-                        // length `n`) inside submit_send itself -- see
-                        // its own doc comment for why the two lengths
-                        // don't correspond and consuming here a second
-                        // time, against the wrong unit, would corrupt
-                        // write_buf's accounting. What DOES need to
-                        // happen here for a TLS connection is
-                        // consuming `n` bytes from MemoryTlsIo::outgoing
-                        // itself -- the real ciphertext this Send just
-                        // transmitted -- so the next submit_send call
-                        // doesn't re-send bytes the peer already
-                        // received (which is exactly what a real
-                        // client sees as TLS record corruption /
-                        // DecryptError, since it's being handed the
-                        // same ciphertext bytes twice, out of their
-                        // correct position in the TLS record stream).
-                        if connections[slab_index].transport.is_tls() {
-                            let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
-                            io.outgoing.consume(n);
-                        } else {
-                            consume_active_write_buf(&mut connections[slab_index].protocol, n);
-                        }
-
-                        // "Should this connection close once its write
-                        // buffer is fully flushed" means something
-                        // different per protocol: HTTP/1.1 has an
-                        // explicit keep_alive flag (a request or its
-                        // response may have asked for the connection to
-                        // close); WebSocket has no such per-message
-                        // flag -- a WS connection is expected to stay
-                        // open until its own close handshake completes,
-                        // which process_websocket_input already
-                        // reflected by returning FlushThenClose rather
-                        // than something this arm needs to re-derive.
-                        // Tracking "this send was the tail end of a
-                        // close-triggering flush" would need its own
-                        // state; for now, a WS connection whose write
-                        // buffer just fully drained always goes back to
-                        // reading rather than closing -- correct for
-                        // every case except the close-handshake
-                        // completion's own final send, a gap called out
-                        // here rather than silently accepted.
-                        let already_marked_closing = connections[slab_index].closing;
-                        let (fully_flushed, should_close_after_flush) = match &connections[slab_index].protocol {
-                            ConnectionProtocol::Http1(h1) => (h1.write_buf.is_empty(), !h1.keep_alive),
-                            ConnectionProtocol::WebSocket(ws) => (ws.write_buf.is_empty(), already_marked_closing),
-                            ConnectionProtocol::Http2(h2) => {
-                                (h2.write_buf.is_empty(), already_marked_closing)
-                            }
-                            ConnectionProtocol::UpstreamH2(h2c) => {
-                                // Never independently closed here --
-                                // an UpstreamH2 connection's lifetime
-                                // is driven by idle-pool/circuit-breaker
-                                // logic elsewhere (mirroring how a
-                                // plain HTTP/1.1 upstream connection's
-                                // own reuse-or-close decision is made
-                                // once a response completes), not by
-                                // this generic flush-completion path.
-                                (!h2c.has_pending_write(), false)
-                            }
-                            ConnectionProtocol::Handshaking => {
-                                // A non-TLS connection should never
-                                // have an outstanding Send while still
-                                // Handshaking (plaintext connections
-                                // skip Handshaking entirely -- see the
-                                // accept arm) -- reaching this means
-                                // something unexpected happened, not a
-                                // normal TLS handshake send (handled
-                                // above).
-                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                connections.remove(slab_index);
-                                continue;
-                            }
-                        };
-
-                        let has_pending_file = matches!(&connections[slab_index].protocol, ConnectionProtocol::Http1(h1) if h1.pending_file.is_some());
-                        if fully_flushed && should_close_after_flush && !has_pending_file {
-                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                            connections.remove(slab_index);
-                            continue;
-                        }
-
-                        if !fully_flushed {
-                            // A partial write -- send the rest of the
-                            // same buffer before doing anything else.
-                            if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
-                                tracing::warn!(worker_id, %reason, "failed to submit remainder of a partially-sent buffer");
-                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                connections.remove(slab_index);
-                            }
-                        } else if matches!(&connections[slab_index].protocol, ConnectionProtocol::Http1(h1) if h1.pending_file.is_some()) {
-                            // The response's headers just finished
-                            // flushing and a PendingFileSend is
-                            // waiting behind them -- relay its bytes
-                            // over a pooled pipe via two chained
-                            // Splice SQEs (see submit_splice_to_pipe's
-                            // own doc comment) instead of falling
-                            // through to a Recv, which is what every
-                            // other branch here does once write_buf
-                            // is empty.
-                            if let Err(reason) = submit_splice_to_pipe(&mut ring, &mut connections, &mut pipe_pool, slab_index) {
-                                tracing::warn!(worker_id, %reason, "failed to submit splice-to-pipe for a pending file body");
-                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                connections.remove(slab_index);
-                            }
-                        } else {
-                            // Fully flushed, and either HTTP/1.1
-                            // keep-alive or WebSocket (which always
-                            // goes back to reading here -- see this
-                            // arm's own comment). Before submitting a
-                            // new Recv, check whether this connection
-                            // is HTTP/1.1 and its read_buf already
-                            // holds a further pipelined request (RFC
-                            // 9112 9.4: a client may send a second
-                            // request without waiting for the first
-                            // response, so both can legitimately have
-                            // arrived in the same earlier Recv
-                            // completion, well before this Send even
-                            // finished). Submitting a fresh Recv in
-                            // that case would wait for bytes the peer
-                            // has no reason to send again -- it
-                            // already sent them -- stalling the
-                            // connection forever from the peer's point
-                            // of view. Re-running process_http1_read_buf
-                            // against what's already buffered is what
-                            // mio_backend's own drive_http1 does
-                            // implicitly (its read/dispatch loop
-                            // always re-checks read_buf before
-                            // returning to wait on the poller); this
-                            // backend needs to do that check
-                            // explicitly, since each completion here
-                            // is handled once and then control returns
-                            // to the main event loop rather than
-                            // looping internally.
-                            drain_pipelined_request_or_recv(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation);
-                        }
+                        handle_send_completion(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, result, &mut pipe_pool);
                     }
                     OP_TAG_CONNECT => {
                         if !connections.contains(slab_index) {
@@ -2785,7 +2865,7 @@ impl WorkerBody for EventLoopWorker {
                                         None
                                     };
                                     if let Some(attempt_state) = attempt_state {
-                                        retry_or_fail_proxy_attempt(&mut ring, &mut connections, &mut generations, downstream_slab_index, attempt_state, self.recv_buf_size, worker_id);
+                                        retry_or_fail_proxy_attempt(&mut ring, &mut connections, &mut generations, downstream_slab_index, attempt_state, self.recv_buf_size, worker_id, send_zc_supported);
                                     }
                                 }
                             }
@@ -2923,6 +3003,47 @@ impl WorkerBody for EventLoopWorker {
                         }
                     }
 
+                    OP_TAG_SEND_ZC => {
+                        if !connections.contains(slab_index) || connections[slab_index].generation != completion_generation {
+                            continue;
+                        }
+                        if !io_uring::cqueue::more(flags) {
+                            // The NOTIF completion -- the kernel is
+                            // done reading the send buffer, so the
+                            // transfer this SendZc represents is now
+                            // actually settled. The byte count itself
+                            // arrived on the *first* (MORE) completion
+                            // and was stashed in pending_send_zc_result
+                            // below; NOTIF's own result carries no
+                            // further meaning beyond "safe to proceed
+                            // now" (per SendZc's own semantics -- see
+                            // submit_send's doc comment on the two-CQE
+                            // lifecycle this opcode requires).
+                            let Some(n) = connections[slab_index].pending_send_zc_result.take() else {
+                                tracing::warn!(worker_id, slab_index, "received a SendZc NOTIF completion with no matching pending result -- closing");
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                                continue;
+                            };
+                            handle_send_completion(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, n as i32, &mut pipe_pool);
+                            continue;
+                        }
+                        // The first (MORE) completion -- result is the
+                        // transfer's own byte count (or a negative
+                        // errno), but the buffer isn't safe to treat
+                        // as settled until the matching NOTIF
+                        // completion above arrives. A negative result
+                        // here is a real failure (not merely "more
+                        // data coming"), so it's handled immediately
+                        // rather than deferred to NOTIF, mirroring how
+                        // OP_TAG_SEND itself treats a negative result.
+                        if result < 0 {
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        }
+                        connections[slab_index].pending_send_zc_result = Some(result as u32);
+                    }
                     OP_TAG_SPLICE_TO_PIPE => {
                         if !connections.contains(slab_index) || connections[slab_index].generation != completion_generation {
                             continue;
@@ -3900,6 +4021,61 @@ mod tests {
     /// completion or a later one on the same connection) alive across
     /// requests, rather than requiring a fresh connection each time.
     /// Mirrors mio_backend's own equivalent test.
+    /// A GET request for an mmap'd (in-memory body, not
+    /// PendingFileSend/splice) static file whose serialized response
+    /// exceeds submit_send's own SendZc size threshold -- proves the
+    /// SendZc path (see OP_TAG_SEND_ZC's own completion arm and its
+    /// two-CQE MORE/NOTIF lifecycle) delivers the complete,
+    /// byte-correct body, not just that it compiles.
+    #[test]
+    fn serves_in_memory_response_via_send_zc() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_uring_send_zc_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp webroot");
+        // Above submit_send's 16KiB SendZc threshold but below the
+        // default 64KiB mmap_threshold, so this takes the mmap'd
+        // in-memory body path (a real write_buf send) rather than a
+        // PendingFileSend/splice relay -- see static_files::serve's
+        // own `lookup.mapped` branch.
+        let body: Vec<u8> = (0..32_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("mid.bin"), &body).expect("write mid.bin");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+        let mut connected = None;
+        for _ in 0..50 {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let mut stream = connected.expect("worker should eventually accept a connection");
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+        stream.write_all(b"GET /mid.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write request");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read response to EOF");
+        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(response.len());
+        let headers = String::from_utf8_lossy(&response[..header_end]);
+        assert!(headers.starts_with("HTTP/1.1 200"), "expected a 200, got: {headers:?}");
+        assert_eq!(response[header_end..].len(), body.len(), "SendZc response body length mismatch");
+        assert_eq!(&response[header_end..], &body[..], "SendZc response body content mismatch");
+
+        pool.shutdown();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     /// A GET request for a file above FileCache's mmap_threshold --
     /// proves this backend's own Splice-based relay (see
