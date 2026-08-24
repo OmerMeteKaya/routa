@@ -12,6 +12,8 @@
 mod mio_backend;
 #[cfg(not(feature = "io_uring"))]
 pub use mio_backend::*;
+#[cfg(not(feature = "io_uring"))]
+mod mio_upstream;
 
 #[cfg(feature = "io_uring")]
 mod uring_kernel_check;

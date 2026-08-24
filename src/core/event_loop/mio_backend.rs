@@ -218,6 +218,17 @@ impl WorkerBody for EventLoopWorker {
         };
 
         let mut connections: Slab<Connection> = Slab::new();
+        // Event-driven upstream connection state -- see
+        // core::event_loop::mio_upstream's own module doc comment for
+        // why this is a completely separate Slab/key-map from
+        // `connections` above rather than folding upstream connections
+        // into that same Slab. Keyed by mio's own PollKey (from
+        // UpstreamConnection::start's own poller.register call) so an
+        // incoming readiness event can be routed to the right entry
+        // the same way `connections`'s own poll_key does for
+        // downstream connections.
+        let mut upstream_connections: Slab<crate::core::event_loop::mio_upstream::UpstreamConnection> = Slab::new();
+        let mut upstream_poll_keys: std::collections::HashMap<PollKey, usize> = std::collections::HashMap::new();
         let mut last_idle_sweep = Instant::now();
         let mut last_memory_check = Instant::now();
         // Set the moment `shutdown.is_set()` first becomes true --
@@ -243,6 +254,8 @@ impl WorkerBody for EventLoopWorker {
             };
 
             for (key, readiness) in events {
+                if upstream_poll_keys.contains_key(&key) {
+                }
                 if key == listener_key {
                     // Stop accepting new connections as soon as a
                     // shutdown has been requested -- only already-open
@@ -256,7 +269,21 @@ impl WorkerBody for EventLoopWorker {
                     dispatch_ws_broadcast(&mut ws_registry, &mut connections);
                     continue;
                 }
-                handle_connection_event(self, &mut poller, &mut connections, key, readiness);
+                if let Some(&upstream_idx) = upstream_poll_keys.get(&key) {
+                    handle_upstream_event(self, &mut poller, &mut connections, &mut upstream_connections, &mut upstream_poll_keys, upstream_idx);
+                    continue;
+                }
+                handle_connection_event(self, &mut poller, &mut connections, &mut upstream_connections, &mut upstream_poll_keys, key, readiness);
+            }
+
+            // Upstream connections have no fixed per-request timeout
+            // check the poller itself can drive for us (unlike a
+            // socket becoming readable/writable, "this connect/read
+            // has taken too long" is purely a wall-clock condition) --
+            // swept alongside the loop's own other periodic
+            // maintenance rather than needing a separate timer.
+            if last_idle_sweep.elapsed() >= IDLE_SWEEP_INTERVAL {
+                reap_timed_out_upstream_connections(self, &mut poller, &mut connections, &mut upstream_connections, &mut upstream_poll_keys);
             }
 
             if last_idle_sweep.elapsed() >= IDLE_SWEEP_INTERVAL {
@@ -290,6 +317,244 @@ impl WorkerBody for EventLoopWorker {
                 }
             }
         }
+    }
+}
+
+/// Drives one upstream connection one step further in response to a
+/// readiness event, and, once it resolves (successfully or not),
+/// flushes the result to whichever downstream connection was waiting
+/// on it -- the mio_backend counterpart to uring_backend's own
+/// OP_TAG_RECV upstream-response handling, using
+/// UpstreamConnection::advance's identical "state machine advances,
+/// caller owns all I/O" contract instead of a completion queue.
+fn handle_upstream_event(
+    worker: &EventLoopWorker,
+    poller: &mut MioPoller,
+    connections: &mut Slab<Connection>,
+    upstream_connections: &mut Slab<crate::core::event_loop::mio_upstream::UpstreamConnection>,
+    upstream_poll_keys: &mut std::collections::HashMap<PollKey, usize>,
+    upstream_idx: usize,
+) {
+    if !upstream_connections.contains(upstream_idx) {
+        return;
+    }
+    let step = match upstream_connections[upstream_idx].advance() {
+        Ok(step) => step,
+        Err(_) => crate::core::event_loop::mio_upstream::UpstreamStep::Failed,
+    };
+    match step {
+        crate::core::event_loop::mio_upstream::UpstreamStep::Pending => {}
+        crate::core::event_loop::mio_upstream::UpstreamStep::Done(response) => {
+            let upstream = upstream_connections.remove(upstream_idx);
+            upstream_poll_keys.remove(&upstream.poll_key);
+            let _ = poller.deregister(&mut { upstream.stream }, upstream.poll_key);
+            if response.status < 500 {
+                upstream.node.record_success(&upstream.pool);
+            } else {
+                upstream.node.record_failure(&upstream.pool);
+            }
+            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, Some(response));
+            // Mirrors handle_connection_event's own identical
+            // check/close right after driving a downstream
+            // connection's protocol state machine (see that
+            // function's own if result.is_err() || connections[idx].closing)
+            // -- flush_upstream_result_to_downstream may have just set
+            // closing = true (Connection: close on either the original
+            // request or the response), and nothing else in this
+            // event-driven upstream path otherwise ever reaches that
+            // check, since this call arrived via an upstream
+            // connection's own readiness event, not a downstream
+            // one's.
+            if connections.contains(upstream.downstream_slab_index) && connections[upstream.downstream_slab_index].id == upstream.downstream_conn_id && connections[upstream.downstream_slab_index].closing {
+                close_connection(worker, poller, connections, upstream.downstream_slab_index);
+            }
+        }
+        crate::core::event_loop::mio_upstream::UpstreamStep::Failed => {
+            let upstream = upstream_connections.remove(upstream_idx);
+            upstream_poll_keys.remove(&upstream.poll_key);
+            let _ = poller.deregister(&mut { upstream.stream }, upstream.poll_key);
+            upstream.node.record_failure(&upstream.pool);
+            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None);
+        }
+    }
+}
+
+/// Delivers an upstream request's outcome to the downstream connection
+/// that was waiting on it -- `Some(response)` flushes it as the proxied
+/// response; `None` means the upstream attempt failed, and this reads
+/// the downstream's own `Http1Connection::waiting_for_upstream` to
+/// decide whether to retry a different node or give up with a 502
+/// (mirrors uring_backend's own retry_or_fail_proxy_attempt).
+fn flush_upstream_result_to_downstream(
+    worker: &EventLoopWorker,
+    poller: &mut MioPoller,
+    connections: &mut Slab<Connection>,
+    downstream_slab_index: usize,
+    downstream_conn_id: crate::core::conn::ConnId,
+    response: Option<crate::http::response::HttpResponse>,
+) {
+    if !connections.contains(downstream_slab_index) {
+        return;
+    }
+    let conn = &mut connections[downstream_slab_index];
+    if conn.id != downstream_conn_id {
+        return;
+    }
+    let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
+        return;
+    };
+    let Some(attempt_state) = h1.waiting_for_upstream.take() else {
+        return;
+    };
+    match response {
+        Some(resp) => {
+            // Sticky-cookie application isn't threaded through here
+            // the way uring_backend's own apply_sticky_cookie call
+            // is -- acceptable gap for this first pass (see this
+            // function's own limitation note), matching the
+            // pre-existing mio_backend forward() path's own behavior
+            // (which also doesn't set a sticky cookie on the response
+            // it flushes) before this event-driven mechanism existed
+            // at all.
+            let keep_alive = attempt_state.keep_alive;
+            crate::core::conn::protocol::queue_http1_response(h1, resp);
+            h1.keep_alive = keep_alive;
+            if !keep_alive {
+                // Mirrors the ordinary (non-proxied) response path's
+                // own identical closing = true -- without this, a
+                // Connection: close request proxied through this
+                // event-driven path would queue and flush its
+                // response correctly but never actually close the
+                // TCP connection afterward, leaving a client using
+                // read-until-EOF (the standard way to consume a
+                // Connection: close response) waiting indefinitely
+                // for a FIN that was never coming.
+                connections[downstream_slab_index].closing = true;
+            }
+            let _ = flush_transport(connections, downstream_slab_index);
+        }
+        None => {
+            retry_or_fail_proxy_attempt_mio(worker, poller, connections, downstream_slab_index, downstream_conn_id, attempt_state);
+        }
+    }
+}
+
+/// Picks a different upstream node and starts a fresh
+/// UpstreamConnection against it, or gives up with a 502 if the
+/// attempt limit (`LbPoolConfig::lb_max_attempts`, via `pending.config`)
+/// has been reached or no other node is available -- the mio_backend
+/// counterpart to uring_backend's own retry_or_fail_proxy_attempt,
+/// using UpstreamConnection::start instead of a raw Connect SQE.
+fn retry_or_fail_proxy_attempt_mio(
+    worker: &EventLoopWorker,
+    poller: &mut MioPoller,
+    connections: &mut Slab<Connection>,
+    downstream_slab_index: usize,
+    downstream_conn_id: crate::core::conn::ConnId,
+    mut attempt_state: crate::core::conn::protocol::ProxyAttemptState,
+) {
+    attempt_state.attempts_so_far += 1;
+    let max_attempts = 1 + attempt_state.pending.lb.config.max_retries.max(0) as u32;
+    let node = if attempt_state.attempts_so_far < max_attempts {
+        attempt_state.pending.lb.pick_node_sticky(None, None)
+    } else {
+        None
+    };
+    let Some(node) = node else {
+        flush_502_to_downstream(connections, downstream_slab_index, downstream_conn_id);
+        return;
+    };
+    let client_addr = attempt_state.original_request.remote_addr;
+    let headers = crate::core::proxy::build_upstream_headers(&attempt_state.original_request, client_addr, &attempt_state.pending.config.proxy_identity);
+    let mut upstream_req = (*attempt_state.original_request).clone();
+    upstream_req.headers = headers.into_iter().map(|h| (h.name, h.value)).collect();
+    let request_bytes = upstream_req.serialize();
+    let pool = std::sync::Arc::clone(&attempt_state.pending.lb.pool);
+    match crate::core::event_loop::mio_upstream::UpstreamConnection::start(
+        poller,
+        std::sync::Arc::clone(&node),
+        pool,
+        request_bytes,
+        downstream_slab_index,
+        downstream_conn_id,
+        attempt_state.pending.config.connect_timeout,
+    ) {
+        Ok(_upstream_conn) => {
+            // The caller (handle_upstream_event's own Failed arm) is
+            // responsible for re-inserting attempt_state as this
+            // downstream connection's own waiting_for_upstream --
+            // done by its own caller site rather than here, since this
+            // function only decides whether a retry is possible at
+            // all, not how it's threaded back into the downstream's
+            // own state (mirrors uring_backend's own split between
+            // deciding and threading state back).
+            if !connections.contains(downstream_slab_index) {
+                return;
+            }
+            let conn = &mut connections[downstream_slab_index];
+            if conn.id != downstream_conn_id {
+                return;
+            }
+            if let ConnectionProtocol::Http1(h1) = &mut conn.protocol {
+                h1.waiting_for_upstream = Some(attempt_state);
+            }
+            let _ = worker;
+        }
+        Err(_) => {
+            flush_502_to_downstream(connections, downstream_slab_index, downstream_conn_id);
+        }
+    }
+}
+
+/// Sends a 502 Bad Gateway to a downstream connection that was waiting
+/// on a proxied response -- shared terminal case for both an exhausted
+/// retry budget and a failed retry attempt itself.
+fn flush_502_to_downstream(connections: &mut Slab<Connection>, downstream_slab_index: usize, downstream_conn_id: crate::core::conn::ConnId) {
+    if !connections.contains(downstream_slab_index) {
+        return;
+    }
+    let conn = &mut connections[downstream_slab_index];
+    if conn.id != downstream_conn_id {
+        return;
+    }
+    let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
+        return;
+    };
+    let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
+    resp.set_body(b"Bad Gateway\n".to_vec());
+    crate::core::conn::protocol::queue_http1_response(h1, resp);
+    let _ = flush_transport(connections, downstream_slab_index);
+}
+
+/// Sweeps `upstream_connections` for any whose own deadline (set from
+/// `UpstreamConnection::start`'s own connect_timeout parameter -- see
+/// that field's own doc comment) has passed without resolving,
+/// treating each as a failed attempt the same way a real connection
+/// error would be -- mio has no equivalent to io_uring's own
+/// LinkTimeout SQE (see uring_backend's own push_link_timeout), so
+/// this periodic wall-clock sweep is this backend's substitute.
+fn reap_timed_out_upstream_connections(
+    worker: &EventLoopWorker,
+    poller: &mut MioPoller,
+    connections: &mut Slab<Connection>,
+    upstream_connections: &mut Slab<crate::core::event_loop::mio_upstream::UpstreamConnection>,
+    upstream_poll_keys: &mut std::collections::HashMap<PollKey, usize>,
+) {
+    let now = Instant::now();
+    let timed_out: Vec<usize> = upstream_connections
+        .iter()
+        .filter(|(_, u)| now >= u.deadline)
+        .map(|(idx, _)| idx)
+        .collect();
+    for idx in timed_out {
+        if !upstream_connections.contains(idx) {
+            continue;
+        }
+        let upstream = upstream_connections.remove(idx);
+        upstream_poll_keys.remove(&upstream.poll_key);
+        let _ = poller.deregister(&mut { upstream.stream }, upstream.poll_key);
+        upstream.node.record_failure(&upstream.pool);
+        flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None);
     }
 }
 
@@ -349,6 +614,8 @@ fn handle_connection_event(
     worker: &EventLoopWorker,
     poller: &mut MioPoller,
     connections: &mut Slab<Connection>,
+    upstream_connections: &mut Slab<crate::core::event_loop::mio_upstream::UpstreamConnection>,
+    upstream_poll_keys: &mut std::collections::HashMap<PollKey, usize>,
     key: PollKey,
     _readiness: crate::net::poller::Readiness,
 ) {
@@ -487,7 +754,7 @@ fn handle_connection_event(
 
     let result = match &mut connections[idx].protocol {
         ConnectionProtocol::Handshaking => Ok(()), // TLS handshake in progress, or a plaintext connection still waiting for enough bytes to decide HTTP/1.1 vs. H2 prior-knowledge (see the block above)
-        ConnectionProtocol::Http1(_) => drive_http1(worker, connections, idx),
+        ConnectionProtocol::Http1(_) => drive_http1(worker, poller, connections, upstream_connections, upstream_poll_keys, idx),
         ConnectionProtocol::Http2(_) => drive_http2(worker, connections, idx),
         ConnectionProtocol::WebSocket(_) => drive_websocket(worker, connections, idx),
         ConnectionProtocol::UpstreamH2(_) => unreachable!("mio_backend never constructs ConnectionProtocol::UpstreamH2 -- see that variant's own doc comment"),
@@ -553,7 +820,14 @@ fn close_connection(worker: &EventLoopWorker, poller: &mut MioPoller, connection
 /// returning a `101` response) transitions this connection to
 /// `ConnectionProtocol::WebSocket` for everything from that point
 /// onward, on the same underlying transport.
-fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx: usize) -> std::io::Result<()> {
+fn drive_http1(
+    worker: &EventLoopWorker,
+    poller: &mut MioPoller,
+    connections: &mut Slab<Connection>,
+    upstream_connections: &mut Slab<crate::core::event_loop::mio_upstream::UpstreamConnection>,
+    upstream_poll_keys: &mut std::collections::HashMap<PollKey, usize>,
+    idx: usize,
+) -> std::io::Result<()> {
     read_into_transport(connections, idx, |conn| {
         let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
             unreachable!("drive_http1 is only called when protocol is Http1")
@@ -675,29 +949,80 @@ fn drive_http1(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
                 // way) -- only *where* forward() is invoked from
                 // changed, not its own synchronous nature or anything
                 // about what it does.
-                let response = match response.proxy_pending.clone() {
-                    Some(pending) => {
-                        match crate::core::proxy::forward(&pending.lb, &pending.h2_pools, &request, &pending.config, &worker.server.metrics) {
-                            Ok(resp) => resp,
-                            Err(crate::core::proxy::ForwardError::AllNodesExhausted) => {
-                                let mut resp = crate::http::response::HttpResponse::new(503, "Service Unavailable");
-                                resp.set_body(b"Service Unavailable\n".to_vec());
-                                resp
-                            }
-                            Err(crate::core::proxy::ForwardError::UpstreamError(_)) => {
-                                let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
-                                resp.set_body(b"Bad Gateway\n".to_vec());
-                                resp
-                            }
-                            Err(crate::core::proxy::ForwardError::AclDenied) => {
-                                let mut resp = crate::http::response::HttpResponse::new(403, "Forbidden");
-                                resp.set_body(b"Forbidden\n".to_vec());
-                                resp
-                            }
+                if let Some(pending) = response.proxy_pending.clone() {
+                    // Event-driven path (see
+                    // core::event_loop::mio_upstream's own module doc
+                    // comment): pick a node the same way
+                    // core::proxy::forward's own pick_node_sticky call
+                    // does, open a real non-blocking connection to it
+                    // via UpstreamConnection::start, and return here
+                    // immediately -- this connection's own
+                    // Http1Connection::waiting_for_upstream is what
+                    // marks it as "response pending" so nothing else
+                    // (a keep-alive pipelined request behind this one,
+                    // for instance) tries to act on it until
+                    // handle_upstream_event's own flush_upstream_result_to_downstream
+                    // resolves it, mirroring uring_backend's identical
+                    // ProxyPending arm.
+                    let Some(node) = pending.lb.pick_node_sticky(None, None) else {
+                        let mut resp = crate::http::response::HttpResponse::new(503, "Service Unavailable");
+                        resp.set_body(b"Service Unavailable\n".to_vec());
+                        let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else { unreachable!() };
+                        crate::core::conn::protocol::queue_http1_response(h1, resp);
+                        return flush_transport(connections, idx);
+                    };
+                    let client_addr = request.remote_addr;
+                    let headers = crate::core::proxy::build_upstream_headers(&request, client_addr, &pending.config.proxy_identity);
+                    let mut upstream_req = request.clone();
+                    upstream_req.headers = headers.into_iter().map(|h| (h.name, h.value)).collect();
+                    let request_bytes = upstream_req.serialize();
+                    // request.keep_alive is what actually reflects
+                    // this specific request's own Connection header
+                    // (see the ordinary, non-proxied response path's
+                    // own identical keep_alive computation a little
+                    // further down in this same function) --
+                    // h1.keep_alive itself hasn't been updated for
+                    // this request yet at this point, so reading it
+                    // here would use whatever value the *previous*
+                    // request on this same keep-alive connection left
+                    // behind.
+                    let keep_alive_for_attempt = request.keep_alive;
+                    let downstream_conn_id = connections[idx].id;
+                    let pool = std::sync::Arc::clone(&pending.lb.pool);
+                    match crate::core::event_loop::mio_upstream::UpstreamConnection::start(
+                        poller,
+                        std::sync::Arc::clone(&node),
+                        pool,
+                        request_bytes,
+                        idx,
+                        downstream_conn_id,
+                        pending.config.connect_timeout,
+                    ) {
+                        Ok(upstream_conn) => {
+                            let key = upstream_conn.poll_key;
+                            let slot = upstream_connections.insert(upstream_conn);
+                            upstream_poll_keys.insert(key, slot);
+                            let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else { unreachable!() };
+                            h1.waiting_for_upstream = Some(crate::core::conn::protocol::ProxyAttemptState {
+                                upstream_slab_index: slot,
+                                upstream_generation: 0,
+                                keep_alive: keep_alive_for_attempt,
+                                attempts_so_far: 1,
+                                pending,
+                                original_request: Box::new(request.clone()),
+                            });
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            let mut resp = crate::http::response::HttpResponse::new(502, "Bad Gateway");
+                            resp.set_body(b"Bad Gateway\n".to_vec());
+                            let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else { unreachable!() };
+                            crate::core::conn::protocol::queue_http1_response(h1, resp);
+                            return flush_transport(connections, idx);
                         }
                     }
-                    None => response,
-                };
+                }
+                let response = response;
                 let duration_secs = dispatch_start.elapsed().as_secs_f64();
                 worker.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
                 worker.server.metrics.record_request(
