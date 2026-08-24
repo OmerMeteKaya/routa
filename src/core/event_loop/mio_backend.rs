@@ -353,7 +353,7 @@ fn handle_upstream_event(
             } else {
                 upstream.node.record_failure(&upstream.pool);
             }
-            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, Some(response));
+            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, Some(response), Some(&upstream.node));
             // Mirrors handle_connection_event's own identical
             // check/close right after driving a downstream
             // connection's protocol state machine (see that
@@ -374,7 +374,7 @@ fn handle_upstream_event(
             upstream_poll_keys.remove(&upstream.poll_key);
             let _ = poller.deregister(&mut { upstream.stream }, upstream.poll_key);
             upstream.node.record_failure(&upstream.pool);
-            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None);
+            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None, None);
         }
     }
 }
@@ -392,6 +392,7 @@ fn flush_upstream_result_to_downstream(
     downstream_slab_index: usize,
     downstream_conn_id: crate::core::conn::ConnId,
     response: Option<crate::http::response::HttpResponse>,
+    node: Option<&Arc<crate::lb::upstream::UpstreamNode>>,
 ) {
     if !connections.contains(downstream_slab_index) {
         return;
@@ -408,15 +409,14 @@ fn flush_upstream_result_to_downstream(
     };
     match response {
         Some(resp) => {
-            // Sticky-cookie application isn't threaded through here
-            // the way uring_backend's own apply_sticky_cookie call
-            // is -- acceptable gap for this first pass (see this
-            // function's own limitation note), matching the
-            // pre-existing mio_backend forward() path's own behavior
-            // (which also doesn't set a sticky cookie on the response
-            // it flushes) before this event-driven mechanism existed
-            // at all.
             let keep_alive = attempt_state.keep_alive;
+            let mut resp = resp;
+            if let Some(node) = node {
+                let incoming_sticky = attempt_state
+                    .original_request
+                    .get_header(&crate::core::proxy::sticky_cookie_header_name(&attempt_state.pending.lb));
+                crate::core::proxy::apply_sticky_cookie(&mut resp, &attempt_state.pending.lb, node, incoming_sticky);
+            }
             crate::core::conn::protocol::queue_http1_response(h1, resp);
             h1.keep_alive = keep_alive;
             if !keep_alive {
@@ -554,7 +554,7 @@ fn reap_timed_out_upstream_connections(
         upstream_poll_keys.remove(&upstream.poll_key);
         let _ = poller.deregister(&mut { upstream.stream }, upstream.poll_key);
         upstream.node.record_failure(&upstream.pool);
-        flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None);
+        flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None, None);
     }
 }
 
@@ -2881,6 +2881,71 @@ mod tests {
         let server = Arc::new(RoutaServer::from_config(config).unwrap());
         let worker = EventLoopWorker::new(free_port(), server);
         assert_eq!(worker.max_connections, 0);
+    }
+
+    /// A real proxied request through a sticky-session-enabled pool,
+    /// driven through mio_upstream's event-driven path -- proves the
+    /// response actually carries a Set-Cookie identifying the node it
+    /// was routed to, mirroring uring_backend's own
+    /// proxy_sets_a_sticky_cookie_on_first_response.
+    #[test]
+    fn proxy_sets_a_sticky_cookie_on_first_response() {
+        let upstream_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind real upstream listener");
+        let upstream_port = upstream_listener.local_addr().expect("upstream addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = upstream_listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = b"sticky!";
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        let mut config = RoutaConfig::default();
+        let port = free_port();
+        config.port = port as i32;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "api".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            sticky_session_enabled: true,
+            upstreams: vec![crate::core::config::UpstreamConfig { host: "127.0.0.1".to_string(), port: upstream_port, weight: 1, use_tls: false }],
+            ..Default::default()
+        });
+        let server = Arc::new(RoutaServer::from_config(config).unwrap());
+        let worker = EventLoopWorker::new(port, Arc::clone(&server));
+        let shutdown = ShutdownSignal::new();
+        let shutdown_for_thread = shutdown.clone();
+        let handle = std::thread::spawn(move || worker.run(0, &shutdown_for_thread));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() > deadline {
+                        panic!("timed out connecting");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+
+        stream.write_all(b"GET /api/users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write proxied request");
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read proxied response to EOF");
+        let response_text = String::from_utf8_lossy(&response);
+
+        assert!(response_text.starts_with("HTTP/1.1 200"), "expected a 200, got: {response_text:?}");
+        assert!(response_text.contains("Set-Cookie: routa_sticky="), "expected a sticky Set-Cookie header, got: {response_text:?}");
+        assert!(response_text.ends_with("sticky!"), "expected the upstream's body, got: {response_text:?}");
+
+        shutdown.signal();
+        handle.join().unwrap();
     }
 
     #[test]
