@@ -697,6 +697,24 @@ mod tests {
         RoutaConfig::default()
     }
 
+    /// Calls `server.middleware_chain.execute(req)`, then resolves a
+    /// `file_cache_pending` sentinel synchronously if one comes back
+    /// (via a direct `std::fs::metadata` call) rather than returning
+    /// it -- mirrors `static_files::serve_sync`'s own rationale, for
+    /// tests that call `middleware_chain.execute` directly rather than
+    /// going through a full backend's own dispatch loop.
+    fn execute_resolving_pending(server: &RoutaServer, req: &HttpRequest) -> HttpResponse {
+        let resp = server.middleware_chain.execute(req);
+        let Some(pending) = &resp.file_cache_pending else {
+            return resp;
+        };
+        let stat_result = std::fs::metadata(&pending.resolved_path)
+            .ok()
+            .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+        let mut worker_mmap = server.file_cache.worker_mmap_cache();
+        crate::http::static_files::finish_after_stat(req, pending, stat_result, &server.file_cache, &mut worker_mmap, server.file_watcher.as_deref())
+    }
+
     #[test]
     fn builds_from_minimal_config() {
         let server = RoutaServer::from_config(minimal_config()).unwrap();
@@ -760,7 +778,7 @@ mod tests {
             trailers: Vec::new(),
         };
 
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"original");
 
@@ -770,7 +788,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let resp = server.middleware_chain.execute(&req);
+            let resp = execute_resolving_pending(&server, &req);
             if resp.body() == b"changed content" {
                 break;
             }
@@ -836,7 +854,7 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         assert_eq!(resp.get_header("Access-Control-Allow-Origin"), Some("https://example.com"));
     }
 
@@ -860,7 +878,7 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         assert_eq!(resp.status, 401); // no Authorization header supplied
     }
 
@@ -885,9 +903,9 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
-        let first = server.middleware_chain.execute(&req);
+        let first = execute_resolving_pending(&server, &req);
         assert_ne!(first.status, 429);
-        let second = server.middleware_chain.execute(&req);
+        let second = execute_resolving_pending(&server, &req);
         assert_eq!(second.status, 429);
     }
 
@@ -928,7 +946,7 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         assert_eq!(resp.get_header("X-Server"), Some("routa"));
     }
 
@@ -1073,7 +1091,7 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"hello from static");
 
@@ -1096,7 +1114,7 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         assert_eq!(resp.status, 404);
     }
 
@@ -1158,7 +1176,7 @@ mod tests {
         // then, matching what mio_backend's own drive_http1 does with
         // it, calls forward() itself to prove the whole path actually
         // reaches the real upstream end to end.
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         let pending = resp.proxy_pending.expect("a request to /api/* should route to this pool's ProxyPending");
         let metrics = crate::util::metrics::Metrics::new();
         let forwarded = crate::core::proxy::forward(&pending.lb, &pending.h2_pools, &req, &pending.config, &metrics).expect("forward should succeed against the real upstream this test started");
@@ -1185,7 +1203,7 @@ mod tests {
             keep_alive: true,
             trailers: Vec::new(),
         };
-        let resp = server.middleware_chain.execute(&req);
+        let resp = execute_resolving_pending(&server, &req);
         assert_eq!(resp.status, 200);
         assert!(resp.get_header("Content-Type").unwrap().starts_with("text/plain"));
     }
@@ -1222,8 +1240,8 @@ mod tests {
             trailers: Vec::new(),
         };
 
-        assert_eq!(server.middleware_chain.execute(&get("/a.txt")).status, 200);
-        assert_eq!(server.middleware_chain.execute(&get("/b.txt")).status, 200);
+        assert_eq!(execute_resolving_pending(&server, &get("/a.txt")).status, 200);
+        assert_eq!(execute_resolving_pending(&server, &get("/b.txt")).status, 200);
 
         let resp = server.middleware_chain.execute(&get("/metrics"));
         let body = String::from_utf8(resp.body().to_vec()).unwrap();

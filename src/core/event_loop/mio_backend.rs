@@ -218,6 +218,15 @@ impl WorkerBody for EventLoopWorker {
         };
 
         let mut connections: Slab<Connection> = Slab::new();
+        // Worker-local, accumulating mmap slots this worker's own
+        // synchronous file_cache_pending completion (see
+        // core::proxy::forward's own sibling handling just below)
+        // reuses across requests -- mirrors register_static_route's
+        // own per-route mmap_cache; this one exists for the
+        // synchronous-completion path specifically, which isn't
+        // reached from inside a route handler closure that already
+        // had one captured.
+        let mut worker_mmap = self.server.file_cache.worker_mmap_cache();
         // Event-driven upstream connection state -- see
         // core::event_loop::mio_upstream's own module doc comment for
         // why this is a completely separate Slab/key-map from
@@ -273,7 +282,7 @@ impl WorkerBody for EventLoopWorker {
                     handle_upstream_event(self, &mut poller, &mut connections, &mut upstream_connections, &mut upstream_poll_keys, upstream_idx);
                     continue;
                 }
-                handle_connection_event(self, &mut poller, &mut connections, &mut upstream_connections, &mut upstream_poll_keys, key, readiness);
+                handle_connection_event(self, &mut poller, &mut connections, &mut upstream_connections, &mut upstream_poll_keys, key, readiness, &mut worker_mmap);
             }
 
             // Upstream connections have no fixed per-request timeout
@@ -618,6 +627,7 @@ fn handle_connection_event(
     upstream_poll_keys: &mut std::collections::HashMap<PollKey, usize>,
     key: PollKey,
     _readiness: crate::net::poller::Readiness,
+    worker_mmap: &mut crate::http::file_cache::WorkerMmapCache,
 ) {
     let idx = key.slab_index();
     if !connections.contains(idx) {
@@ -754,7 +764,7 @@ fn handle_connection_event(
 
     let result = match &mut connections[idx].protocol {
         ConnectionProtocol::Handshaking => Ok(()), // TLS handshake in progress, or a plaintext connection still waiting for enough bytes to decide HTTP/1.1 vs. H2 prior-knowledge (see the block above)
-        ConnectionProtocol::Http1(_) => drive_http1(worker, poller, connections, upstream_connections, upstream_poll_keys, idx),
+        ConnectionProtocol::Http1(_) => drive_http1(worker, poller, connections, upstream_connections, upstream_poll_keys, idx, worker_mmap),
         ConnectionProtocol::Http2(_) => drive_http2(worker, connections, idx),
         ConnectionProtocol::WebSocket(_) => drive_websocket(worker, connections, idx),
         ConnectionProtocol::UpstreamH2(_) => unreachable!("mio_backend never constructs ConnectionProtocol::UpstreamH2 -- see that variant's own doc comment"),
@@ -827,6 +837,7 @@ fn drive_http1(
     upstream_connections: &mut Slab<crate::core::event_loop::mio_upstream::UpstreamConnection>,
     upstream_poll_keys: &mut std::collections::HashMap<PollKey, usize>,
     idx: usize,
+    worker_mmap: &mut crate::http::file_cache::WorkerMmapCache,
 ) -> std::io::Result<()> {
     read_into_transport(connections, idx, |conn| {
         let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
@@ -936,7 +947,7 @@ fn drive_http1(
                 let route = request.path.clone();
                 worker.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).inc();
                 let dispatch_start = Instant::now();
-                let response = worker.server.middleware_chain.execute(&request);
+                let mut response = worker.server.middleware_chain.execute(&request);
                 // A route handler that matched a proxy route
                 // deliberately does no I/O itself (see
                 // `HttpResponse::proxy_pending`'s own doc comment) --
@@ -1022,6 +1033,42 @@ fn drive_http1(
                         }
                     }
                 }
+                if let Some(pending) = &response.file_cache_pending {
+                    // mio's own model already tolerates blocking I/O
+                    // on its worker threads, so there's no async
+                    // story here the way uring_backend's own
+                    // OP_TAG_STATX completion arm has -- finish the
+                    // stat synchronously, right here, exactly as
+                    // static_files::serve used to do inline before
+                    // FileCachePending existed (see serve_sync's own
+                    // doc comment, which this mirrors by hand since
+                    // this call site only has the sentinel response,
+                    // not the original serve() call, to work with).
+                    let stat_result = std::fs::metadata(&pending.resolved_path)
+                        .ok()
+                        .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+                    let mut real_response = crate::http::static_files::finish_after_stat(
+                        &request,
+                        pending,
+                        stat_result,
+                        &worker.server.file_cache,
+                        worker_mmap,
+                        worker.server.file_watcher.as_deref(),
+                    );
+                    worker.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
+                    let keep_alive = request.keep_alive && real_response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
+                    if real_response.get_header("Connection").is_none() {
+                        real_response.set_header("Connection", if keep_alive { "keep-alive" } else { "close" });
+                    }
+                    queue_http1_response(connections, idx, real_response);
+                    let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else { unreachable!() };
+                    h1.keep_alive = keep_alive;
+                    if !keep_alive {
+                        connections[idx].closing = true;
+                    }
+                    flush_transport(connections, idx)?;
+                    return Ok(());
+                }
                 let response = response;
                 let duration_secs = dispatch_start.elapsed().as_secs_f64();
                 worker.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
@@ -1097,6 +1144,9 @@ fn drive_http1(
                 }
 
                 let keep_alive = request.keep_alive && response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
+                if response.get_header("Connection").is_none() {
+                    response.set_header("Connection", if keep_alive { "keep-alive" } else { "close" });
+                }
                 queue_http1_response(connections, idx, response);
 
                 let ConnectionProtocol::Http1(h1) = &mut connections[idx].protocol else {

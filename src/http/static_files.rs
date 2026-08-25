@@ -25,6 +25,25 @@ pub struct StaticConfig {
     pub enable_index: bool,
 }
 
+/// Carries what's needed to finish serving a static file after an
+/// asynchronous OPENAT+STATX round-trip -- set on
+/// `HttpResponse::file_cache_pending` by `serve`'s own cache-miss path
+/// instead of calling `std::fs::metadata` synchronously (see that
+/// field's own doc comment). A backend that drives this
+/// asynchronously (currently only `uring_backend`) opens/stats
+/// `resolved_path`, then calls `finish_after_stat` with the result to
+/// produce the real response -- mirrors `core::proxy::ProxyPending`'s
+/// own "here's what you need, come back to me once the I/O
+/// completes" shape.
+#[derive(Debug)]
+pub struct FileCachePending {
+    pub resolved_path: PathBuf,
+    /// The original request path -- this is the cache key `FileCache`
+    /// indexes by, which may differ from `resolved_path` (the actual
+    /// filesystem location `resolve_path` resolved it to).
+    pub request_path: String,
+}
+
 /// Resolves `request_path` against `cfg`, returning the real
 /// filesystem path to serve: strips the configured URL prefix, joins
 /// onto `doc_root`, canonicalizes, and rejects anything that
@@ -174,31 +193,24 @@ pub fn serve(
         Some(_) => return not_found_response(),
         None => match resolve_path(&req.path, cfg) {
             Ok(resolved) => {
-                let metadata = match std::fs::metadata(&resolved) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        cache.put_negative(&req.path, resolved);
-                        return not_found_response();
-                    }
-                };
-                let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-                cache.put(&req.path, resolved.clone(), metadata.len(), mtime);
-                if let Some(watcher) = watcher {
-                    // RoutaConfig::file_cache_watch = Inotify: subscribe
-                    // this freshly-cached path to filesystem change
-                    // notifications, so a later edit invalidates it
-                    // immediately instead of waiting for `ttl` to elapse.
-                    watcher.watch_path(&resolved, &req.path);
-                }
-                match cache.get(&req.path, worker_mmap) {
-                    Some(l) => l,
-                    None => {
-                        // Extremely unlikely (put() then immediate get()
-                        // miss would mean eviction raced within the same
-                        // request) -- fail safe rather than panic.
-                        return HttpResponse::new(500, "Internal Server Error");
-                    }
-                }
+                // Cache-miss: rather than calling std::fs::metadata
+                // synchronously here (blocking whichever worker thread
+                // is driving this request until the stat(2) syscall
+                // returns), hand back a sentinel response carrying
+                // what's needed to finish once a backend has stat'd
+                // resolved_path asynchronously -- see
+                // FileCachePending's own doc comment. mio_backend
+                // never looks at file_cache_pending, so for it this
+                // sentinel is dead weight on the HttpResponse it
+                // returns -- see finish_after_stat's own doc comment
+                // for the synchronous equivalent every backend can
+                // still fall back to.
+                let mut resp = HttpResponse::new(200, "OK");
+                resp.file_cache_pending = Some(FileCachePending {
+                    resolved_path: resolved,
+                    request_path: req.path.clone(),
+                });
+                return resp;
             }
             Err(404) => {
                 cache.put_negative(&req.path, PathBuf::from(&req.path));
@@ -210,6 +222,72 @@ pub fn serve(
     };
 
     build_response(req, lookup)
+}
+
+/// Calls `serve`, then synchronously resolves a `file_cache_pending`
+/// sentinel if one comes back (via a direct `std::fs::metadata` call)
+/// rather than returning it to the caller -- the full synchronous
+/// behavior `serve` itself used to have inline before
+/// `FileCachePending` existed. This is what `mio_backend` calls
+/// instead of `serve` directly (mio's own model already tolerates
+/// blocking I/O on its worker threads, so there's no reason for it to
+/// drive the async two-step at all), and what this module's own tests
+/// use so they can keep asserting against a real, complete response
+/// rather than needing to drive the async handshake themselves.
+pub fn serve_sync(
+    req: &HttpRequest,
+    cfg: &StaticConfig,
+    cache: &FileCache,
+    worker_mmap: &mut WorkerMmapCache,
+    metrics: Option<&crate::util::metrics::Metrics>,
+    watcher: Option<&crate::http::file_cache::FileWatcher>,
+) -> HttpResponse {
+    let resp = serve(req, cfg, cache, worker_mmap, metrics, watcher);
+    let Some(pending) = &resp.file_cache_pending else {
+        return resp;
+    };
+    let stat_result = std::fs::metadata(&pending.resolved_path)
+        .ok()
+        .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+    finish_after_stat(req, pending, stat_result, cache, worker_mmap, watcher)
+}
+
+/// The synchronous equivalent of what a backend driving
+/// FileCachePending asynchronously does after its own OPENAT+STATX
+/// completes -- called directly (with a real, already-obtained size
+/// and mtime) by mio_backend's own dispatch path, which never looks
+/// at file_cache_pending and instead calls std::fs::metadata
+/// synchronously itself, exactly as `serve` used to inline before
+/// FileCachePending existed. uring_backend calls this too, from its
+/// own OPENAT+STATX completion handler.
+///
+/// Takes `(size, mtime)` rather than a `std::fs::Metadata` -- the
+/// latter has no public constructor, so there's no way to build one
+/// from a raw kernel `statx` result the way uring_backend's own async
+/// path needs to; `(u64, SystemTime)` is the only subset of Metadata
+/// this module actually needs, and both a real Metadata (mio's
+/// synchronous path) and a raw statx result (uring's async path) can
+/// supply it identically.
+pub fn finish_after_stat(
+    req: &HttpRequest,
+    pending: &FileCachePending,
+    stat_result: Option<(u64, std::time::SystemTime)>,
+    cache: &FileCache,
+    worker_mmap: &mut WorkerMmapCache,
+    watcher: Option<&crate::http::file_cache::FileWatcher>,
+) -> HttpResponse {
+    let Some((size, mtime)) = stat_result else {
+        cache.put_negative(&pending.request_path, pending.resolved_path.clone());
+        return not_found_response();
+    };
+    cache.put(&pending.request_path, pending.resolved_path.clone(), size, mtime);
+    if let Some(watcher) = watcher {
+        watcher.watch_path(&pending.resolved_path, &pending.request_path);
+    }
+    match cache.get(&pending.request_path, worker_mmap) {
+        Some(lookup) => build_response(req, lookup),
+        None => HttpResponse::new(500, "Internal Server Error"),
+    }
 }
 
 fn not_found_response() -> HttpResponse {
@@ -364,7 +442,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/hello.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
 
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"hello world");
@@ -385,7 +463,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/nope.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 404);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -404,7 +482,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Post, "/a.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 405);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -423,7 +501,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Head, "/a.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         assert!(resp.body().is_empty());
         assert_eq!(resp.get_header("Content-Length"), Some("12"));
@@ -444,11 +522,11 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let first_req = make_request(HttpMethod::Get, "/a.txt", &[]);
-        let first_resp = serve(&first_req, &cfg, &cache, &mut mmap_cache, None, None);
+        let first_resp = serve_sync(&first_req, &cfg, &cache, &mut mmap_cache, None, None);
         let etag = first_resp.get_header("ETag").unwrap().to_string();
 
         let second_req = make_request(HttpMethod::Get, "/a.txt", &[("If-None-Match", &etag)]);
-        let second_resp = serve(&second_req, &cfg, &cache, &mut mmap_cache, None, None);
+        let second_resp = serve_sync(&second_req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(second_resp.status, 304);
         assert!(second_resp.body().is_empty());
 
@@ -468,7 +546,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=2-4")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 206);
         assert_eq!(resp.body(), b"234");
         assert_eq!(resp.get_header("Content-Range"), Some("bytes 2-4/10"));
@@ -489,7 +567,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=-3")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 206);
         assert_eq!(resp.body(), b"789");
 
@@ -509,7 +587,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=7-")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 206);
         assert_eq!(resp.body(), b"789");
 
@@ -529,7 +607,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/a.txt", &[("Range", "bytes=100-200")]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 416);
         assert_eq!(resp.get_header("Content-Range"), Some("bytes */10"));
 
@@ -549,7 +627,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/assets/app.js", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"console.log(1)");
 
@@ -572,7 +650,7 @@ mod tests {
         // (must be a real path-segment boundary, not just a string
         // prefix).
         let req = make_request(HttpMethod::Get, "/assets-other/app.js", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 404);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -591,7 +669,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/subdir", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 403);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -610,7 +688,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/subdir", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body(), b"<h1>index</h1>");
 
@@ -633,10 +711,10 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/nope.txt", &[]);
-        let first = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let first = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(first.status, 404);
 
-        let second = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let second = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(second.status, 404);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -663,7 +741,7 @@ mod tests {
         let mut mmap_cache = cache.worker_mmap_cache();
 
         let req = make_request(HttpMethod::Get, "/big.txt", &[]);
-        let resp = serve(&req, &cfg, &cache, &mut mmap_cache, None, None);
+        let resp = serve_sync(&req, &cfg, &cache, &mut mmap_cache, None, None);
         assert_eq!(resp.status, 200);
         // Large, non-mmap'd files are now sent via a FileBody
         // (sendfile-eligible) rather than being read into resp.body()

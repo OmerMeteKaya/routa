@@ -134,6 +134,10 @@ const OP_TAG_SPLICE_TO_SOCKET: u64 = 8;
 /// and this tag's own completion arm for the two-CQE (MORE, then
 /// NOTIF) lifecycle SendZc requires that ordinary `Send` doesn't.
 const OP_TAG_SEND_ZC: u64 = 9;
+/// A `Statx` SQE stat'ing a static file's path asynchronously -- see
+/// `FileCachePending`'s own doc comment (in http::static_files) for
+/// why this exists instead of a synchronous std::fs::metadata call.
+const OP_TAG_STATX: u64 = 10;
 
 /// The listener accept SQE has no associated connection slot and is
 /// submitted exactly once per worker (re-armed in place, never
@@ -1043,14 +1047,6 @@ fn handle_send_completion(
                         // otherwise treat Handshaking as an
                         // unrecognized state and incorrectly tear the
                         // connection down mid-handshake.
-                        let _is_tls_snapshot = connections[slab_index].transport.is_tls();
-                        let _protocol_str = match &connections[slab_index].protocol {
-                            ConnectionProtocol::Handshaking => "Handshaking",
-                            ConnectionProtocol::Http1(_) => "Http1",
-                            ConnectionProtocol::Http2(_) => "Http2",
-                            ConnectionProtocol::WebSocket(_) => "WebSocket",
-                            ConnectionProtocol::UpstreamH2(_) => "UpstreamH2",
-                        };
                         if connections[slab_index].transport.is_tls() && matches!(connections[slab_index].protocol, ConnectionProtocol::Handshaking) {
                             let still_pending = {
                                 let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
@@ -1394,6 +1390,13 @@ fn drain_pipelined_request_or_recv(
                 cancel_outstanding_operations(ring, completion_generation, slab_index);
                 connections.remove(slab_index);
             }
+            Http1Outcome::FileCachePending(pending, original_request) => {
+                if let Err(reason) = submit_statx(ring, connections, slab_index, pending, original_request) {
+                    tracing::warn!(worker_id, %reason, "failed to submit statx for a pipelined static-file cache-miss");
+                    cancel_outstanding_operations(ring, completion_generation, slab_index);
+                    connections.remove(slab_index);
+                }
+            }
         }
         return;
     }
@@ -1411,6 +1414,46 @@ fn drain_pipelined_request_or_recv(
 /// pipe. Only valid on a plaintext HTTP/1.1 connection with a
 /// `pending_file` still holding bytes to send -- callers must check
 /// both before calling (see this function's own call sites).
+/// Submits a `Statx` SQE stat'ing `pending.resolved_path` (an
+/// absolute filesystem path -- resolve_path already canonicalized it,
+/// see FileCachePending's own doc comment) asynchronously, storing
+/// the raw kernel-written statx buffer in `conn.pending_statx` for
+/// OP_TAG_STATX's own completion arm to read once it arrives.
+fn submit_statx(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize, pending: crate::http::static_files::FileCachePending, original_request: Box<crate::http::request::HttpRequest>) -> Result<(), String> {
+    let conn = &mut connections[slab_index];
+    let path_cstring = std::ffi::CString::new(pending.resolved_path.as_os_str().as_encoded_bytes())
+        .map_err(|_| "static file path contains an interior NUL byte".to_string())?;
+    let mut statx_buf: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
+    let statx_ptr = statx_buf.as_mut() as *mut libc::statx as *mut io_uring::types::statx;
+    let statx = opcode::Statx::new(types::Fd(libc::AT_FDCWD), path_cstring.as_ptr(), statx_ptr)
+        .flags(libc::AT_STATX_SYNC_AS_STAT)
+        .mask(libc::STATX_SIZE | libc::STATX_MTIME)
+        .build()
+        .user_data(make_user_data(OP_TAG_STATX, conn.generation, slab_index));
+    conn.pending_statx = Some(crate::core::conn::uring_conn::PendingStatx {
+        pending,
+        original_request,
+        statx_buf,
+    });
+    // path_cstring must outlive the SQE the kernel hasn't yet
+    // consumed -- leaked deliberately (a handful of bytes, freed by
+    // the allocator never running its destructor is the accepted
+    // trade-off here, mirroring how pending_connect_addr/pending_timeout
+    // solve the identical stable-address requirement via a Box kept
+    // alive on Connection instead; a CString has no natural home on
+    // PendingStatx itself since Statx's own pathname pointer must
+    // already be baked into the SQE by the time this function
+    // returns, and the completion arm has no further use for the
+    // pathname bytes once the kernel has read them).
+    std::mem::forget(path_cstring);
+    unsafe {
+        ring.submission()
+            .push(&statx)
+            .map_err(|_| "failed to push statx SQE -- submission queue unexpectedly full".to_string())?;
+    }
+    Ok(())
+}
+
 fn submit_splice_to_pipe(ring: &mut IoUring, connections: &mut Slab<Connection>, pipe_pool: &mut PipePool, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
@@ -1579,6 +1622,16 @@ impl WorkerBody for EventLoopWorker {
         } else {
             None
         };
+        // Worker-local, accumulating mmap slots (see
+        // WorkerMmapCache's own doc comment) reused across every
+        // static-file cache-miss OP_TAG_STATX completion handles --
+        // mirrors register_static_route's own per-route mmap_cache,
+        // the one piece of static_files::serve's own state this
+        // backend needs to hold itself now that finish_after_stat is
+        // called directly from a completion arm rather than from
+        // inside a route handler closure that already had one
+        // captured.
+        let mut worker_mmap = self.server.file_cache.worker_mmap_cache();
         // Parallel to `connections`: `generations[i]` is the
         // generation currently valid for slab index `i`, bumped every
         // time that slot is reused for a new connection -- see
@@ -3001,6 +3054,13 @@ impl WorkerBody for EventLoopWorker {
                                     connections.remove(upstream_slab_index);
                                 }
                             }
+                            Http1Outcome::FileCachePending(pending, original_request) => {
+                                if let Err(reason) = submit_statx(&mut ring, &mut connections, slab_index, pending, original_request) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit statx for a static-file cache-miss");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
+                            }
                         }
                     }
 
@@ -3226,6 +3286,54 @@ impl WorkerBody for EventLoopWorker {
                             continue;
                         }
                         connections[slab_index].pending_send_zc_result = Some(result as u32);
+                    }
+                    OP_TAG_STATX => {
+                        if !connections.contains(slab_index) || connections[slab_index].generation != completion_generation {
+                            continue;
+                        }
+                        let Some(statx_state) = connections[slab_index].pending_statx.take() else {
+                            tracing::warn!(worker_id, slab_index, "received a statx completion with no matching pending_statx -- closing");
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        };
+                        // A negative result (ENOENT, EACCES, etc.)
+                        // means the file doesn't exist or isn't
+                        // stat-able -- finish_after_stat's own None
+                        // branch handles this identically to a failed
+                        // synchronous std::fs::metadata call (negative
+                        // caching, 404).
+                        let stat_result = if result < 0 {
+                            None
+                        } else {
+                            let stx = &statx_state.statx_buf;
+                            let mtime = std::time::UNIX_EPOCH + std::time::Duration::new(stx.stx_mtime.tv_sec.max(0) as u64, stx.stx_mtime.tv_nsec);
+                            Some((stx.stx_size, mtime))
+                        };
+                        let mut response = crate::http::static_files::finish_after_stat(
+                            &statx_state.original_request,
+                            &statx_state.pending,
+                            stat_result,
+                            &self.server.file_cache,
+                            &mut worker_mmap,
+                            self.server.file_watcher.as_deref(),
+                        );
+                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else {
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                            continue;
+                        };
+                        let keep_alive = statx_state.original_request.keep_alive && response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
+                        if response.get_header("Connection").is_none() {
+                            response.set_header("Connection", if keep_alive { "keep-alive" } else { "close" });
+                        }
+                        crate::core::conn::protocol::queue_http1_response(h1, response);
+                        h1.keep_alive = keep_alive;
+                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                            tracing::warn!(worker_id, %reason, "failed to submit response after an async static-file stat");
+                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                            connections.remove(slab_index);
+                        }
                     }
                     OP_TAG_SPLICE_TO_PIPE => {
                         if !connections.contains(slab_index) || connections[slab_index].generation != completion_generation {
@@ -4325,6 +4433,73 @@ mod tests {
     /// running well past the pool's own size still serves every
     /// request correctly, which a real leak would eventually break as
     /// requests kept accumulating unreturned buffers).
+    /// A cache-miss GET (first request for a path) followed by a
+    /// cache-hit GET for the same path, and a GET for a path that
+    /// never existed -- proves the asynchronous OPENAT+STATX-free
+    /// stat path (Http1Outcome::FileCachePending -> submit_statx ->
+    /// OP_TAG_STATX's own completion arm -> static_files::finish_after_stat)
+    /// delivers correct results end to end for all three outcomes:
+    /// a fresh stat populating the cache, a subsequent cache hit
+    /// needing no stat at all, and a stat that fails (404, negative
+    /// cached).
+    #[test]
+    fn static_file_cache_miss_is_resolved_asynchronously_via_statx() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_uring_statx_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp webroot");
+        std::fs::write(dir.join("exists.txt"), b"async stat works").expect("write exists.txt");
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to find a free port");
+            listener.local_addr().expect("local addr").port()
+        };
+        let mut config = crate::core::config::RoutaConfig::default();
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        config.port = port as i32;
+        let server = Arc::new(RoutaServer::from_config(config).expect("build a minimal RoutaServer"));
+        let pool = run(server, port, 1);
+
+        let get = |path: &str| -> String {
+            let mut connected = None;
+            for _ in 0..50 {
+                match StdTcpStream::connect(("127.0.0.1", port)) {
+                    Ok(stream) => {
+                        connected = Some(stream);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            let mut stream = connected.expect("worker should eventually accept a connection");
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("set read timeout");
+            stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).expect("write request");
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).expect("read response to EOF");
+            String::from_utf8_lossy(&response).to_string()
+        };
+
+        // First request: cache-miss, resolved via the async statx path.
+        let first = get("/exists.txt");
+        assert!(first.starts_with("HTTP/1.1 200"), "expected a 200 on cache-miss, got: {first:?}");
+        assert!(first.ends_with("async stat works"), "expected the file's body on cache-miss, got: {first:?}");
+
+        // Second request: cache-hit, no statx needed at all.
+        let second = get("/exists.txt");
+        assert!(second.starts_with("HTTP/1.1 200"), "expected a 200 on cache-hit, got: {second:?}");
+        assert!(second.ends_with("async stat works"), "expected the file's body on cache-hit, got: {second:?}");
+
+        // A path that never existed: statx fails, finish_after_stat's
+        // own None branch negative-caches it and returns 404.
+        let missing = get("/does-not-exist.txt");
+        assert!(missing.starts_with("HTTP/1.1 404"), "expected a 404 for a missing file, got: {missing:?}");
+
+        pool.shutdown();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn many_sequential_requests_reuse_the_registered_buffer_pool() {
         let dir = std::env::temp_dir().join(format!(

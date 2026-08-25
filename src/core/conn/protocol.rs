@@ -487,6 +487,16 @@ pub enum Http1Outcome {
     /// completely separate, synchronous code path instead -- see
     /// `core::proxy`'s own doc comment).
     ProxyPending(crate::core::proxy::ProxyPending, Box<crate::http::request::HttpRequest>),
+    /// The matched route is a static-file route whose cache-miss path
+    /// needs an asynchronous OPENAT+STATX round-trip -- see
+    /// `crate::http::static_files::FileCachePending`'s own doc
+    /// comment. Same shape and rationale as `ProxyPending` just above:
+    /// nothing was queued into `write_buf`, and this connection's
+    /// `read_buf` is left untouched; the caller drives the actual
+    /// stat (or, for a backend with no async story of its own, calls
+    /// `static_files::finish_after_stat` synchronously right away)
+    /// and re-enters ordinary dispatch once a real response exists.
+    FileCachePending(crate::http::static_files::FileCachePending, Box<crate::http::request::HttpRequest>),
     /// The connection has just switched to
     /// `ConnectionProtocol::WebSocket` -- same flush-before-anything-else
     /// requirement as `SwitchedToHttp2` above.
@@ -698,6 +708,13 @@ pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1Disp
                     ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
                     return Http1Outcome::ProxyPending(pending, Box::new(request));
                 }
+                if let Some(pending) = response.file_cache_pending.take() {
+                    // Same rationale as the proxy_pending arm just
+                    // above -- no real response exists yet to record
+                    // metrics for.
+                    ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
+                    return Http1Outcome::FileCachePending(pending, Box::new(request));
+                }
                 let duration_secs = dispatch_start.elapsed().as_secs_f64();
                 ctx.server.metrics.http.requests_in_flight.with_label_values(&["http1"]).dec();
                 ctx.server.metrics.record_request(
@@ -763,6 +780,21 @@ pub fn process_http1_read_buf(protocol: &mut ConnectionProtocol, ctx: &Http1Disp
                 }
 
                 let keep_alive = request.keep_alive && response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
+                // HttpResponse::serialize defaults to writing
+                // Connection: close whenever no route handler set
+                // this header explicitly (see its own doc comment) --
+                // without setting it here, a keep_alive=true response
+                // from a handler that never touches this header (the
+                // overwhelming majority) would tell the client the
+                // connection is closing while this backend actually
+                // keeps it open, a real client-visible protocol
+                // violation a read-until-EOF client (or a pipelined
+                // request waiting on this connection's own second
+                // response) would misinterpret as "nothing more is
+                // coming".
+                if response.get_header("Connection").is_none() {
+                    response.set_header("Connection", if keep_alive { "keep-alive" } else { "close" });
+                }
                 let ConnectionProtocol::Http1(h1) = protocol else { unreachable!() };
                 queue_http1_response(h1, response);
                 h1.keep_alive = keep_alive;

@@ -289,6 +289,27 @@ pub struct Connection {
     /// instead, which reads directly into `recv_buf` and has no
     /// pool-owned buffer to return.
     pub pending_recv_buf_index: Option<u16>,
+    /// State for an in-flight `Statx` SQE stat'ing a static file's
+    /// path asynchronously (see `Http1Outcome::FileCachePending`'s own
+    /// doc comment) -- `Some` from the moment the Statx SQE is
+    /// submitted until its completion is processed. The `Box<statx>`
+    /// is the raw kernel-written buffer the SQE's own pointer targets
+    /// -- boxed (not stack-local) so its address stays stable across
+    /// this struct being moved around (a Slab entry can be relocated
+    /// on Vec growth elsewhere, though not typically mid-flight here;
+    /// boxing removes the need to reason about whether that could
+    /// ever happen), the same buffer-stability requirement
+    /// `pending_connect_addr`/`pending_timeout` already document for
+    /// their own boxed buffers.
+    pub pending_statx: Option<PendingStatx>,
+}
+
+/// What's needed to finish a static-file cache-miss once its `Statx`
+/// completes -- see `Connection::pending_statx`'s own doc comment.
+pub struct PendingStatx {
+    pub pending: crate::http::static_files::FileCachePending,
+    pub original_request: Box<crate::http::request::HttpRequest>,
+    pub statx_buf: Box<libc::statx>,
 }
 
 /// The pipe fd pair (and current relay phase) backing one in-flight
@@ -341,6 +362,7 @@ impl Connection {
             send_zc_supported: false,
             pending_send_zc_result: None,
             pending_recv_buf_index: None,
+            pending_statx: None,
         }
     }
 

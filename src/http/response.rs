@@ -75,6 +75,17 @@ pub struct HttpResponse {
     /// exists at all; only `core::proxy`'s own route handler ever sets
     /// it, and only each backend's own dispatch code ever reads it.
     pub proxy_pending: Option<crate::core::proxy::ProxyPending>,
+    /// Set instead of a real status/body when this response
+    /// requires an asynchronous OPENAT+STATX round-trip (see
+    /// `crate::http::static_files::FileCachePending`'s own doc
+    /// comment) before a real response can be produced -- mirrors
+    /// `proxy_pending`'s own opaque-Option shape and rationale.
+    /// Only `static_files::serve`'s own cache-miss path ever sets
+    /// this, and only a backend that supports driving it
+    /// asynchronously (currently just `uring_backend`) ever reads
+    /// it -- `mio_backend` never sees this set, since mio's own
+    /// model already tolerates blocking I/O on its worker threads.
+    pub file_cache_pending: Option<crate::http::static_files::FileCachePending>,
 }
 
 impl HttpResponse {
@@ -88,6 +99,7 @@ impl HttpResponse {
             chunked: false,
             early_hints: Vec::new(),
             proxy_pending: None,
+            file_cache_pending: None,
         }
     }
 
