@@ -263,8 +263,6 @@ impl WorkerBody for EventLoopWorker {
             };
 
             for (key, readiness) in events {
-                if upstream_poll_keys.contains_key(&key) {
-                }
                 if key == listener_key {
                     // Stop accepting new connections as soon as a
                     // shutdown has been requested -- only already-open
@@ -362,7 +360,7 @@ fn handle_upstream_event(
             } else {
                 upstream.node.record_failure(&upstream.pool);
             }
-            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, Some(response), Some(&upstream.node));
+            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, upstream.downstream_stream_id, Some(response), Some(&upstream.node));
             // Mirrors handle_connection_event's own identical
             // check/close right after driving a downstream
             // connection's protocol state machine (see that
@@ -383,7 +381,7 @@ fn handle_upstream_event(
             upstream_poll_keys.remove(&upstream.poll_key);
             let _ = poller.deregister(&mut { upstream.stream }, upstream.poll_key);
             upstream.node.record_failure(&upstream.pool);
-            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None, None);
+            flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, upstream.downstream_stream_id, None, None);
         }
     }
 }
@@ -400,6 +398,7 @@ fn flush_upstream_result_to_downstream(
     connections: &mut Slab<Connection>,
     downstream_slab_index: usize,
     downstream_conn_id: crate::core::conn::ConnId,
+    downstream_stream_id: Option<u32>,
     response: Option<crate::http::response::HttpResponse>,
     node: Option<&Arc<crate::lb::upstream::UpstreamNode>>,
 ) {
@@ -410,41 +409,68 @@ fn flush_upstream_result_to_downstream(
     if conn.id != downstream_conn_id {
         return;
     }
-    let ConnectionProtocol::Http1(h1) = &mut conn.protocol else {
-        return;
-    };
-    let Some(attempt_state) = h1.waiting_for_upstream.take() else {
-        return;
-    };
-    match response {
-        Some(resp) => {
-            let keep_alive = attempt_state.keep_alive;
-            let mut resp = resp;
-            if let Some(node) = node {
-                let incoming_sticky = attempt_state
-                    .original_request
-                    .get_header(&crate::core::proxy::sticky_cookie_header_name(&attempt_state.pending.lb));
-                crate::core::proxy::apply_sticky_cookie(&mut resp, &attempt_state.pending.lb, node, incoming_sticky);
+    match (&mut conn.protocol, downstream_stream_id) {
+        (ConnectionProtocol::Http1(h1), None) => {
+            let Some(attempt_state) = h1.waiting_for_upstream.take() else {
+                return;
+            };
+            match response {
+                Some(resp) => {
+                    let keep_alive = attempt_state.keep_alive;
+                    let mut resp = resp;
+                    if let Some(node) = node {
+                        let incoming_sticky = attempt_state
+                            .original_request
+                            .get_header(&crate::core::proxy::sticky_cookie_header_name(&attempt_state.pending.lb));
+                        crate::core::proxy::apply_sticky_cookie(&mut resp, &attempt_state.pending.lb, node, incoming_sticky);
+                    }
+                    crate::core::conn::protocol::queue_http1_response(h1, resp);
+                    h1.keep_alive = keep_alive;
+                    if !keep_alive {
+                        // Mirrors the ordinary (non-proxied) response
+                        // path's own identical closing = true --
+                        // without this, a Connection: close request
+                        // proxied through this event-driven path would
+                        // queue and flush its response correctly but
+                        // never actually close the TCP connection
+                        // afterward, leaving a client using
+                        // read-until-EOF (the standard way to consume
+                        // a Connection: close response) waiting
+                        // indefinitely for a FIN that was never
+                        // coming.
+                        connections[downstream_slab_index].closing = true;
+                    }
+                    let _ = flush_transport(connections, downstream_slab_index);
+                }
+                None => {
+                    retry_or_fail_proxy_attempt_mio(worker, poller, connections, downstream_slab_index, downstream_conn_id, None, attempt_state);
+                }
             }
-            crate::core::conn::protocol::queue_http1_response(h1, resp);
-            h1.keep_alive = keep_alive;
-            if !keep_alive {
-                // Mirrors the ordinary (non-proxied) response path's
-                // own identical closing = true -- without this, a
-                // Connection: close request proxied through this
-                // event-driven path would queue and flush its
-                // response correctly but never actually close the
-                // TCP connection afterward, leaving a client using
-                // read-until-EOF (the standard way to consume a
-                // Connection: close response) waiting indefinitely
-                // for a FIN that was never coming.
-                connections[downstream_slab_index].closing = true;
+        }
+        (ConnectionProtocol::Http2(h2), Some(stream_id)) => {
+            let Some(attempt_state) = h2.waiting_for_upstream.remove(&stream_id) else {
+                return;
+            };
+            match response {
+                Some(resp) => {
+                    let mut resp = resp;
+                    if let Some(node) = node {
+                        let incoming_sticky = attempt_state
+                            .original_request
+                            .get_header(&crate::core::proxy::sticky_cookie_header_name(&attempt_state.pending.lb));
+                        crate::core::proxy::apply_sticky_cookie(&mut resp, &attempt_state.pending.lb, node, incoming_sticky);
+                    }
+                    let (status, headers, body) = split_response_for_h2(resp);
+                    let out = h2.inner.send_response(stream_id, status, &headers, body);
+                    h2.write_buf.push(&out);
+                    let _ = flush_transport(connections, downstream_slab_index);
+                }
+                None => {
+                    retry_or_fail_proxy_attempt_mio(worker, poller, connections, downstream_slab_index, downstream_conn_id, Some(stream_id), attempt_state);
+                }
             }
-            let _ = flush_transport(connections, downstream_slab_index);
         }
-        None => {
-            retry_or_fail_proxy_attempt_mio(worker, poller, connections, downstream_slab_index, downstream_conn_id, attempt_state);
-        }
+        _ => {}
     }
 }
 
@@ -460,6 +486,7 @@ fn retry_or_fail_proxy_attempt_mio(
     connections: &mut Slab<Connection>,
     downstream_slab_index: usize,
     downstream_conn_id: crate::core::conn::ConnId,
+    downstream_stream_id: Option<u32>,
     mut attempt_state: crate::core::conn::protocol::ProxyAttemptState,
 ) {
     attempt_state.attempts_so_far += 1;
@@ -486,6 +513,7 @@ fn retry_or_fail_proxy_attempt_mio(
         request_bytes,
         downstream_slab_index,
         downstream_conn_id,
+        downstream_stream_id,
         attempt_state.pending.config.connect_timeout,
     ) {
         Ok(_upstream_conn) => {
@@ -563,7 +591,7 @@ fn reap_timed_out_upstream_connections(
         upstream_poll_keys.remove(&upstream.poll_key);
         let _ = poller.deregister(&mut { upstream.stream }, upstream.poll_key);
         upstream.node.record_failure(&upstream.pool);
-        flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, None, None);
+        flush_upstream_result_to_downstream(worker, poller, connections, upstream.downstream_slab_index, upstream.downstream_conn_id, upstream.downstream_stream_id, None, None);
     }
 }
 
@@ -634,6 +662,11 @@ fn handle_connection_event(
             return; // stale event for an already-removed connection
     }
 
+    eprintln!("DEBUG handle_connection_event port={} idx={} conn_id={:?} readiness={:?} write_buf_len={}", worker.port, idx, connections[idx].id, _readiness, match &connections[idx].protocol {
+        ConnectionProtocol::Http2(h2) => h2.write_buf.as_slice().len(),
+        ConnectionProtocol::Http1(h1) => h1.write_buf.as_slice().len(),
+        _ => 0,
+    });
     connections[idx].touch();
 
     // Drive the TLS handshake (a no-op immediately returning "not
@@ -765,7 +798,7 @@ fn handle_connection_event(
     let result = match &mut connections[idx].protocol {
         ConnectionProtocol::Handshaking => Ok(()), // TLS handshake in progress, or a plaintext connection still waiting for enough bytes to decide HTTP/1.1 vs. H2 prior-knowledge (see the block above)
         ConnectionProtocol::Http1(_) => drive_http1(worker, poller, connections, upstream_connections, upstream_poll_keys, idx, worker_mmap),
-        ConnectionProtocol::Http2(_) => drive_http2(worker, connections, idx),
+        ConnectionProtocol::Http2(_) => drive_http2(worker, poller, connections, upstream_connections, upstream_poll_keys, idx, worker_mmap),
         ConnectionProtocol::WebSocket(_) => drive_websocket(worker, connections, idx),
         ConnectionProtocol::UpstreamH2(_) => unreachable!("mio_backend never constructs ConnectionProtocol::UpstreamH2 -- see that variant's own doc comment"),
     };
@@ -938,7 +971,7 @@ fn drive_http1(
                     h2.inner.assume_preface_received();
                     h2.inner.apply_upgrade_settings(&settings_payload);
                     connections[idx].protocol = ConnectionProtocol::Http2(h2);
-                    return drive_http2(worker, connections, idx);
+                    return drive_http2(worker, poller, connections, upstream_connections, upstream_poll_keys, idx, worker_mmap);
                 }
 
                 let is_upgrade = crate::http::ws::is_upgrade_request(&request);
@@ -1007,6 +1040,7 @@ fn drive_http1(
                         request_bytes,
                         idx,
                         downstream_conn_id,
+                        None,
                         pending.config.connect_timeout,
                     ) {
                         Ok(upstream_conn) => {
@@ -1021,6 +1055,7 @@ fn drive_http1(
                                 attempts_so_far: 1,
                                 pending,
                                 original_request: Box::new(request.clone()),
+                                downstream_stream_id: None,
                             });
                             return Ok(());
                         }
@@ -1341,7 +1376,10 @@ fn flush_transport(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                eprintln!("DEBUG flush_transport WouldBlock idx={} pending_len={}", idx, pending.len());
+                return Ok(());
+            }
             Err(e) => return Err(e),
         }
     }
@@ -1423,7 +1461,7 @@ fn flush_pending_file(connections: &mut Slab<Connection>, idx: usize) -> std::io
 /// the server's middleware chain, and encodes each response back onto
 /// the same stream via `send_response` -- multiplexing however many
 /// requests happen to be in flight on this one connection.
-fn drive_http2(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx: usize) -> std::io::Result<()> {
+fn drive_http2(worker: &EventLoopWorker, poller: &mut MioPoller, connections: &mut Slab<Connection>, upstream_connections: &mut Slab<crate::core::event_loop::mio_upstream::UpstreamConnection>, upstream_poll_keys: &mut std::collections::HashMap<PollKey, usize>, idx: usize, worker_mmap: &mut crate::http::file_cache::WorkerMmapCache) -> std::io::Result<()> {
     let incoming = read_transport_bytes(connections, idx)?;
 
     let advance_result = {
@@ -1466,7 +1504,90 @@ fn drive_http2(worker: &EventLoopWorker, connections: &mut Slab<Connection>, idx
         let request_body_len = request.body.len();
         worker.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).inc();
         let dispatch_start = Instant::now();
-        let response = worker.server.middleware_chain.execute(&request);
+        let mut response = worker.server.middleware_chain.execute(&request);
+        if let Some(pending) = &response.file_cache_pending {
+            // mio's own model already tolerates blocking I/O on its
+            // worker threads (see drive_http1's own identical
+            // handling, which this mirrors) -- there's no async story
+            // for this backend the way uring_backend's OP_TAG_STATX
+            // completion arm has.
+            let stat_result = std::fs::metadata(&pending.resolved_path)
+                .ok()
+                .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+            response = crate::http::static_files::finish_after_stat(
+                &request,
+                pending,
+                stat_result,
+                &worker.server.file_cache,
+                worker_mmap,
+                worker.server.file_watcher.as_deref(),
+            );
+        }
+        if let Some(pending) = response.proxy_pending.clone() {
+            // H2 analogue of drive_http1's own identical ProxyPending
+            // handling -- see that block's own doc comment for the
+            // overall event-driven rationale. The one real difference
+            // here: a single H2 connection can have several proxy
+            // requests outstanding on different streams at once, so
+            // the in-flight attempt is keyed by stream_id in this
+            // connection's own Http2Connection::waiting_for_upstream
+            // map rather than the single Option an HTTP/1.1
+            // connection's Http1Connection::waiting_for_upstream
+            // uses.
+            let Some(node) = pending.lb.pick_node_sticky(None, None) else {
+                let out = {
+                    let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else { unreachable!() };
+                    h2.inner.send_response(stream_id, 503, &[], b"Service Unavailable\n".to_vec())
+                };
+                let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else { unreachable!() };
+                h2.write_buf.push(&out);
+                continue;
+            };
+            let client_addr = request.remote_addr;
+            let headers = crate::core::proxy::build_upstream_headers(&request, client_addr, &pending.config.proxy_identity);
+            let mut upstream_req = request.clone();
+            upstream_req.headers = headers.into_iter().map(|h| (h.name, h.value)).collect();
+            let request_bytes = upstream_req.serialize();
+            let keep_alive_for_attempt = request.keep_alive;
+            let downstream_conn_id = connections[idx].id;
+            let pool = std::sync::Arc::clone(&pending.lb.pool);
+            match crate::core::event_loop::mio_upstream::UpstreamConnection::start(
+                poller,
+                std::sync::Arc::clone(&node),
+                pool,
+                request_bytes,
+                idx,
+                downstream_conn_id,
+                Some(stream_id),
+                pending.config.connect_timeout,
+            ) {
+                Ok(upstream_conn) => {
+                    let key = upstream_conn.poll_key;
+                    let slot = upstream_connections.insert(upstream_conn);
+                    upstream_poll_keys.insert(key, slot);
+                    let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else { unreachable!() };
+                    h2.waiting_for_upstream.insert(stream_id, crate::core::conn::protocol::ProxyAttemptState {
+                        upstream_slab_index: slot,
+                        upstream_generation: 0,
+                        keep_alive: keep_alive_for_attempt,
+                        attempts_so_far: 1,
+                        pending,
+                        original_request: Box::new(request.clone()),
+                        downstream_stream_id: Some(stream_id),
+                    });
+                    continue;
+                }
+                Err(_) => {
+                    let out = {
+                        let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else { unreachable!() };
+                        h2.inner.send_response(stream_id, 502, &[], b"Bad Gateway\n".to_vec())
+                    };
+                    let ConnectionProtocol::Http2(h2) = &mut connections[idx].protocol else { unreachable!() };
+                    h2.write_buf.push(&out);
+                    continue;
+                }
+            }
+        }
         let duration_secs = dispatch_start.elapsed().as_secs_f64();
         worker.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).dec();
         worker.server.metrics.record_request(&method_str, &route, response.status, duration_secs, request_body_len, response.body().len());
@@ -1722,13 +1843,42 @@ fn build_request_from_h2_headers(
 /// Splits an `HttpResponse` into the pieces `http::h2::stream::Connection::send_response`
 /// needs (status separately from headers, since H2 sends `:status` as
 /// its own pseudo-header rather than a regular one).
-fn split_response_for_h2(response: crate::http::response::HttpResponse) -> (u16, Vec<crate::http::h2::hpack::HeaderField>, Vec<u8>) {
+fn split_response_for_h2(mut response: crate::http::response::HttpResponse) -> (u16, Vec<crate::http::h2::hpack::HeaderField>, Vec<u8>) {
     let status = response.status;
-    let body = response.body().to_vec();
+    // A file-backed body (see HttpResponse::set_body_file's own doc
+    // comment) has nothing in `body` itself -- the whole point of
+    // that variant is avoiding a userspace copy by handing the event
+    // loop a file descriptor instead. drive_http1's own flush path
+    // (flush_pending_file) reads this via a dedicated sendfile(2)
+    // call outside of HttpResponse entirely, but H2 has no equivalent
+    // fast path here (H2 frames the body regardless, and TLS on top
+    // of that already rules out true zero-copy) -- reading the file's
+    // bytes synchronously into `body` here, once, is what makes a
+    // large static file actually serve any content at all over H2
+    // rather than silently sending a 200 with zero bytes.
+    let body = if let Some(file_body) = response.file_body.take() {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file_body.file;
+        let mut buf = vec![0u8; file_body.len as usize];
+        match file.seek(SeekFrom::Start(file_body.offset)).and_then(|_| file.read_exact(&mut buf)) {
+            Ok(()) => buf,
+            Err(_) => Vec::new(),
+        }
+    } else {
+        response.body().to_vec()
+    };
     let headers = response
         .headers()
+        // RFC 9113 8.2.1: HTTP/2 header field names must be lowercase
+        // -- HttpResponse's own headers (built for HTTP/1.1, where
+        // names are case-insensitive but conventionally mixed-case,
+        // e.g. "Content-Type") are stored as whatever case a route
+        // handler set them in. A conforming H2 peer (nghttp2 included)
+        // treats an uppercase header name as a hard protocol error
+        // and resets the stream rather than merely warning, so this
+        // lowercasing is required, not cosmetic.
         .map(|(name, value)| crate::http::h2::hpack::HeaderField {
-            name: name.to_string(),
+            name: name.to_ascii_lowercase(),
             value: value.to_string(),
         })
         .collect();
@@ -2197,6 +2347,203 @@ mod tests {
         assert_eq!(frame_type, 0x4, "expected a SETTINGS frame as the first bytes back over the upgraded connection");
     }
 
+    /// A GET request for a static file over a real h2c (prior-knowledge
+    /// HTTP/2) connection -- proves two RFC 9113 conformance bugs
+    /// found via a real nghttp2 client stay fixed:
+    /// (1) this backend's own initial SETTINGS frame must not
+    /// advertise SETTINGS_ENABLE_PUSH at all (RFC 9113 6.5.2: only a
+    /// client may send this setting meaningfully; a conforming H2
+    /// client such as nghttp2 treats a server sending it as a
+    /// protocol error and tears the connection down), and
+    /// (2) response header field names must be lowercase (RFC 9113
+    /// 8.2.1) -- HttpResponse's own headers carry whatever case a
+    /// route handler used (e.g. "Content-Type"), which
+    /// split_response_for_h2 must normalize before framing.
+    #[test]
+    fn static_file_served_correctly_over_real_h2_connection() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_mio_h2_static_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("a.bin"), &body).unwrap();
+
+        let mut config = RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        let port = free_port();
+        let _pool = start_test_server(config, port);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        // HTTP/2 prior-knowledge preface, followed by an empty client
+        // SETTINGS frame -- no h2c HTTP/1.1 upgrade dance needed here
+        // since the point of this test is the H2 layer itself, not
+        // the upgrade path h2c_upgrade_switches_a_plaintext_connection_to_http2
+        // already covers.
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]); // empty SETTINGS frame
+        stream.write_all(&preface).unwrap();
+
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+
+        // The server's own first frame must be a SETTINGS frame that
+        // does not advertise SETTINGS_ENABLE_PUSH (id 0x2) at all.
+        let (frame_type, _flags, payload) = read_one_h2_frame(&mut reader);
+        assert_eq!(frame_type, 0x4, "expected the server's initial SETTINGS frame first");
+        for chunk in payload.chunks(6) {
+            let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+            assert_ne!(id, 0x2, "server must never advertise SETTINGS_ENABLE_PUSH (RFC 9113 6.5.2) -- got payload: {payload:?}");
+        }
+
+        // Client's own SETTINGS ACK, then the actual request.
+        stream.write_all(&[0, 0, 0, 4, 0x1, 0, 0, 0, 0]).unwrap();
+
+        let mut encoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let request_fields = vec![
+            crate::http::h2::hpack::HeaderField { name: ":method".to_string(), value: "GET".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":path".to_string(), value: "/a.bin".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":scheme".to_string(), value: "http".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":authority".to_string(), value: "localhost".to_string() },
+        ];
+        let encoded = encoder.encode(&request_fields);
+        let mut headers_frame = Vec::new();
+        let len = encoded.len();
+        headers_frame.push((len >> 16) as u8);
+        headers_frame.push((len >> 8) as u8);
+        headers_frame.push(len as u8);
+        headers_frame.push(0x1); // HEADERS
+        headers_frame.push(0x5); // END_STREAM | END_HEADERS
+        headers_frame.extend_from_slice(&[0, 0, 0, 1]); // stream_id = 1
+        headers_frame.extend_from_slice(&encoded);
+        stream.write_all(&headers_frame).unwrap();
+
+        let mut decoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let (status, _end_stream, fields) = read_h2_response_headers(&mut reader, &mut decoder);
+        assert_eq!(status, "200", "expected a 200 for the static file, got: {status}");
+        for field in &fields {
+            assert_eq!(field.name, field.name.to_ascii_lowercase(), "H2 response header name must be lowercase (RFC 9113 8.2.1): {field:?}");
+        }
+        assert!(fields.iter().any(|f| f.name == "content-type"), "expected a lowercase content-type header, got: {fields:?}");
+
+        let received_body = read_h2_data_payload(&mut reader);
+        assert_eq!(received_body, body, "H2 response body did not match the static file's real content");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A GET for a static file above FileCache's mmap_threshold (so
+    /// its body arrives via HttpResponse::file_body/set_body_file
+    /// rather than the in-memory path static_file_served_correctly_over_real_h2_connection
+    /// already covers) over a real h2c connection -- proves
+    /// split_response_for_h2's own file_body branch actually reads
+    /// and delivers the file's real bytes rather than silently
+    /// sending a 200 with an empty body (H2 has no sendfile(2)
+    /// fast-path the way drive_http1's own flush_pending_file does;
+    /// this is the synchronous read-into-body fallback that makes H2
+    /// serve a large static file at all). A file this size also
+    /// spans multiple DATA frames at H2's default max_frame_size, so
+    /// this test collects frames until END_STREAM rather than
+    /// assuming a single one holds the whole body.
+    #[test]
+    fn large_static_file_served_correctly_over_real_h2_connection() {
+        let dir = std::env::temp_dir().join(format!(
+            "routa_mio_h2_large_static_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Comfortably above the default 64KiB mmap_threshold.
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("big.bin"), &body).unwrap();
+
+        let mut config = RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        config.static_dirs.push(("/".to_string(), dir.to_str().unwrap().to_string()));
+        let port = free_port();
+        let _pool = start_test_server(config, port);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        // Advertise a large initial flow-control window (well above
+        // the 200KiB body this test requests) so the server isn't
+        // stalled waiting on a WINDOW_UPDATE this test would
+        // otherwise never send -- the default 65535-byte window is
+        // smaller than the file itself.
+        preface.extend_from_slice(&[0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 4, 0, 0x0f, 0x00, 0x00]);
+        stream.write_all(&preface).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let (frame_type, _flags, _payload) = read_one_h2_frame(&mut reader);
+        assert_eq!(frame_type, 0x4, "expected the server's initial SETTINGS frame first");
+        stream.write_all(&[0, 0, 0, 4, 0x1, 0, 0, 0, 0]).unwrap();
+        // SETTINGS_INITIAL_WINDOW_SIZE above only raises each new
+        // stream's own flow-control window -- the connection-level
+        // window (also defaulting to 65535 bytes) is separate and
+        // needs its own WINDOW_UPDATE on stream 0 to cover a body
+        // this large.
+        let extra_window: u32 = 900_000;
+        let mut window_update = vec![0, 0, 4, 0x8, 0, 0, 0, 0, 0];
+        window_update.extend_from_slice(&extra_window.to_be_bytes());
+        stream.write_all(&window_update).unwrap();
+
+        let mut encoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let request_fields = vec![
+            crate::http::h2::hpack::HeaderField { name: ":method".to_string(), value: "GET".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":path".to_string(), value: "/big.bin".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":scheme".to_string(), value: "http".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":authority".to_string(), value: "localhost".to_string() },
+        ];
+        let encoded = encoder.encode(&request_fields);
+        let mut headers_frame = Vec::new();
+        let len = encoded.len();
+        headers_frame.push((len >> 16) as u8);
+        headers_frame.push((len >> 8) as u8);
+        headers_frame.push(len as u8);
+        headers_frame.push(0x1);
+        headers_frame.push(0x5);
+        headers_frame.extend_from_slice(&[0, 0, 0, 1]);
+        headers_frame.extend_from_slice(&encoded);
+        stream.write_all(&headers_frame).unwrap();
+
+        let mut decoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let (status, mut end_stream, _fields) = read_h2_response_headers(&mut reader, &mut decoder);
+        assert_eq!(status, "200", "expected a 200 for the large static file, got: {status}");
+
+        let mut received_body = Vec::new();
+        while !end_stream {
+            let (frame_type, flags, payload) = read_one_h2_frame(&mut reader);
+            if frame_type == 0x0 {
+                received_body.extend_from_slice(&payload);
+                if flags & 0x1 != 0 {
+                    end_stream = true;
+                }
+            }
+        }
+        assert_eq!(received_body.len(), body.len(), "large static file body length mismatch over H2");
+        assert_eq!(received_body, body, "large static file body content mismatch over H2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Reads exactly one H2 frame (header + payload) off `reader` --
     /// the test-side equivalent of `frame::parse_frame`, but reading
     /// from a live socket a byte at a time instead of an
@@ -2540,6 +2887,94 @@ mod tests {
         let (status, body) = http_get(port, "/api/anything");
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body).trim_end(), "from upstream!");
+    }
+
+    /// A proxied request made over a real h2c (prior-knowledge HTTP/2)
+    /// downstream connection -- proves drive_http2's own ProxyPending
+    /// handling (the H2 analogue of drive_http1's identical
+    /// HTTP/1.1 handling, added alongside file_cache_pending support
+    /// once both were found missing from the H2 dispatch path
+    /// entirely) actually opens the event-driven UpstreamConnection,
+    /// tracks it against the correct stream_id in
+    /// Http2Connection::waiting_for_upstream, and delivers the real
+    /// upstream response back onto that same H2 stream once it
+    /// resolves.
+    #[test]
+    fn proxied_request_resolves_correctly_over_real_h2_connection() {
+        let upstream_port = free_port();
+        std::thread::spawn(move || {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", upstream_port)).unwrap();
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = b"from upstream via h2!";
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut config = RoutaConfig::default();
+        config.h2.h2c_upgrade_enabled = true;
+        config.pools.push(crate::core::config::LbPoolConfig {
+            name: "test".to_string(),
+            route: "/api/*".to_string(),
+            lb_enabled: true,
+            upstreams: vec![crate::core::config::UpstreamConfig {
+                host: "127.0.0.1".to_string(),
+                port: upstream_port,
+                weight: 1,
+                use_tls: false,
+            }],
+            ..Default::default()
+        });
+        let port = free_port();
+        let _pool = start_test_server(config, port);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match StdTcpStream::connect(("127.0.0.1", port)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("could not connect to test server: {e}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        let mut preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        preface.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        stream.write_all(&preface).unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let (frame_type, _flags, _payload) = read_one_h2_frame(&mut reader);
+        assert_eq!(frame_type, 0x4, "expected the server's initial SETTINGS frame first");
+        stream.write_all(&[0, 0, 0, 4, 0x1, 0, 0, 0, 0]).unwrap();
+
+        let mut encoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let request_fields = vec![
+            crate::http::h2::hpack::HeaderField { name: ":method".to_string(), value: "GET".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":path".to_string(), value: "/api/anything".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":scheme".to_string(), value: "http".to_string() },
+            crate::http::h2::hpack::HeaderField { name: ":authority".to_string(), value: "localhost".to_string() },
+        ];
+        let encoded = encoder.encode(&request_fields);
+        let mut headers_frame = Vec::new();
+        let len = encoded.len();
+        headers_frame.push((len >> 16) as u8);
+        headers_frame.push((len >> 8) as u8);
+        headers_frame.push(len as u8);
+        headers_frame.push(0x1);
+        headers_frame.push(0x5);
+        headers_frame.extend_from_slice(&[0, 0, 0, 1]);
+        headers_frame.extend_from_slice(&encoded);
+        stream.write_all(&headers_frame).unwrap();
+
+        let mut decoder = crate::http::h2::hpack::HpackContext::new(4096);
+        let (status, _end_stream) = read_h2_status_headers(&mut reader, &mut decoder);
+        assert_eq!(status, "200", "expected a 200 from the proxied upstream, got: {status}");
+
+        let received_body = read_h2_data_payload(&mut reader);
+        assert_eq!(received_body, b"from upstream via h2!", "expected the real upstream's body over the H2 stream");
     }
 
     // ─── WsConfig wiring ──────────────────────────────────────────────

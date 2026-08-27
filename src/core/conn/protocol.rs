@@ -75,6 +75,16 @@ pub struct ProxyAttemptState {
     pub attempts_so_far: u32,
     pub pending: crate::core::proxy::ProxyPending,
     pub original_request: Box<crate::http::request::HttpRequest>,
+    /// Which H2 stream on the downstream connection this proxy
+    /// attempt belongs to -- `None` for an HTTP/1.1 downstream (one
+    /// request per connection, no stream to disambiguate), `Some` for
+    /// one of possibly several concurrently in-flight streams on an
+    /// H2 downstream connection. Threaded through retries so a failed
+    /// upstream attempt's retry (or final 502) lands back on the
+    /// correct stream rather than an arbitrary one -- see
+    /// mio_upstream::UpstreamConnection::downstream_stream_id's own
+    /// doc comment for the same concern on the upstream side.
+    pub downstream_stream_id: Option<u32>,
 }
 
 pub struct Http1Connection {
@@ -187,6 +197,15 @@ pub struct Http2Connection {
     pub inner: crate::http::h2::stream::Connection,
     pub write_buf: Buf,
     pub created_at: Instant,
+    /// Proxy attempts currently in flight for this H2 connection,
+    /// keyed by stream_id -- the H2 analogue of
+    /// Http1Connection::waiting_for_upstream, needed because a single
+    /// H2 connection can have several proxy requests outstanding at
+    /// once (multiplexed streams) where an HTTP/1.1 connection only
+    /// ever has one. Populated when a stream's dispatched response
+    /// carries proxy_pending, read back once that stream's upstream
+    /// attempt resolves (see mio_backend's own H2 handling of both).
+    pub waiting_for_upstream: std::collections::HashMap<u32, ProxyAttemptState>,
 }
 
 /// The subset of `core::config::RoutaH2Config` a new `Http2Connection`
@@ -232,6 +251,7 @@ impl Http2Connection {
             inner,
             write_buf,
             created_at: Instant::now(),
+            waiting_for_upstream: std::collections::HashMap::new(),
         }
     }
 }

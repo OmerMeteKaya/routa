@@ -2944,6 +2944,7 @@ impl WorkerBody for EventLoopWorker {
                                             attempts_so_far: 1,
                                             pending: pending.clone(),
                                             original_request: original_request.clone(),
+                                            downstream_stream_id: None,
                                         });
 
                                         // Serialize and send immediately -- an
@@ -3045,6 +3046,7 @@ impl WorkerBody for EventLoopWorker {
                                     attempts_so_far: 1,
                                     pending: pending.clone(),
                                     original_request: original_request.clone(),
+                                    downstream_stream_id: None,
                                 });
 
                                 if let Err(reason) = submit_connect(&mut ring, &mut connections, upstream_slab_index, pending.config.connect_timeout) {

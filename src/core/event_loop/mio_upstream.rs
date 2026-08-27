@@ -49,6 +49,17 @@ pub struct UpstreamConnection {
     /// recycled for someone else) is waiting on this upstream request.
     pub downstream_slab_index: usize,
     pub downstream_conn_id: crate::core::conn::ConnId,
+    /// Which H2 stream on the downstream connection is waiting for
+    /// this upstream request's result -- `None` means the downstream
+    /// connection is plain HTTP/1.1 (one request per connection, no
+    /// stream multiplexing to disambiguate), `Some(stream_id)` means
+    /// it's one of possibly several concurrently in-flight streams on
+    /// a single H2 downstream connection. Read by
+    /// flush_upstream_result_to_downstream to decide whether to queue
+    /// the result into Http1Connection::write_buf (None) or hand it
+    /// to the H2 connection's own per-stream response machinery
+    /// (Some) -- see that function's own doc comment.
+    pub downstream_stream_id: Option<u32>,
     pub deadline: std::time::Instant,
 }
 
@@ -90,6 +101,7 @@ impl UpstreamConnection {
         request_bytes: Vec<u8>,
         downstream_slab_index: usize,
         downstream_conn_id: crate::core::conn::ConnId,
+        downstream_stream_id: Option<u32>,
         connect_timeout: std::time::Duration,
     ) -> std::io::Result<Self> {
         let addr = node.resolve_addr()?;
@@ -105,6 +117,7 @@ impl UpstreamConnection {
             read_buf: Vec::new(),
             downstream_slab_index,
             downstream_conn_id,
+            downstream_stream_id,
             deadline: std::time::Instant::now() + connect_timeout,
         })
     }

@@ -546,10 +546,6 @@ impl Connection {
                 value: self.local_header_table_size as u32,
             },
             frame::Setting {
-                id: SETTINGS_ENABLE_PUSH,
-                value: self.local_enable_push as u32,
-            },
-            frame::Setting {
                 id: SETTINGS_MAX_CONCURRENT_STREAMS,
                 value: self.local_max_concurrent_streams,
             },
