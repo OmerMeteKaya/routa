@@ -662,11 +662,6 @@ fn handle_connection_event(
             return; // stale event for an already-removed connection
     }
 
-    eprintln!("DEBUG handle_connection_event port={} idx={} conn_id={:?} readiness={:?} write_buf_len={}", worker.port, idx, connections[idx].id, _readiness, match &connections[idx].protocol {
-        ConnectionProtocol::Http2(h2) => h2.write_buf.as_slice().len(),
-        ConnectionProtocol::Http1(h1) => h1.write_buf.as_slice().len(),
-        _ => 0,
-    });
     connections[idx].touch();
 
     // Drive the TLS handshake (a no-op immediately returning "not
@@ -1376,10 +1371,7 @@ fn flush_transport(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                eprintln!("DEBUG flush_transport WouldBlock idx={} pending_len={}", idx, pending.len());
-                return Ok(());
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e),
         }
     }
@@ -1478,6 +1470,10 @@ fn drive_http2(worker: &EventLoopWorker, poller: &mut MioPoller, connections: &m
             unreachable!()
         };
         h2.write_buf.push(&advance_result.to_send);
+        for stream_id in h2.inner.streams_with_pending_response() {
+            let resumed = h2.inner.resume_pending(stream_id);
+            h2.write_buf.push(&resumed);
+        }
     }
 
     for stream_id in advance_result.newly_ready_streams {

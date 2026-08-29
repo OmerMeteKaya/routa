@@ -1086,8 +1086,30 @@ fn handle_send_completion(
                         // same ciphertext bytes twice, out of their
                         // correct position in the TLS record stream).
                         if connections[slab_index].transport.is_tls() {
-                            let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
-                            io.outgoing.consume(n);
+                            let outgoing_empty = {
+                                let Transport::Tls { io, .. } = &mut connections[slab_index].transport else { unreachable!() };
+                                io.outgoing.consume(n);
+                                io.outgoing.is_empty()
+                            };
+                            // Only now -- once every ciphertext byte
+                            // rustls produced from the plaintext this
+                            // connection accumulated across possibly
+                            // several submit_send calls has actually
+                            // been transmitted -- is it safe to tell
+                            // write_buf that plaintext is gone. Doing
+                            // this before outgoing fully drains would
+                            // have write_buf report empty (and this
+                            // connection treated as "fully flushed")
+                            // while unset bytes were still sitting in
+                            // outgoing, never to be retried -- exactly
+                            // the bug that silently truncated large
+                            // TLS+H2 response bodies at whatever a
+                            // single Send call happened to transmit.
+                            if outgoing_empty {
+                                if let Some(plaintext_len) = connections[slab_index].pending_tls_plaintext_len.take() {
+                                    consume_active_write_buf(&mut connections[slab_index].protocol, plaintext_len);
+                                }
+                            }
                         } else {
                             consume_active_write_buf(&mut connections[slab_index].protocol, n);
                         }
@@ -1218,24 +1240,50 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
     };
 
     if conn.transport.is_tls() {
-        // A TLS connection's protocol state machines (process_http1_read_buf,
-        // process_http2_input, process_websocket_input) are
-        // deliberately unaware of TLS at all -- they only ever queue
-        // plaintext into write_buf, the same as on a plaintext
-        // connection. Encrypting that plaintext into real ciphertext
-        // is this function's job, not theirs: every byte queued since
-        // the last submit_send call is fed through write_plaintext
-        // (which only queues it into rustls's own internal buffer)
-        // and then advance_io (which is what actually encrypts it
-        // into MemoryTlsIo::outgoing) before anything is submitted to
-        // the kernel. Sending `pending`'s plaintext bytes directly, as
-        // this function used to, would leak unencrypted application
-        // data onto the wire on a connection the peer believes is
-        // encrypted.
-        let plaintext = pending.to_vec();
-        let Transport::Tls { tls, io, fd } = &mut conn.transport else { unreachable!() };
-        tls.write_plaintext(&plaintext).map_err(|e| format!("failed to queue plaintext for TLS encryption: {e}"))?;
-        tls.advance_io(io.as_mut()).map_err(|e| format!("failed to advance TLS record layer while encrypting: {e}"))?;
+        // If a previous submit_send call's ciphertext hasn't fully
+        // drained from MemoryTlsIo::outgoing yet (pending_tls_plaintext_len
+        // is still Some -- see that field's own doc comment),
+        // write_buf's own contents haven't been consumed and this
+        // call is purely a retry of the still-outstanding Send, not a
+        // new one: handing write_buf's plaintext to rustls again here
+        // would encrypt and transmit those same bytes a second time,
+        // real TLS record corruption from the peer's point of view.
+        // Only feed genuinely new plaintext to rustls once the
+        // previous batch has actually gone out.
+        if conn.pending_tls_plaintext_len.is_none() {
+            // A TLS connection's protocol state machines (process_http1_read_buf,
+            // process_http2_input, process_websocket_input) are
+            // deliberately unaware of TLS at all -- they only ever queue
+            // plaintext into write_buf, the same as on a plaintext
+            // connection. Encrypting that plaintext into real ciphertext
+            // is this function's job, not theirs: every byte queued since
+            // the last submit_send call is fed through write_plaintext
+            // (which only queues it into rustls's own internal buffer)
+            // and then advance_io (which is what actually encrypts it
+            // into MemoryTlsIo::outgoing) before anything is submitted to
+            // the kernel. Sending `pending`'s plaintext bytes directly, as
+            // this function used to, would leak unencrypted application
+            // data onto the wire on a connection the peer believes is
+            // encrypted.
+            let plaintext = pending.to_vec();
+            let Transport::Tls { tls, io, .. } = &mut conn.transport else { unreachable!() };
+            // write_plaintext's own Ok(n) is how many bytes rustls
+            // actually accepted into its internal buffer, not
+            // necessarily all of `plaintext` -- rustls's writer()
+            // follows the ordinary std::io::Write contract (a partial
+            // Ok(n) is a legal, non-error outcome, not just a
+            // WouldBlock/error case), and a response body large
+            // enough to exceed rustls's own internal buffer capacity
+            // routinely triggers exactly that. Only the accepted
+            // prefix is genuinely "handed off" -- the remainder is
+            // still sitting in write_buf, unconsumed, for a later
+            // submit_send call to hand off once this batch drains.
+            let accepted = tls.write_plaintext(&plaintext).map_err(|e| format!("failed to queue plaintext for TLS encryption: {e}"))?;
+            tls.advance_io(io.as_mut()).map_err(|e| format!("failed to advance TLS record layer while encrypting: {e}"))?;
+            *conn.pending_tls_plaintext_len.get_or_insert(0) += accepted;
+        }
+        let Transport::Tls { fd, io, .. } = &conn.transport else { unreachable!() };
+        let fd = *fd;
 
         // The plaintext was fully handed to rustls above -- mark it
         // consumed from the protocol's own write_buf now, since the
@@ -1247,8 +1295,6 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
         // length avoids the OP_TAG_SEND completion handler needing to
         // (incorrectly) treat a ciphertext byte count as a plaintext
         // one.
-        let plaintext_len = plaintext.len();
-        consume_active_write_buf(&mut conn.protocol, plaintext_len);
 
         let ciphertext = io.outgoing.as_slice();
         // Deliberately submitted even when empty (a 0-byte Send),
@@ -1266,7 +1312,7 @@ fn submit_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_inde
         // Send still produces a normal, immediate completion, letting
         // OP_TAG_SEND's own existing "fully flushed -> submit_recv"
         // logic run exactly as it would for any other completed send.
-        let mut send = opcode::Send::new(types::Fd(*fd), ciphertext.as_ptr(), ciphertext.len() as u32).build();
+        let mut send = opcode::Send::new(types::Fd(fd), ciphertext.as_ptr(), ciphertext.len() as u32).build();
         if write_timeout.is_some() {
             send = send.flags(squeue::Flags::IO_LINK);
         }
@@ -1391,7 +1437,7 @@ fn drain_pipelined_request_or_recv(
                 connections.remove(slab_index);
             }
             Http1Outcome::FileCachePending(pending, original_request) => {
-                if let Err(reason) = submit_statx(ring, connections, slab_index, pending, original_request) {
+                if let Err(reason) = submit_statx(ring, connections, slab_index, pending, original_request, None) {
                     tracing::warn!(worker_id, %reason, "failed to submit statx for a pipelined static-file cache-miss");
                     cancel_outstanding_operations(ring, completion_generation, slab_index);
                     connections.remove(slab_index);
@@ -1419,7 +1465,7 @@ fn drain_pipelined_request_or_recv(
 /// see FileCachePending's own doc comment) asynchronously, storing
 /// the raw kernel-written statx buffer in `conn.pending_statx` for
 /// OP_TAG_STATX's own completion arm to read once it arrives.
-fn submit_statx(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize, pending: crate::http::static_files::FileCachePending, original_request: Box<crate::http::request::HttpRequest>) -> Result<(), String> {
+fn submit_statx(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize, pending: crate::http::static_files::FileCachePending, original_request: Box<crate::http::request::HttpRequest>, downstream_stream_id: Option<u32>) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     let path_cstring = std::ffi::CString::new(pending.resolved_path.as_os_str().as_encoded_bytes())
         .map_err(|_| "static file path contains an interior NUL byte".to_string())?;
@@ -1434,6 +1480,7 @@ fn submit_statx(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_ind
         pending,
         original_request,
         statx_buf,
+        downstream_stream_id,
     });
     // path_cstring must outlive the SQE the kernel hasn't yet
     // consumed -- leaked deliberately (a handful of bytes, freed by
@@ -2651,11 +2698,35 @@ impl WorkerBody for EventLoopWorker {
                             };
 
                             match h2_outcome {
-                                crate::core::conn::protocol::Http2Outcome::FlushThenContinue => {
+                                crate::core::conn::protocol::Http2Outcome::FlushThenContinue { pending_file_caches, pending_proxies } => {
                                     if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
                                         tracing::warn!(worker_id, %reason, "failed to submit http2 send");
                                         cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                         connections.remove(slab_index);
+                                        continue;
+                                    }
+                                    for (stream_id, pending, original_request) in pending_file_caches {
+                                        if let Err(reason) = submit_statx(&mut ring, &mut connections, slab_index, pending, original_request, Some(stream_id)) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit statx for an H2 static-file cache-miss");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                            break;
+                                        }
+                                    }
+                                    for (stream_id, _pending, _original_request) in pending_proxies {
+                                        // H2-over-uring proxying isn't implemented yet (see this
+                                        // arm's own limitation note) -- reject just this stream
+                                        // with a 502 rather than tearing down the whole
+                                        // connection, since other streams on it may be healthy.
+                                        tracing::warn!(worker_id, slab_index, stream_id, "proxying over an H2 downstream connection is not yet supported by this backend");
+                                        let ConnectionProtocol::Http2(h2) = &mut connections[slab_index].protocol else { continue };
+                                        let out = h2.inner.send_response(stream_id, 502, &[], b"Bad Gateway\n".to_vec());
+                                        h2.write_buf.push(&out);
+                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit 502 for an unsupported H2 proxy stream");
+                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
                                     }
                                 }
                                 crate::core::conn::protocol::Http2Outcome::FlushThenClose => {
@@ -3057,7 +3128,7 @@ impl WorkerBody for EventLoopWorker {
                                 }
                             }
                             Http1Outcome::FileCachePending(pending, original_request) => {
-                                if let Err(reason) = submit_statx(&mut ring, &mut connections, slab_index, pending, original_request) {
+                                if let Err(reason) = submit_statx(&mut ring, &mut connections, slab_index, pending, original_request, None) {
                                     tracing::warn!(worker_id, %reason, "failed to submit statx for a static-file cache-miss");
                                     cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
@@ -3320,21 +3391,34 @@ impl WorkerBody for EventLoopWorker {
                             &mut worker_mmap,
                             self.server.file_watcher.as_deref(),
                         );
-                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else {
-                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                            connections.remove(slab_index);
-                            continue;
-                        };
-                        let keep_alive = statx_state.original_request.keep_alive && response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
-                        if response.get_header("Connection").is_none() {
-                            response.set_header("Connection", if keep_alive { "keep-alive" } else { "close" });
-                        }
-                        crate::core::conn::protocol::queue_http1_response(h1, response);
-                        h1.keep_alive = keep_alive;
-                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
-                            tracing::warn!(worker_id, %reason, "failed to submit response after an async static-file stat");
-                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                            connections.remove(slab_index);
+                        match (&mut connections[slab_index].protocol, statx_state.downstream_stream_id) {
+                            (ConnectionProtocol::Http1(h1), None) => {
+                                let keep_alive = statx_state.original_request.keep_alive && response.get_header("Connection").map(|v| !v.eq_ignore_ascii_case("close")).unwrap_or(true);
+                                if response.get_header("Connection").is_none() {
+                                    response.set_header("Connection", if keep_alive { "keep-alive" } else { "close" });
+                                }
+                                crate::core::conn::protocol::queue_http1_response(h1, response);
+                                h1.keep_alive = keep_alive;
+                                if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit response after an async static-file stat");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
+                            }
+                            (ConnectionProtocol::Http2(h2), Some(stream_id)) => {
+                                let (status, headers, body) = crate::core::conn::protocol::split_response_for_h2(response);
+                                let out = h2.inner.send_response(stream_id, status, &headers, body);
+                                h2.write_buf.push(&out);
+                                if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit H2 response after an async static-file stat");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
+                            }
+                            _ => {
+                                cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                connections.remove(slab_index);
+                            }
                         }
                     }
                     OP_TAG_SPLICE_TO_PIPE => {

@@ -961,8 +961,26 @@ pub enum Http2Outcome {
     /// Bytes are queued in `Http2Connection::write_buf` (stream
     /// responses, WS-tunnel DATA frames, or protocol-level frames like
     /// SETTINGS acks) and should be flushed; the connection stays open
-    /// afterward.
-    FlushThenContinue,
+    /// afterward. May also carry per-stream async work a backend with
+    /// its own async story (currently only uring_backend) still needs
+    /// to drive -- see `pending_file_caches`/`pending_proxies`' own
+    /// doc comments. A backend with no async story (mio_backend)
+    /// resolves each of these synchronously right away instead of
+    /// treating them as truly pending.
+    FlushThenContinue {
+        /// Streams whose dispatched response came back with
+        /// `file_cache_pending` set -- the H2 analogue of
+        /// `Http1Outcome::FileCachePending`, needed because a single
+        /// H2 connection can have several such streams outstanding at
+        /// once (multiplexed streams) where an HTTP/1.1 connection
+        /// only ever has one.
+        pending_file_caches: Vec<(u32, crate::http::static_files::FileCachePending, Box<crate::http::request::HttpRequest>)>,
+        /// Streams whose dispatched response came back with
+        /// `proxy_pending` set -- the H2 analogue of
+        /// `Http1Outcome::ProxyPending`, same multiplexing rationale
+        /// as `pending_file_caches`.
+        pending_proxies: Vec<(u32, crate::core::proxy::ProxyPending, Box<crate::http::request::HttpRequest>)>,
+    },
     /// The H2 connection itself has ended (a GOAWAY was sent/received,
     /// or a fatal connection-level error occurred) -- whatever is
     /// queued in `write_buf` should still be flushed, then the
@@ -1035,13 +1053,40 @@ fn build_request_from_h2_headers(
 /// Splits an `HttpResponse` into the pieces `http::h2::stream::Connection::send_response`
 /// needs (status separately from headers, since H2 sends `:status` as
 /// its own pseudo-header rather than a regular one).
-fn split_response_for_h2(response: crate::http::response::HttpResponse) -> (u16, Vec<crate::http::h2::hpack::HeaderField>, Vec<u8>) {
+pub(crate) fn split_response_for_h2(mut response: crate::http::response::HttpResponse) -> (u16, Vec<crate::http::h2::hpack::HeaderField>, Vec<u8>) {
     let status = response.status;
-    let body = response.body().to_vec();
+    // A file-backed body (see HttpResponse::set_body_file's own doc
+    // comment) has nothing in `body` itself -- both this backend's
+    // own OP_TAG_SPLICE_TO_PIPE/SOCKET pair (HTTP/1.1 only) and
+    // mio_backend's own flush_pending_file are H1-specific fast paths
+    // with no H2 equivalent (H2 frames the body regardless, and TLS
+    // on top of that already rules out true zero-copy), so this reads
+    // the file's bytes synchronously into `body` here -- otherwise a
+    // large static file response would silently carry zero bytes over
+    // H2 despite a real 200 status.
+    let body = if let Some(file_body) = response.file_body.take() {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file_body.file;
+        let mut buf = vec![0u8; file_body.len as usize];
+        match file.seek(SeekFrom::Start(file_body.offset)).and_then(|_| file.read_exact(&mut buf)) {
+            Ok(()) => buf,
+            Err(_) => Vec::new(),
+        }
+    } else {
+        response.body().to_vec()
+    };
     let headers = response
         .headers()
+        // RFC 9113 8.2.1: HTTP/2 header field names must be lowercase
+        // -- HttpResponse's own headers (built for HTTP/1.1, where
+        // names are case-insensitive but conventionally mixed-case,
+        // e.g. "Content-Type") are stored as whatever case a route
+        // handler set them in. A conforming H2 peer (nghttp2 included)
+        // treats an uppercase header name as a hard protocol error
+        // and resets the stream rather than merely warning, so this
+        // lowercasing is required, not cosmetic.
         .map(|(name, value)| crate::http::h2::hpack::HeaderField {
-            name: name.to_string(),
+            name: name.to_ascii_lowercase(),
             value: value.to_string(),
         })
         .collect();
@@ -1124,6 +1169,25 @@ pub fn process_http2_input(protocol: &mut ConnectionProtocol, incoming: &[u8], c
     let advance_result = h2.inner.advance(incoming);
     h2.write_buf.push(&advance_result.to_send);
 
+    // A WINDOW_UPDATE (connection- or stream-level) in `incoming` may
+    // have just unblocked one or more streams whose response body
+    // previously stalled against a full flow-control window (see
+    // `Connection::flush_pending`'s own doc comment on why a response
+    // larger than the window doesn't send all at once) -- `advance`
+    // itself only reacts to protocol events as it parses them, it
+    // doesn't proactively re-check every stream's own pending body
+    // afterward. Without this, a stalled stream's remaining bytes
+    // were never sent again once the client's WINDOW_UPDATE arrived:
+    // the connection would sit there fully caught up on protocol
+    // frames but permanently short a static file's tail end.
+    for stream_id in h2.inner.streams_with_pending_response() {
+        let resumed = h2.inner.resume_pending(stream_id);
+        h2.write_buf.push(&resumed);
+    }
+
+    let mut pending_file_caches = Vec::new();
+    let mut pending_proxies = Vec::new();
+
     for stream_id in advance_result.newly_ready_streams {
         let request = h2
             .inner
@@ -1141,7 +1205,30 @@ pub fn process_http2_input(protocol: &mut ConnectionProtocol, incoming: &[u8], c
         let request_body_len = request.body.len();
         ctx.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).inc();
         let dispatch_start = std::time::Instant::now();
-        let response = ctx.server.middleware_chain.execute(&request);
+        let mut response = ctx.server.middleware_chain.execute(&request);
+
+        // A backend with its own async story (uring_backend) needs to
+        // drive this stream's pending stat/proxy attempt itself
+        // before a real response exists -- deferred to
+        // pending_file_caches/pending_proxies rather than resolved
+        // here, since process_http2_input (shared, protocol-parsing
+        // code) has no I/O capability of its own (see this module's
+        // own doc comment on why -- mirrors Http1Outcome::FileCachePending/
+        // ProxyPending's identical rationale). No metrics recorded
+        // here for the same reason those two arms don't: there's no
+        // real response yet to record a status/duration/body size
+        // for.
+        if let Some(pending) = response.file_cache_pending.take() {
+            ctx.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).dec();
+            pending_file_caches.push((stream_id, pending, Box::new(request)));
+            continue;
+        }
+        if let Some(pending) = response.proxy_pending.take() {
+            ctx.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).dec();
+            pending_proxies.push((stream_id, pending, Box::new(request)));
+            continue;
+        }
+
         let duration_secs = dispatch_start.elapsed().as_secs_f64();
         ctx.server.metrics.http.requests_in_flight.with_label_values(&["http2"]).dec();
         ctx.server.metrics.record_request(&method_str, &route, response.status, duration_secs, request_body_len, response.body().len());
@@ -1217,7 +1304,7 @@ pub fn process_http2_input(protocol: &mut ConnectionProtocol, incoming: &[u8], c
     if advance_result.connection_closed {
         Http2Outcome::FlushThenClose
     } else {
-        Http2Outcome::FlushThenContinue
+        Http2Outcome::FlushThenContinue { pending_file_caches, pending_proxies }
     }
 }
 

@@ -289,6 +289,41 @@ pub struct Connection {
     /// instead, which reads directly into `recv_buf` and has no
     /// pool-owned buffer to return.
     pub pending_recv_buf_index: Option<u16>,
+    /// How much plaintext was handed to rustls for encryption by the
+    /// most recent submit_send call on a TLS connection, not yet
+    /// consumed from the active protocol's own write_buf -- `None`
+    /// once that consumption has happened (or there's no TLS send in
+    /// flight). Deferred rather than consumed immediately inside
+    /// submit_send because rustls's own TLS record framing means the
+    /// ciphertext byte count OP_TAG_SEND's completion reports has no
+    /// direct correspondence to this plaintext length, AND a single
+    /// Send SQE covering a large ciphertext payload (a multi-hundred-
+    /// KB response body, encrypted, easily exceeds what one Send call
+    /// actually transmits) can complete with only part of it sent --
+    /// consuming the full plaintext length against write_buf at that
+    /// point would silently drop the unsent remainder, since
+    /// write_buf would report empty (fully flushed) while
+    /// MemoryTlsIo::outgoing still held bytes that were never put on
+    /// the wire. Only consumed once outgoing is fully drained (see
+    /// OP_TAG_SEND's own TLS completion arm).
+    pub pending_tls_plaintext_len: Option<usize>,
+    /// How much plaintext was handed to rustls for encryption by the
+    /// most recent submit_send call on a TLS connection, not yet
+    /// consumed from the active protocol's own write_buf -- `None`
+    /// once that consumption has happened (or there's no TLS send in
+    /// flight). Deferred rather than consumed immediately inside
+    /// submit_send because rustls's own TLS record framing means the
+    /// ciphertext byte count OP_TAG_SEND's completion reports has no
+    /// direct correspondence to this plaintext length, AND a single
+    /// Send SQE covering a large ciphertext payload (a multi-hundred-
+    /// KB response body, encrypted, easily exceeds what one Send call
+    /// actually transmits) can complete with only part of it sent --
+    /// consuming the full plaintext length against write_buf at that
+    /// point would silently drop the unsent remainder, since
+    /// write_buf would report empty (fully flushed) while
+    /// MemoryTlsIo::outgoing still held bytes that were never put on
+    /// the wire. Only consumed once outgoing is fully drained (see
+    /// OP_TAG_SEND's own TLS completion arm).
     /// State for an in-flight `Statx` SQE stat'ing a static file's
     /// path asynchronously (see `Http1Outcome::FileCachePending`'s own
     /// doc comment) -- `Some` from the moment the Statx SQE is
@@ -310,6 +345,14 @@ pub struct PendingStatx {
     pub pending: crate::http::static_files::FileCachePending,
     pub original_request: Box<crate::http::request::HttpRequest>,
     pub statx_buf: Box<libc::statx>,
+    /// Which H2 stream this stat belongs to -- `None` for an
+    /// HTTP/1.1 downstream (one request per connection), `Some` for
+    /// one of possibly several concurrently in-flight streams on an
+    /// H2 downstream connection. Read by OP_TAG_STATX's own
+    /// completion arm to decide whether to queue the resolved
+    /// response into Http1Connection::write_buf or hand it to the H2
+    /// connection's own per-stream response machinery.
+    pub downstream_stream_id: Option<u32>,
 }
 
 /// The pipe fd pair (and current relay phase) backing one in-flight
@@ -362,6 +405,7 @@ impl Connection {
             send_zc_supported: false,
             pending_send_zc_result: None,
             pending_recv_buf_index: None,
+            pending_tls_plaintext_len: None,
             pending_statx: None,
         }
     }
