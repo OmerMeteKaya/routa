@@ -3325,16 +3325,39 @@ impl WorkerBody for EventLoopWorker {
                         }
                         if !io_uring::cqueue::more(flags) {
                             // The NOTIF completion -- the kernel is
-                            // done reading the send buffer, so the
-                            // transfer this SendZc represents is now
-                            // actually settled. The byte count itself
-                            // arrived on the *first* (MORE) completion
-                            // and was stashed in pending_send_zc_result
-                            // below; NOTIF's own result carries no
-                            // further meaning beyond "safe to proceed
-                            // now" (per SendZc's own semantics -- see
-                            // submit_send's doc comment on the two-CQE
-                            // lifecycle this opcode requires).
+                            // done with the send buffer either way
+                            // (settled on success, released on the
+                            // MORE arm's own failure path below), so
+                            // this is always the right point to act,
+                            // whichever outcome the MORE completion
+                            // reported.
+                            if connections[slab_index].send_zc_failed_needs_retry {
+                                connections[slab_index].send_zc_failed_needs_retry = false;
+                                // write_buf was never consumed against
+                                // the failed attempt (only a
+                                // successful transfer's byte count
+                                // ever reaches consume_active_write_buf,
+                                // via handle_send_completion below) --
+                                // it still holds the same pending data
+                                // in full, and send_zc_supported is
+                                // now false (set alongside this flag),
+                                // so this retry goes out as an
+                                // ordinary Send.
+                                if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
+                                    tracing::warn!(worker_id, %reason, "failed to submit ordinary-Send retry after a SendZc failure");
+                                    cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
+                                    connections.remove(slab_index);
+                                }
+                                continue;
+                            }
+                            // The byte count itself arrived on the
+                            // *first* (MORE) completion and was
+                            // stashed in pending_send_zc_result below;
+                            // NOTIF's own result carries no further
+                            // meaning beyond "safe to proceed now"
+                            // (per SendZc's own semantics -- see
+                            // submit_send's doc comment on the
+                            // two-CQE lifecycle this opcode requires).
                             let Some(n) = connections[slab_index].pending_send_zc_result.take() else {
                                 tracing::warn!(worker_id, slab_index, "received a SendZc NOTIF completion with no matching pending result -- closing");
                                 cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
@@ -3349,13 +3372,23 @@ impl WorkerBody for EventLoopWorker {
                         // errno), but the buffer isn't safe to treat
                         // as settled until the matching NOTIF
                         // completion above arrives. A negative result
-                        // here is a real failure (not merely "more
-                        // data coming"), so it's handled immediately
-                        // rather than deferred to NOTIF, mirroring how
-                        // OP_TAG_SEND itself treats a negative result.
+                        // here doesn't necessarily mean the
+                        // connection itself is broken -- MSG_ZEROCOPY
+                        // requires the kernel to pin the send
+                        // buffer's pages, which can fail under memory
+                        // pressure (-ENOMEM observed in practice for
+                        // large multi-megabyte WebSocket messages)
+                        // even when an ordinary copying send would
+                        // have succeeded. Rather than tearing the
+                        // connection down over what's really a
+                        // resource-availability hiccup, the matching
+                        // NOTIF completion (still expected per
+                        // SendZc's own two-completion contract) is
+                        // used as the trigger to retry via an
+                        // ordinary Send instead.
                         if result < 0 {
-                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                            connections.remove(slab_index);
+                            connections[slab_index].send_zc_failed_needs_retry = true;
+                            connections[slab_index].send_zc_supported = false;
                             continue;
                         }
                         connections[slab_index].pending_send_zc_result = Some(result as u32);

@@ -279,6 +279,17 @@ pub struct Connection {
     /// arm). `None` whenever no SendZc is currently between its two
     /// completions on this connection.
     pub pending_send_zc_result: Option<u32>,
+    /// Set when a SendZc's own MORE completion reported a negative
+    /// result (observed in practice: -ENOMEM under memory pressure --
+    /// MSG_ZEROCOPY requires pinning the send buffer's pages, which
+    /// can fail where an ordinary copying send never would) --
+    /// checked once the matching NOTIF completion arrives (mirroring
+    /// pending_send_zc_result's own two-completion bookkeeping) to
+    /// retry via an ordinary Send rather than silently tearing the
+    /// connection down. send_zc_supported is also cleared at the same
+    /// time so this connection doesn't keep hitting the same failure
+    /// on every subsequent large send.
+    pub send_zc_failed_needs_retry: bool,
     /// The registered buffer index backing this connection's current
     /// in-flight `ReadFixed` recv, if it's using one (see
     /// `submit_recv`'s own doc comment on the ReadFixed/Recv choice).
@@ -404,6 +415,7 @@ impl Connection {
             pending_splice: None,
             send_zc_supported: false,
             pending_send_zc_result: None,
+            send_zc_failed_needs_retry: false,
             pending_recv_buf_index: None,
             pending_tls_plaintext_len: None,
             pending_statx: None,
