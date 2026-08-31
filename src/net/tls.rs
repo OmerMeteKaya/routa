@@ -126,6 +126,7 @@ impl TlsContext {
             default_key,
             sni_entries: Vec::new(),
             alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            tls_versions: None,
         })
     }
 
@@ -149,6 +150,7 @@ impl TlsContext {
             default_key,
             sni_entries: Vec::new(),
             alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            tls_versions: None,
         })
     }
 
@@ -162,6 +164,16 @@ pub struct TlsContextBuilder {
     default_key: Arc<CertifiedKey>,
     sni_entries: Vec<(String, Arc<CertifiedKey>)>,
     alpn_protocols: Vec<Vec<u8>>,
+    /// Which TLS protocol versions this context will negotiate --
+    /// `None` (the default) means both TLS 1.2 and 1.3, rustls's own
+    /// default range. Restricting this to TLS 1.2 only exists for
+    /// interoperability with older TLS stacks that mishandle or never
+    /// learned TLS 1.3 at all (observed in practice: a 2019-era
+    /// pyOpenSSL/Twisted combination silently hangs mid-handshake
+    /// against a TLS 1.3 ServerHello rather than erroring, which is
+    /// what motivated this option) -- most deployments should leave
+    /// this at the default.
+    tls_versions: Option<&'static [&'static rustls::SupportedProtocolVersion]>,
 }
 
 impl TlsContextBuilder {
@@ -177,6 +189,14 @@ impl TlsContextBuilder {
         } else {
             vec![b"http/1.1".to_vec()]
         };
+        self
+    }
+    /// Restricts this context to negotiating TLS 1.2 only, never TLS
+    /// 1.3 -- see `tls_versions`'s own doc comment for why this
+    /// exists. Idempotent; calling this more than once is harmless.
+    pub fn with_tls12_only(mut self) -> Self {
+        static TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+        self.tls_versions = Some(TLS12_ONLY);
         self
     }
 
@@ -223,13 +243,19 @@ impl TlsContextBuilder {
             }
         }
 
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(SniResolver {
-                default_key: self.default_key,
-                exact_entries,
-                wildcard_entries,
-            }));
+        let cert_resolver = Arc::new(SniResolver {
+            default_key: self.default_key,
+            exact_entries,
+            wildcard_entries,
+        });
+        let mut config = match self.tls_versions {
+            Some(versions) => ServerConfig::builder_with_protocol_versions(versions)
+                .with_no_client_auth()
+                .with_cert_resolver(cert_resolver),
+            None => ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(cert_resolver),
+        };
         config.alpn_protocols = self.alpn_protocols;
         // `with_cert_resolver` (any custom cert resolver, which SNI
         // support requires) leaves session ticket issuance at rustls's
@@ -447,12 +473,37 @@ impl TlsConnection {
         let was_handshaking = self.is_handshaking();
         let mut peer_closed = false;
 
-        if self.wants_read() {
+        // Looped rather than a single conditional read: a peer that
+        // sends its TLS 1.3 Finished message and the very next
+        // plaintext record (an HTTP request, say) in two separate
+        // write(2) calls can have both arrive in the same kernel
+        // socket buffer before this function ever runs -- rustls's
+        // own read_tls only performs one Read::read call per
+        // invocation, so a single pass here can drain the Finished
+        // record, see wants_read() flip to false (handshake
+        // complete), and return without ever reading the
+        // already-buffered application-data record sitting right
+        // behind it. That leftover record then has no future trigger
+        // to be read: edge-triggered epoll (this backend's poller)
+        // only reports a socket readable again on *new* incoming
+        // bytes, not merely because unread bytes remain from a
+        // previous notification, so the connection stalls forever
+        // waiting on a readiness event that was already delivered and
+        // consumed. Looping until wants_read() is false or a read
+        // returns WouldBlock/0 ensures every record the kernel
+        // already has buffered is drained in this same call.
+        loop {
+            if !self.wants_read() {
+                break;
+            }
             let read_result = self.read_tls(socket);
             match read_result {
-                Ok(0) => peer_closed = true,
+                Ok(0) => {
+                    peer_closed = true;
+                    break;
+                }
                 Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
             let process_result = self.process_new_packets();

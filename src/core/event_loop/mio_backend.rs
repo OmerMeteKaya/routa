@@ -1255,6 +1255,30 @@ fn read_into_transport(
 ) -> std::io::Result<()> {
     loop {
         let conn = &mut connections[idx];
+        // For a TLS transport, read_plaintext only surfaces bytes
+        // rustls has already decrypted from a previous advance_io
+        // call -- it never itself reads new bytes off the real
+        // socket. Without calling advance_io here (mirroring
+        // read_transport_bytes's own identical need for it), any TLS
+        // record that arrived in a separate read(2) from the
+        // handshake's own Finished message -- a client's HTTP
+        // request sent as its own write(2) call right after the
+        // handshake completes, for instance -- would sit unread in
+        // the kernel's socket buffer forever: read_plaintext finds
+        // nothing already decrypted, returns WouldBlock, and this
+        // function returns having silently read zero bytes of a
+        // request that was actually sitting there the whole time.
+        if let Transport::Tls { stream, tls } = &mut conn.transport {
+            match tls.advance_io(stream) {
+                Ok(advance) if advance.peer_closed => {
+                    conn.closing = true;
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
         let mut chunk = [0u8; 16384];
         let read_result = match &mut conn.transport {
             Transport::Plain(stream) => stream.read(&mut chunk),
@@ -1345,11 +1369,28 @@ fn flush_transport(connections: &mut Slab<Connection>, idx: usize) -> std::io::R
             break;
         }
 
+        let is_tls = matches!(&conn.transport, Transport::Tls { .. });
         let write_result = match &mut conn.transport {
             Transport::Plain(stream) => stream.write(pending),
             Transport::Tls { tls, .. } => tls.write_plaintext(pending),
         };
         match write_result {
+            // For a TLS transport, Ok(0) from write_plaintext does
+            // NOT mean the peer's socket is gone the way it would for
+            // a plain Write::write -- rustls's own Writer::write
+            // (see net::tls's own doc comment on write_plaintext)
+            // buffers plaintext internally up to a configurable
+            // limit (ConnectionCommon::set_buffer_limit) and returns
+            // Ok(0) once that limit is hit, exactly the ordinary
+            // std::io::Write "temporarily can't accept more, retry
+            // later" signal WouldBlock represents everywhere else.
+            // Treating it as WriteZero (this function's prior
+            // behavior) tore the connection down mid-response for any
+            // WebSocket message or H1/H2 body large enough to fill
+            // that internal buffer before advance_io/TCP had drained
+            // it -- exactly the multi-megabyte payloads Autobahn's
+            // own 9.x performance suite sends.
+            Ok(0) if is_tls && !pending.is_empty() => return Ok(()),
             Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write returned 0")),
             Ok(n) => {
                 match &mut conn.protocol {

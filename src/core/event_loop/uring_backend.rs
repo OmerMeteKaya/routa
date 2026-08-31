@@ -811,6 +811,150 @@ fn consume_active_write_buf(protocol: &mut ConnectionProtocol, n: usize) {
 /// `WebSocketOutcome` reach `submit_send` today for that shape; this
 /// function is deliberately only for the pre-application-data
 /// handshake bytes.
+
+/// Finishes a downstream TLS handshake once its own Send (either the
+/// bulk of the handshake, driven by advance_io during OP_TAG_RECV, or
+/// this connection's own final flight, driven here from
+/// handle_send_completion's own Handshaking arm) is fully off the
+/// wire: negotiates the application protocol via ALPN, and either
+/// starts the H2 SETTINGS frame on its way (H2) or checks for -- and
+/// feeds through the correct protocol's own dispatch -- any
+/// application data rustls already decrypted alongside the
+/// handshake's own final flight before submitting an ordinary Recv
+/// (H1/WebSocket). That last check matters because a client that
+/// sends its TLS Finished message and its first real request in two
+/// separate write(2) calls can have both land in the same kernel
+/// socket buffer before this function ever runs: without draining
+/// whatever's already decrypted here, that first request would sit
+/// unread forever, since a fresh Recv only reports genuinely new
+/// bytes arriving after it's submitted, not old ones already
+/// buffered.
+fn finish_downstream_tls_handshake(
+    worker: &EventLoopWorker,
+    worker_id: usize,
+    ring: &mut IoUring,
+    connections: &mut Slab<Connection>,
+    slab_index: usize,
+    completion_generation: u32,
+    registered_buffer_pool: &mut Option<RegisteredBufferPool>,
+) {
+                                    let is_h2_alpn = connections[slab_index].transport.alpn_protocol() == Some(b"h2".as_slice());
+                                    connections[slab_index].protocol = if is_h2_alpn {
+                                        ConnectionProtocol::Http2(Http2Connection::new(&worker.h2_settings))
+                                    } else {
+                                        ConnectionProtocol::Http1(Http1Connection::new())
+                                    };
+
+                                    // Http2Connection::new() just queued
+                                    // its own initial_send() (the
+                                    // server's SETTINGS frame) into
+                                    // Http2Connection::write_buf -- but
+                                    // that's plaintext, and nothing
+                                    // else in this HandshakeJustCompleted
+                                    // arm ever encrypts a protocol's
+                                    // write_buf the way submit_send's
+                                    // TLS branch does; only the raw TLS
+                                    // handshake bytes already sitting
+                                    // in MemoryTlsIo::outgoing were
+                                    // being sent. Without this, an
+                                    // ALPN-negotiated H2 connection's
+                                    // SETTINGS frame was silently never
+                                    // encrypted or transmitted at all
+                                    // -- the client would see a
+                                    // successful TLS+ALPN handshake but
+                                    // then wait forever for a SETTINGS
+                                    // frame that was never coming (this
+                                    // is what h2spec's TLS suite
+                                    // exposed: every test after the
+                                    // bare connection-preface check
+                                    // timed out, since none of them
+                                    // could get past waiting for this
+                                    // frame). h2c's own upgrade path
+                                    // doesn't have this problem because
+                                    // it's plaintext -- the 101
+                                    // response and the H2 preface
+                                    // travel unencrypted, and
+                                    // Http1Outcome::SwitchedToHttp2's
+                                    // own submit_send call already
+                                    // handles a protocol's write_buf
+                                    // correctly for that case.
+                                    if is_h2_alpn {
+                                        // submit_send's TLS branch
+                                        // already both encrypts
+                                        // Http2Connection::write_buf's
+                                        // SETTINGS frame into
+                                        // MemoryTlsIo::outgoing AND
+                                        // submits the resulting Send
+                                        // SQE -- it's a complete,
+                                        // self-contained submission,
+                                        // unlike the plain "check
+                                        // outgoing, maybe submit_tls_send"
+                                        // pattern the non-H2 branch
+                                        // below still needs (that
+                                        // pattern exists because a
+                                        // plaintext Http1/WebSocket
+                                        // connection reaching this
+                                        // point has no write_buf
+                                        // content of its own to send
+                                        // yet -- only leftover TLS
+                                        // handshake bytes, if any).
+                                        // Falling through to that same
+                                        // check here would submit a
+                                        // second, redundant Send SQE
+                                        // against the same still-unconsumed
+                                        // outgoing buffer.
+                                        if let Err(reason) = submit_send(ring, connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit h2 settings frame after tls+alpn handshake");
+                                            cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                        return;
+                                    }
+
+                                    let has_outgoing = {
+                                        let Transport::Tls { io, .. } = &connections[slab_index].transport else { unreachable!() };
+                                        !io.outgoing.is_empty()
+                                    };
+                                    if has_outgoing {
+                                        if let Err(reason) = submit_tls_send(ring, connections, slab_index) {
+                                            tracing::warn!(worker_id, %reason, "failed to submit final tls handshake send");
+                                            cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                            connections.remove(slab_index);
+                                        }
+                                        return;
+                                    }
+                                    // A client that sends its TLS
+                                    // Finished message and its first
+                                    // real request (an HTTP/1.1
+                                    // request line, or a WebSocket
+                                    // upgrade's own GET) in two
+                                    // separate write(2) calls can have
+                                    // both land in the kernel's socket
+                                    // buffer before this function ever
+                                    // runs -- rustls already decrypted
+                                    // that second record the moment
+                                    // advance_io processed it as part
+                                    // of settling the handshake, and
+                                    // it's sitting in rustls's own
+                                    // plaintext buffer right now,
+                                    // never having touched this
+                                    // connection's own recv_buf.
+                                    // Submitting an ordinary Recv
+                                    // without checking for this first
+                                    // would wait on bytes the kernel
+                                    // has already delivered and
+                                    // rustls already decrypted --
+                                    // nothing new is coming to trigger
+                                    // that Recv's own completion, so
+                                    // the request already sitting
+                                    // there would never be read.
+                                    if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after tls handshake");
+                                        cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+}
+
 fn submit_tls_send(ring: &mut IoUring, connections: &mut Slab<Connection>, slab_index: usize) -> Result<(), String> {
     let conn = &mut connections[slab_index];
     let Transport::Tls { fd, io, .. } = &conn.transport else {
@@ -1059,10 +1203,40 @@ fn handle_send_completion(
                                     cancel_outstanding_operations(ring, completion_generation, slab_index);
                                     connections.remove(slab_index);
                                 }
-                            } else if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
-                                tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after a tls handshake send");
-                                cancel_outstanding_operations(ring, completion_generation, slab_index);
-                                connections.remove(slab_index);
+                            } else {
+                                let is_upstream = matches!(connections[slab_index].role, ConnectionRole::Upstream { .. });
+                                if is_upstream {
+                                    // An upstream connection's own TLS
+                                    // handshake completing here means
+                                    // its Finished message's own final
+                                    // Send just settled -- the actual
+                                    // "handshake just completed, do
+                                    // something about it" logic lives
+                                    // in OP_TAG_RECV's own
+                                    // HandshakeJustCompleted arm
+                                    // (triggered by advance_io during
+                                    // that completion, not this one),
+                                    // so there's nothing upstream-specific
+                                    // to do here beyond letting the
+                                    // connection go back to reading --
+                                    // finish_downstream_tls_handshake's
+                                    // own ALPN-driven protocol
+                                    // selection is downstream-only
+                                    // logic and would be actively
+                                    // wrong here (an upstream
+                                    // connection's role and pending
+                                    // request live in
+                                    // ConnectionRole::Upstream, which
+                                    // that function knows nothing
+                                    // about).
+                                    if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after an upstream tls handshake send");
+                                        cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    }
+                                } else {
+                                    finish_downstream_tls_handshake(worker, worker_id, ring, connections, slab_index, completion_generation, registered_buffer_pool);
+                                }
                             }
                             return;
                         }
@@ -2540,94 +2714,7 @@ impl WorkerBody for EventLoopWorker {
                                         continue;
                                     }
 
-                                    let is_h2_alpn = connections[slab_index].transport.alpn_protocol() == Some(b"h2".as_slice());
-                                    connections[slab_index].protocol = if is_h2_alpn {
-                                        ConnectionProtocol::Http2(Http2Connection::new(&self.h2_settings))
-                                    } else {
-                                        ConnectionProtocol::Http1(Http1Connection::new())
-                                    };
-
-                                    // Http2Connection::new() just queued
-                                    // its own initial_send() (the
-                                    // server's SETTINGS frame) into
-                                    // Http2Connection::write_buf -- but
-                                    // that's plaintext, and nothing
-                                    // else in this HandshakeJustCompleted
-                                    // arm ever encrypts a protocol's
-                                    // write_buf the way submit_send's
-                                    // TLS branch does; only the raw TLS
-                                    // handshake bytes already sitting
-                                    // in MemoryTlsIo::outgoing were
-                                    // being sent. Without this, an
-                                    // ALPN-negotiated H2 connection's
-                                    // SETTINGS frame was silently never
-                                    // encrypted or transmitted at all
-                                    // -- the client would see a
-                                    // successful TLS+ALPN handshake but
-                                    // then wait forever for a SETTINGS
-                                    // frame that was never coming (this
-                                    // is what h2spec's TLS suite
-                                    // exposed: every test after the
-                                    // bare connection-preface check
-                                    // timed out, since none of them
-                                    // could get past waiting for this
-                                    // frame). h2c's own upgrade path
-                                    // doesn't have this problem because
-                                    // it's plaintext -- the 101
-                                    // response and the H2 preface
-                                    // travel unencrypted, and
-                                    // Http1Outcome::SwitchedToHttp2's
-                                    // own submit_send call already
-                                    // handles a protocol's write_buf
-                                    // correctly for that case.
-                                    if is_h2_alpn {
-                                        // submit_send's TLS branch
-                                        // already both encrypts
-                                        // Http2Connection::write_buf's
-                                        // SETTINGS frame into
-                                        // MemoryTlsIo::outgoing AND
-                                        // submits the resulting Send
-                                        // SQE -- it's a complete,
-                                        // self-contained submission,
-                                        // unlike the plain "check
-                                        // outgoing, maybe submit_tls_send"
-                                        // pattern the non-H2 branch
-                                        // below still needs (that
-                                        // pattern exists because a
-                                        // plaintext Http1/WebSocket
-                                        // connection reaching this
-                                        // point has no write_buf
-                                        // content of its own to send
-                                        // yet -- only leftover TLS
-                                        // handshake bytes, if any).
-                                        // Falling through to that same
-                                        // check here would submit a
-                                        // second, redundant Send SQE
-                                        // against the same still-unconsumed
-                                        // outgoing buffer.
-                                        if let Err(reason) = submit_send(&mut ring, &mut connections, slab_index) {
-                                            tracing::warn!(worker_id, %reason, "failed to submit h2 settings frame after tls+alpn handshake");
-                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                            connections.remove(slab_index);
-                                        }
-                                        continue;
-                                    }
-
-                                    let has_outgoing = {
-                                        let Transport::Tls { io, .. } = &connections[slab_index].transport else { unreachable!() };
-                                        !io.outgoing.is_empty()
-                                    };
-                                    if has_outgoing {
-                                        if let Err(reason) = submit_tls_send(&mut ring, &mut connections, slab_index) {
-                                            tracing::warn!(worker_id, %reason, "failed to submit final tls handshake send");
-                                            cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                            connections.remove(slab_index);
-                                        }
-                                    } else if let Err(reason) = submit_recv(&mut ring, &mut connections, slab_index, &mut registered_buffer_pool) {
-                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after tls handshake");
-                                        cancel_outstanding_operations(&mut ring, completion_generation, slab_index);
-                                        connections.remove(slab_index);
-                                    }
+                                    finish_downstream_tls_handshake(self, worker_id, &mut ring, &mut connections, slab_index, completion_generation, &mut registered_buffer_pool);
                                     continue;
                                 }
                                 Ok(TlsAdvanceOutcome::RecordLayerAdvanced) => {
