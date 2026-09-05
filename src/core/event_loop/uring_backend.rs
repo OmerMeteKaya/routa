@@ -911,43 +911,107 @@ fn finish_downstream_tls_handshake(
                                         return;
                                     }
 
+                                    // A client that sends its TLS
+                                    // Finished message and its first
+                                    // real request (an HTTP/1.1
+                                    // request line, or a WebSocket
+                                    // upgrade's own GET) in the same
+                                    // TLS record, or in two separate
+                                    // write(2) calls that both land in
+                                    // the kernel's socket buffer
+                                    // before this function ever runs,
+                                    // can have rustls decrypt that
+                                    // request the moment advance_io
+                                    // processed it as part of settling
+                                    // the handshake -- it's sitting in
+                                    // rustls's own plaintext buffer
+                                    // right now, never having touched
+                                    // this connection's own read_buf.
+                                    // This has to be drained and
+                                    // stashed into read_buf BEFORE the
+                                    // has_outgoing check below, and
+                                    // regardless of which branch that
+                                    // check takes: if outgoing still
+                                    // holds a post-handshake
+                                    // NewSessionTicket, this decrypted
+                                    // request would otherwise sit
+                                    // forgotten until that Send's own
+                                    // completion falls through to
+                                    // drain_pipelined_request_or_recv
+                                    // (which is exactly what picks it
+                                    // up here, since that function
+                                    // already checks read_buf for a
+                                    // pending request); if outgoing is
+                                    // empty, submitting an ordinary
+                                    // Recv without this would wait on
+                                    // bytes the kernel has already
+                                    // delivered and rustls already
+                                    // decrypted -- nothing new is
+                                    // coming to trigger that Recv's
+                                    // own completion, so the request
+                                    // already sitting there would
+                                    // never be read (this is exactly
+                                    // what a real TLS 1.3 client whose
+                                    // Finished message and first
+                                    // request coalesce into one
+                                    // write(2) call -- observed from
+                                    // both Node's TLS stack and
+                                    // wstest's -- hits every time).
+                                    let already_decrypted = {
+                                        let recv_buf_len = connections[slab_index].recv_buf.len();
+                                        let mut buf = vec![0u8; recv_buf_len];
+                                        let Transport::Tls { tls, .. } = &mut connections[slab_index].transport else { unreachable!() };
+                                        let mut collected = Vec::new();
+                                        loop {
+                                            match tls.read_plaintext(&mut buf) {
+                                                Ok(0) => break,
+                                                Ok(read_n) => collected.extend_from_slice(&buf[..read_n]),
+                                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        collected
+                                    };
+                                    if !already_decrypted.is_empty() {
+                                        let protocol_kind = match &connections[slab_index].protocol {
+                                            ConnectionProtocol::Handshaking => "Handshaking",
+                                            ConnectionProtocol::Http1(_) => "Http1",
+                                            ConnectionProtocol::Http2(_) => "Http2",
+                                            ConnectionProtocol::WebSocket(_) => "WebSocket",
+                                            ConnectionProtocol::UpstreamH2(_) => "UpstreamH2",
+                                        };
+                                        let ConnectionProtocol::Http1(h1) = &mut connections[slab_index].protocol else { unreachable!() };
+                                        h1.read_buf.push(&already_decrypted);
+                                    }
+
                                     let has_outgoing = {
                                         let Transport::Tls { io, .. } = &connections[slab_index].transport else { unreachable!() };
                                         !io.outgoing.is_empty()
                                     };
                                     if has_outgoing {
-                                        if let Err(reason) = submit_tls_send(ring, connections, slab_index) {
+                                        let submit_result = submit_tls_send(ring, connections, slab_index);
+                                        if let Err(reason) = submit_result {
                                             tracing::warn!(worker_id, %reason, "failed to submit final tls handshake send");
                                             cancel_outstanding_operations(ring, completion_generation, slab_index);
                                             connections.remove(slab_index);
                                         }
+                                        // Whether or not there was
+                                        // already-decrypted plaintext,
+                                        // it's now safely stashed in
+                                        // read_buf (if any) -- this
+                                        // Send's own completion falls
+                                        // through to
+                                        // drain_pipelined_request_or_recv,
+                                        // which checks read_buf before
+                                        // deciding whether to submit a
+                                        // fresh Recv, so nothing more
+                                        // to do here.
                                         return;
                                     }
-                                    // A client that sends its TLS
-                                    // Finished message and its first
-                                    // real request (an HTTP/1.1
-                                    // request line, or a WebSocket
-                                    // upgrade's own GET) in two
-                                    // separate write(2) calls can have
-                                    // both land in the kernel's socket
-                                    // buffer before this function ever
-                                    // runs -- rustls already decrypted
-                                    // that second record the moment
-                                    // advance_io processed it as part
-                                    // of settling the handshake, and
-                                    // it's sitting in rustls's own
-                                    // plaintext buffer right now,
-                                    // never having touched this
-                                    // connection's own recv_buf.
-                                    // Submitting an ordinary Recv
-                                    // without checking for this first
-                                    // would wait on bytes the kernel
-                                    // has already delivered and
-                                    // rustls already decrypted --
-                                    // nothing new is coming to trigger
-                                    // that Recv's own completion, so
-                                    // the request already sitting
-                                    // there would never be read.
+                                    if !already_decrypted.is_empty() {
+                                        drain_pipelined_request_or_recv(worker, worker_id, ring, connections, slab_index, completion_generation, registered_buffer_pool);
+                                        return;
+                                    }
                                     if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
                                         tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after tls handshake");
                                         cancel_outstanding_operations(ring, completion_generation, slab_index);
@@ -1179,6 +1243,13 @@ fn handle_send_completion(
                         }
 
                         let n = result as usize;
+                        let _protocol_str = match &connections[slab_index].protocol {
+                            ConnectionProtocol::Handshaking => "Handshaking",
+                            ConnectionProtocol::Http1(_) => "Http1",
+                            ConnectionProtocol::Http2(_) => "Http2",
+                            ConnectionProtocol::WebSocket(_) => "WebSocket",
+                            ConnectionProtocol::UpstreamH2(_) => "UpstreamH2",
+                        };
 
                         // A TLS handshake's own Send (see
                         // submit_tls_send) drains MemoryTlsIo::outgoing
@@ -1235,7 +1306,54 @@ fn handle_send_completion(
                                         connections.remove(slab_index);
                                     }
                                 } else {
-                                    finish_downstream_tls_handshake(worker, worker_id, ring, connections, slab_index, completion_generation, registered_buffer_pool);
+                                    // Mirroring the upstream arm just
+                                    // above: this Send completing (and
+                                    // draining MemoryTlsIo::outgoing)
+                                    // does NOT by itself mean the TLS
+                                    // handshake is done -- it only
+                                    // means whatever advance_tls queued
+                                    // for THIS leg of it (e.g. the
+                                    // server's ServerHello+Cert+Finished)
+                                    // finished transmitting. The
+                                    // client's own Finished message,
+                                    // completing the handshake from the
+                                    // server's point of view, hasn't
+                                    // necessarily been read yet.
+                                    // Calling finish_downstream_tls_handshake
+                                    // here unconditionally used to
+                                    // promote the connection's protocol
+                                    // to Http1/Http2 the instant this
+                                    // Send drained -- often well before
+                                    // the client's Finished record (and
+                                    // any post-handshake
+                                    // NewSessionTicket the server still
+                                    // owes it) had actually been
+                                    // exchanged. A downstream TLS 1.3
+                                    // client whose Finished + first
+                                    // request happened to land as a
+                                    // genuinely separate read from
+                                    // this Send's own completion (which
+                                    // is exactly wstest's own timing,
+                                    // unlike curl/openssl's) would then
+                                    // have its still-encrypted Finished
+                                    // record misparsed as a plaintext
+                                    // Http1 request, corrupting the
+                                    // connection and prompting the
+                                    // peer to reset it. The real
+                                    // "handshake just completed, do
+                                    // something about it" moment lives
+                                    // in OP_TAG_RECV's own
+                                    // HandshakeJustCompleted arm
+                                    // (see finish_downstream_tls_handshake's
+                                    // other call site) exactly as it
+                                    // does for upstream connections --
+                                    // so just go back to reading here.
+                                    if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
+                                        tracing::warn!(worker_id, %reason, "failed to submit follow-up recv after a downstream tls handshake send");
+                                        cancel_outstanding_operations(ring, completion_generation, slab_index);
+                                        connections.remove(slab_index);
+                                    } else {
+                                    }
                                 }
                             }
                             return;
@@ -1583,6 +1701,15 @@ fn drain_pipelined_request_or_recv(
             };
             crate::core::conn::protocol::process_http1_read_buf(&mut conn.protocol, &ctx)
         };
+        let outcome_str = match &outcome {
+            Http1Outcome::NeedsMoreData => "NeedsMoreData",
+            Http1Outcome::FlushThenContinue => "FlushThenContinue",
+            Http1Outcome::FlushThenClose => "FlushThenClose",
+            Http1Outcome::SwitchedToHttp2 => "SwitchedToHttp2",
+            Http1Outcome::SwitchedToWebSocket => "SwitchedToWebSocket",
+            Http1Outcome::ProxyPending(..) => "ProxyPending",
+            Http1Outcome::FileCachePending(..) => "FileCachePending",
+        };
         match outcome {
             Http1Outcome::NeedsMoreData => {
                 if let Err(reason) = submit_recv(ring, connections, slab_index, registered_buffer_pool) {
@@ -1599,11 +1726,29 @@ fn drain_pipelined_request_or_recv(
                 }
             }
             Http1Outcome::SwitchedToHttp2 | Http1Outcome::SwitchedToWebSocket => {
+                // A pipelined upgrade request (arriving in read_buf
+                // rather than triggering the normal recv-driven
+                // dispatch path -- see this function's own doc
+                // comment) still deserves its upgrade response sent
+                // rather than the connection being torn down out from
+                // under a Send that just got queued for it. Tearing
+                // it down unconditionally here, even when submit_send
+                // just succeeded, orphaned that Send's own SQE against
+                // an fd this connection's removal was about to close
+                // -- the kernel would settle it with an EBADF (or
+                // corrupt an unrelated connection that happened to
+                // reuse the same slab slot/fd first) rather than ever
+                // delivering the upgrade response, silently hanging
+                // the peer's own opening handshake. Only tear down on
+                // a genuine submission failure; a successful submit_send
+                // leaves this connection's fate to that Send's own
+                // completion, same as every other submit_send call
+                // site in this file.
                 if let Err(reason) = submit_send(ring, connections, slab_index) {
                     tracing::warn!(worker_id, %reason, "failed to submit upgrade response to a pipelined request");
+                    cancel_outstanding_operations(ring, completion_generation, slab_index);
+                    connections.remove(slab_index);
                 }
-                cancel_outstanding_operations(ring, completion_generation, slab_index);
-                connections.remove(slab_index);
             }
             Http1Outcome::ProxyPending(..) => {
                 tracing::warn!(worker_id, slab_index, "a pipelined proxy request is not yet supported by this backend, closing");
@@ -1624,6 +1769,7 @@ fn drain_pipelined_request_or_recv(
         tracing::warn!(worker_id, %reason, "failed to submit follow-up recv");
         cancel_outstanding_operations(ring, completion_generation, slab_index);
         connections.remove(slab_index);
+    } else {
     }
 }
 
