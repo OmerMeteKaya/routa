@@ -171,7 +171,7 @@ pub enum ConnectionRole {
         /// streams it's actually serving, each key being that
         /// stream's real id. Empty while this upstream connection is
         /// idle (in a pool, not currently serving any request).
-        serving_downstream: std::collections::HashMap<u32, (usize, u32)>,
+        serving_downstream: std::collections::HashMap<u32, (usize, u32, Option<u32>)>,
         /// The original client request to serialize and send once
         /// this upstream connection's `Connect` completes -- kept
         /// here (rather than, say, already serialized into

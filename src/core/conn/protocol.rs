@@ -1029,11 +1029,25 @@ fn build_request_from_h2_headers(
         })
         .unwrap_or_default();
 
-    let regular_headers = headers
+    // H2 has no Host header of its own -- :authority is its
+    // pseudo-header equivalent (RFC 9113 8.3.1). Synthesizing a real
+    // Host header from it here means every downstream piece of code
+    // that already expects one (route matching by Host, this
+    // request's own eventual re-serialization as HTTP/1.1 if it gets
+    // proxied to an upstream, etc.) keeps working unchanged for an H2
+    // client, without each of those call sites needing its own
+    // :authority special-case.
+    let authority = headers.iter().find(|h| h.name == ":authority").map(|h| h.value.clone());
+    let mut regular_headers: Vec<(String, String)> = headers
         .iter()
         .filter(|h| !h.name.starts_with(':'))
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
+    if !regular_headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host")) {
+        if let Some(authority) = authority {
+            regular_headers.push(("Host".to_string(), authority));
+        }
+    }
 
     Some(crate::http::request::HttpRequest {
         method,
